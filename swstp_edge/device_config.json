@@ -1,0 +1,4 @@
+{
+  "device_id": "SWSTP-PI-001",
+  "_comment": "Edit 'device_id' to match your provisioned device code in the SWSTP backend. This file replaces the Arduino EEPROM identity mechanism."
+}

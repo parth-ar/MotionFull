@@ -1,0 +1,30 @@
+# SWSTP Edge — Raspberry Pi 4B requirements
+# Install with: pip3 install -r requirements.txt
+
+# ── Core vision & numerics ────────────────────────────────────────────────────
+# Full GUI build required (cv2.imshow + mouse ROI plotting must work on the Pi desktop)
+opencv-python>=4.8.0
+numpy>=1.24.0
+imutils>=0.5.4
+
+# ── Backend / HTTP ────────────────────────────────────────────────────────────
+requests>=2.31.0
+
+# ── Pi-native sensor drivers ──────────────────────────────────────────────────
+# MPU-6500 I2C register access (replaces MPU6500_WE Arduino library)
+smbus2>=0.4.3
+
+# NEO-6M GNSS via gpsd (replaces hand-rolled NMEA parsing + SoftwareSerial)
+# Requires gpsd daemon: sudo apt install gpsd gpsd-clients
+gpsdclient>=1.0.0
+
+# Status LED GPIO control (replaces digitalWrite)
+# Requires pigpiod or RPi.GPIO kernel module on Pi
+gpiozero>=2.0
+
+# ── pyserial ─────────────────────────────────────────────────────────────────
+# Removed: the Arduino serial link no longer exists.
+# Keep only if you need direct AT-command access to a Quectel EC200U LTE USB
+# modem for diagnostic purposes (cellular connectivity itself is handled at the
+# OS level via ModemManager / NetworkManager, not in application code).
+# pyserial>=3.5

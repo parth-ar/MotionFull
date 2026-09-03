@@ -3,5 +3,7 @@ __pycache__/
 *$py.class
 evidence/
 motion_captures/
+swstp_edge/captures/*.jpg
 .history/
 *.log
+
