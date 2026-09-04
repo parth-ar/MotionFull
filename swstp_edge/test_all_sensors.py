@@ -104,6 +104,12 @@ def test_rtc():
         _ok(f"DS3231 detected on I2C bus (0x68)")
     else:
         _warn("DS3231 NOT detected on I2C bus — timestamps still valid (software RTC)")
+        if rtc_mod.rtc_error:
+            _err(f"Detail : {rtc_mod.rtc_error}")
+        _warn("Pi diagnostic  : sudo i2cdetect -y 1")
+        _warn("  '68' = device present, smbus access OK")
+        _warn("  'UU' = device present but claimed by kernel rtc driver (dtoverlay=i2c-rtc,ds3231)")
+        _warn("  '--' = device absent / wiring fault")
 
     _field("Hardware present",  hw_present)
     _field("Module status OK",  rtc_mod.rtc_ok)
