@@ -227,9 +227,9 @@ def live_frame_streamer(backend_url: str, device_id: str, fps: float,
         s.mount("https://", a)
         return s
 
-    session            = _make_session()
-    logged_first_ok    = False
-    last_sent_frame_id = None
+    session          = _make_session()
+    logged_first_ok  = False
+    last_sent_time   = 0.0   # monotonic write-timestamp of the last frame we sent
 
     # Error back-off state
     _err_count         = 0
@@ -247,10 +247,18 @@ def live_frame_streamer(backend_url: str, device_id: str, fps: float,
 
         frame_to_send = None
         with _lock:
+            # _get_frame() returns a (ndarray, write_time) tuple or a bare ndarray
+            # (bare ndarray kept for backward compat with tests)
             candidate = _get_frame()
-            if candidate is not None and id(candidate) != last_sent_frame_id:
-                frame_to_send      = candidate
-                last_sent_frame_id = id(candidate)
+            if candidate is not None:
+                if isinstance(candidate, tuple):
+                    arr, write_time = candidate
+                else:
+                    arr, write_time = candidate, time.monotonic()
+                # Send whenever the write_time is strictly newer than last send
+                if arr is not None and write_time > last_sent_time:
+                    frame_to_send  = arr
+                    last_sent_time = write_time
 
         if frame_to_send is not None:
             try:

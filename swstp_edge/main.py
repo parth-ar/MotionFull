@@ -85,7 +85,10 @@ from network.location_fallback import gps_fallback_worker
 # Shared live stream frame (read by live_frame_streamer in a separate thread)
 # ---------------------------------------------------------------------------
 latest_frame_lock:  threading.Lock = threading.Lock()
-latest_stream_frame = None          # latest BGR frame; encoded to JPEG in streamer
+# latest_stream_frame is a (BGR ndarray, monotonic write_time) tuple.
+# The write_time lets live_frame_streamer detect new frames even when the
+# numpy array is mutated in-place, avoiding the streaming-stall bug.
+latest_stream_frame: tuple | None = None
 
 RE_CLEAN_FILENAME = re.compile(r"[^\w]")
 
@@ -175,6 +178,9 @@ def main() -> None:
     # LEDs
     try:
         leds.init()
+        if args.headless:
+            leds.set_headless_mode(True)
+            # Yellow will go solid once the main loop is ready (after camera init)
     except Exception as exc:
         print(f"[LEDS] init skipped: {exc}")
 
@@ -314,8 +320,26 @@ def main() -> None:
     saved_count    = 0
     last_known_frame = None
 
+    # ── Stop-collection event state ───────────────────────────────────────
+    # A stop event begins when motion is detected AND vehicle speed < 5 km/h.
+    # It ends when the vehicle speeds up or motion is absent for STOP_IDLE_TIMEOUT s.
+    STOP_IDLE_TIMEOUT    = 10.0      # seconds of no-motion before auto-closing event
+    MOTION_SPEED_GATE    = 5.0       # km/h threshold
+    _stop_ev_active      = False
+    _stop_ev_start       = 0.0       # monotonic timestamp of event start
+    _stop_ev_lat         = None
+    _stop_ev_lon         = None
+    _stop_last_motion    = 0.0       # monotonic time of last frame with motion
+
     print("[INIT] Edge Gateway running.")
     print("  Controls: [t] Toggle Camera | [r] Plot Area of Interest | [c] Clear Pointers | [q] Quit\n")
+
+    # Signal LED that system is operational (headless mode)
+    if args.headless:
+        try:
+            leds.set_system_ready()
+        except Exception:
+            pass
 
     try:
         while not stop_event.is_set():
@@ -340,7 +364,7 @@ def main() -> None:
                 display_frame = overlay_metadata(paused_frame)
 
                 with latest_frame_lock:
-                    latest_stream_frame = display_frame
+                    latest_stream_frame = (display_frame, time.monotonic())
 
                 if not args.headless:
                     cv2.imshow(WIN_TITLE, display_frame)
@@ -400,7 +424,7 @@ def main() -> None:
             if frame_count <= WARMUP_FRAMES:
                 display_frame = overlay_metadata(orig_frame.copy())
                 with latest_frame_lock:
-                    latest_stream_frame = display_frame
+                    latest_stream_frame = (display_frame, time.monotonic())
                 if not args.headless:
                     cv2.imshow(WIN_TITLE, display_frame)
                     k = cv2.waitKey(delay) & 0xFF
@@ -485,11 +509,42 @@ def main() -> None:
 
             display_frame = overlay_metadata(orig_frame.copy())
 
-            # Update live stream buffer
+            # Update live stream buffer (tuple with write timestamp for stall-free streaming)
             with latest_frame_lock:
-                latest_stream_frame = display_frame
+                latest_stream_frame = (display_frame, time.monotonic())
 
-            # ── Motion capture & upload ───────────────────────────────────
+            # ── Stop-collection event state machine ───────────────────────
+            now_mono       = time.monotonic()
+            vehicle_speed  = latest_sensor.get("speed") or 0.0
+            is_vehicle_stopped = vehicle_speed < MOTION_SPEED_GATE
+
+            if motion_detected and is_vehicle_stopped:
+                # Keep motion timestamp alive
+                _stop_last_motion = now_mono
+                # Open a new stop event if not already active
+                if not _stop_ev_active:
+                    _stop_ev_active = True
+                    _stop_ev_start  = now_mono
+                    _stop_ev_lat    = latest_sensor.get("lat")
+                    _stop_ev_lon    = latest_sensor.get("lon")
+                    print(f"[STOP EVENT] Collection event started "
+                          f"@ ({_stop_ev_lat}, {_stop_ev_lon}) "
+                          f"| Speed: {vehicle_speed:.1f} km/h")
+
+            if _stop_ev_active:
+                # Close event if vehicle sped up OR motion idle too long
+                idle_secs = now_mono - _stop_last_motion
+                if (not is_vehicle_stopped) or (idle_secs > STOP_IDLE_TIMEOUT):
+                    duration_sec = now_mono - _stop_ev_start
+                    reason = "speed > 5 km/h" if not is_vehicle_stopped else "motion idle timeout"
+                    print(f"[STOP EVENT] Collection event ended — "
+                          f"Duration: {duration_sec:.1f}s | Reason: {reason}")
+                    _stop_ev_active = False
+
+            # Current event duration (0 if no active event)
+            current_event_duration = (now_mono - _stop_ev_start) if _stop_ev_active else 0.0
+
+            # ── Motion capture & upload ───────────────────────────────────────
             if motion_detected:
                 text_scale = max(0.5, (orig_h / 480.0) * 0.5)
                 cv2.putText(display_frame, "MOTION DETECTED",
@@ -497,8 +552,11 @@ def main() -> None:
                             cv2.FONT_HERSHEY_SIMPLEX, text_scale,
                             (0, 0, 255), max(1, int(orig_h / 360)), cv2.LINE_AA)
 
-                now_mono = time.monotonic()
-                if now_mono - last_save_time >= SAVE_COOLDOWN_SEC:
+                # ── Speed gate: only capture when vehicle is stopped ─────────
+                if not is_vehicle_stopped:
+                    # Vehicle moving too fast — skip this capture
+                    pass
+                elif now_mono - last_save_time >= SAVE_COOLDOWN_SEC:
                     saved_count    += 1
                     last_save_time  = now_mono
 
@@ -516,19 +574,30 @@ def main() -> None:
 
                     try:
                         upload_queue.put_nowait({
-                            "jpeg_bytes":          evidence_bytes,
-                            "captured_at":         utc_iso,
-                            "collection_event_id": 0,
-                            "idempotency_key":     str(uuid.uuid4()),
-                            "width":               orig_w,
-                            "height":              orig_h,
-                            "compression_quality": 80,
+                            "jpeg_bytes":           evidence_bytes,
+                            "captured_at":          utc_iso,
+                            "collection_event_id":  0,
+                            "idempotency_key":      str(uuid.uuid4()),
+                            "width":                orig_w,
+                            "height":               orig_h,
+                            "compression_quality":  80,
+                            "stop_duration_sec":    round(current_event_duration, 2),
+                            "vehicle_speed_kmh":    round(vehicle_speed, 2),
                         })
                     except Exception:
                         pass
 
-                    print(f"[CAPTURE #{saved_count}] Saved: {local_path} | Queued for backend upload.")
+                    print(f"[CAPTURE #{saved_count}] Saved: {local_path} "
+                          f"| Event duration: {current_event_duration:.1f}s "
+                          f"| Speed: {vehicle_speed:.1f} km/h "
+                          f"| Queued for backend upload.")
                     cleanup_old_local_captures(args.save_dir, retention_days=3)
+
+                    # ── Headless LED: blink yellow 3× to confirm snap ────────
+                    try:
+                        leds.notify_motion_snap()
+                    except Exception:
+                        pass
 
             # ── Display & keyboard handling ───────────────────────────────
             if not args.headless:
@@ -565,6 +634,13 @@ def main() -> None:
 
     finally:
         stop_event.set()
+        # Signal fault LED before closing (yellow off, red blink briefly)
+        if args.headless:
+            try:
+                leds.set_fault("Edge gateway shutting down")
+                time.sleep(0.5)   # brief visible fault indication
+            except Exception:
+                pass
         power_sensor.stop()
         _telemetry.stop()
         gnss_sensor.stop()
