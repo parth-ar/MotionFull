@@ -95,24 +95,44 @@ def test_rtc():
         _err(f"Cannot import sensors.rtc: {exc}")
         return False
 
-    # ── Init (runs sync + I2C probe) ─────────────────────────────────────
-    print(f"\n  {DIM}Initialising RTC (NTP sync attempt will run now)…{RESET}")
+    # ── Init (NTP sync + hardware detection) ─────────────────────────────
+    print(f"\n  {DIM}Initialising RTC (NTP sync + hardware detection)…{RESET}")
     hw_present = rtc_mod.init()
 
+    access_mode  = getattr(rtc_mod, "_access_mode",     "unknown")
+    kernel_dev   = getattr(rtc_mod, "_kernel_rtc_dev",  None)
+    kernel_name  = getattr(rtc_mod, "_kernel_rtc_name", None)
+
     print()
-    if hw_present:
-        _ok(f"DS3231 detected on I2C bus (0x68)")
+    if hw_present and access_mode == "kernel":
+        _ok("DS3231 RTC detected — kernel-managed")
+        _ok(f"Hardware present    : True")
+        _ok(f"Module status       : OK")
+        _ok(f"Access mode         : Kernel-managed RTC")
+        _ok(f"Kernel RTC device   : /dev/{kernel_dev}  (/sys/class/rtc/{kernel_dev})")
+        _ok(f"Kernel identifier   : {kernel_name}")
+        _ok(f"I\u00b2C address         : 0x68  (bus 1)")
+    elif hw_present and access_mode == "smbus":
+        _ok("DS3231 RTC detected — direct SMBus access")
+        _ok(f"Hardware present    : True")
+        _ok(f"Access mode         : Direct SMBus")
     else:
-        _warn("DS3231 NOT detected on I2C bus — timestamps still valid (software RTC)")
+        _warn("DS3231 NOT detected by kernel subsystem or direct SMBus")
+        _warn("Hardware present    : False")
         if rtc_mod.rtc_error:
             _err(f"Detail : {rtc_mod.rtc_error}")
         _warn("Pi diagnostic  : sudo i2cdetect -y 1")
-        _warn("  '68' = device present, smbus access OK")
-        _warn("  'UU' = device present but claimed by kernel rtc driver (dtoverlay=i2c-rtc,ds3231)")
-        _warn("  '--' = device absent / wiring fault")
+        _warn("  '68' = direct SMBus accessible")
+        _warn("  'UU' = kernel holds device — check /sys/class/rtc for 1-0068")
+        _warn("  '--' = wiring fault or no power to RTC module")
 
+    # ── Detection status fields ───────────────────────────────────────────
+    _sub("Detection status")
     _field("Hardware present",  hw_present)
     _field("Module status OK",  rtc_mod.rtc_ok)
+    _field("Access mode",       access_mode)
+    _field("Kernel RTC device", f"/dev/{kernel_dev}" if kernel_dev else "N/A")
+    _field("Kernel identifier", kernel_name          if kernel_name else "N/A")
     _field("Sync source",       rtc_mod.sync_source)
     _field("Error",             rtc_mod.rtc_error or "None")
 
@@ -123,14 +143,25 @@ def test_rtc():
     _field("timestamp (IST)",   data.get("timestamp"))
     _field("epoch",             data.get("epoch"),  "ms")
     _field("timezone",          data.get("timezone"))
+    _field("hw_source",         data.get("hw_source"))
 
-    # Cross-check with system time
+    # ── System clock cross-check + drift display ──────────────────────────
     now_sys = datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
     _sub("System clock cross-check")
     _field("System time (local)", now_sys)
+    if data.get("timestamp") and data.get("hw_source") in ("kernel", "smbus"):
+        try:
+            hw_ts  = datetime.datetime.strptime(data["timestamp"], "%Y-%m-%dT%H:%M:%S")
+            sys_ts = datetime.datetime.strptime(now_sys,           "%Y-%m-%dT%H:%M:%S")
+            drift  = abs((hw_ts - sys_ts).total_seconds())
+            drift_col = GREEN if drift < 2 else YELLOW if drift < 10 else RED
+            print(f"    {BOLD}{'RTC \u2194 system drift':<28}{RESET}{drift_col}{drift:.0f} s{RESET}")
+        except Exception:
+            pass
 
     _hr()
     return True
+
 
 
 # ════════════════════════════════════════════════════════════════════════════
