@@ -7,7 +7,7 @@ No algorithm parameters have been changed:
   MIN_CONTOUR_AREA = 350
   BG_ALPHA         = 0.04
   WARMUP_FRAMES    = 30
-  SAVE_COOLDOWN_SEC = 2.0
+  SAVE_COOLDOWN_SEC = 5.0
 
 Linux/Pi note: cv2.VideoCapture() uses V4L2 on Linux.  The Windows-specific
   cv2.CAP_DSHOW backend flag is guarded and omitted on non-Windows platforms.

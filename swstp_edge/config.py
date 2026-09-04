@@ -21,6 +21,8 @@ CAPTURES_DIR       = os.path.join(_HERE, "captures")
 # Device identity  (loaded from device_config.json)
 # ---------------------------------------------------------------------------
 _DEFAULT_DEVICE_ID = "UNPROVISIONED"
+DEFAULT_TIMEZONE   = "Asia/Kolkata"    # Indian Standard Time (IST, UTC+05:30) for Maharashtra, India
+RTC_RESYNC_INTERVAL_HOURS = 1.0      # Recalibrate timing every hour using the internet
 
 def load_device_id() -> str:
     """Read device ID from device_config.json.  Falls back to UNPROVISIONED."""
@@ -34,6 +36,29 @@ def load_device_id() -> str:
     except Exception as exc:
         print(f"[CONFIG] Warning reading {DEVICE_CONFIG_FILE}: {exc}")
         return _DEFAULT_DEVICE_ID
+
+
+def load_timezone() -> str:
+    """Read timezone string from device_config.json. Falls back to DEFAULT_TIMEZONE ('Asia/Kolkata')."""
+    try:
+        with open(DEVICE_CONFIG_FILE, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+        tz_name = str(cfg.get("timezone") or "").strip()
+        return tz_name if tz_name else DEFAULT_TIMEZONE
+    except Exception:
+        return DEFAULT_TIMEZONE
+
+
+def get_timezone_obj():
+    """Return a datetime.tzinfo object for the configured timezone (Asia/Kolkata / IST)."""
+    import datetime
+    tz_name = load_timezone()
+    try:
+        import zoneinfo
+        return zoneinfo.ZoneInfo(tz_name)
+    except Exception:
+        # Robust fallback for Asia/Kolkata (IST: UTC+05:30)
+        return datetime.timezone(datetime.timedelta(hours=5, minutes=30), name="IST")
 
 # ---------------------------------------------------------------------------
 # Backend / session defaults (mirrors webcam_motion_detect.py globals)
@@ -57,6 +82,12 @@ TELEMETRY_INTERVAL_SEC = 1.0 / TELEMETRY_RATE_HZ
 GNSS_DATA_TIMEOUT_SEC   = 3.0         # was GNSS_DATA_TIMEOUT_MS / 1000
 GNSS_DETAIL_INTERVAL_SEC = 1.0        # emit satellite detail once per second
 GNSS_SATELLITE_SNAP_SEC  = 5.0        # drop satellite detail if snapshot > 5 s old
+
+# ---------------------------------------------------------------------------
+# NavCast GNSS — phone app streaming NMEA over USB tethering TCP
+# ---------------------------------------------------------------------------
+NAVCAST_HOST = "10.208.43.190"        # phone USB tethering IP (set in NavCast app)
+NAVCAST_PORT = 10110                   # NavCast TCP port
 
 # ---------------------------------------------------------------------------
 # IMU complementary filter
@@ -91,7 +122,7 @@ DIFF_THRESHOLD   = 22
 MIN_CONTOUR_AREA = 350
 BG_ALPHA         = 0.04
 WARMUP_FRAMES    = 30
-SAVE_COOLDOWN_SEC = 2.0
+SAVE_COOLDOWN_SEC = 5.0   # 5-second buffer between motion captures
 FRAME_SIZE       = (320, 180)
 
 # ---------------------------------------------------------------------------

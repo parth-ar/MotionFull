@@ -1,35 +1,22 @@
 """
 sensors/rtc_sync.py — RTC / NTP synchronisation utility for the SWSTP Pi node.
 
-Purpose
--------
-Ensures the system clock is accurate at startup using the following priority
-cascade:
+Timezone
+--------
+Configured for Maharashtra, India: Asia/Kolkata (IST, UTC+05:30).
 
-  Priority 1 — Internet (NTP)
-    Query public NTP servers.  On success:
-      a) Set the Linux system clock (requires `sudo date -s` or CAP_SYS_TIME).
-      b) Write the accurate time to the DS3231 RTC via smbus2 direct register
-         access OR via `hwclock --systohc` if the kernel i2c-rtc overlay owns
-         the chip.
-      The DS3231 now acts as a battery-backed backup for future offline starts.
+Boot & Recalibration Strategy
+-----------------------------
+1. Boot Initialization:
+   - Checks if internet access is available immediately after boot.
+   - If internet is online: queries NTP (or HTTP Date header fallback) to ensure
+     maximum time accuracy, setting both the Linux system clock and the DS3231 RTC module.
+   - If offline / no internet: immediately refers to the Raspberry Pi's local machine time
+     and sets the DS3231 hardware RTC module to match it without stalling boot.
 
-  Priority 2 — DS3231 hardware RTC (internet unavailable)
-    Read the DS3231 time registers via smbus2 (or `hwclock --hctosys`).
-    The oscillator-stop flag (OSF) in register 0x0F is checked first; if set
-    the DS3231 has lost power and its time is unreliable (falls through to
-    Priority 3).
-
-  Priority 3 — Existing system clock (last resort)
-    If neither NTP nor the RTC is available the system clock is used unchanged
-    and a warning is printed.
-
-Standalone usage:
-    python3 sensors/rtc_sync.py [--dry-run] [--ntp-host pool.ntp.org]
-
-Module usage (called automatically from sensors/rtc.py init):
-    from sensors.rtc_sync import sync
-    result = sync()     # returns a SyncResult namedtuple
+2. Hourly Internet Recalibration:
+   - Background daemon thread runs every hour (`periodic_sync_loop(interval_hours=1.0)`).
+   - Recalibrates both the system clock and the DS3231 RTC module from internet time.
 
 Register map (DS3231, I2C 0x68)
     0x00  seconds    BCD, bits[6:0]
@@ -50,8 +37,20 @@ import struct
 import subprocess
 import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
+
+# Ensure safe terminal encoding across all platforms / serial lines
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+if hasattr(sys.stderr, "reconfigure"):
+    try:
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 
 # ---------------------------------------------------------------------------
 # DS3231 constants
@@ -62,19 +61,62 @@ _REG_STATUS    = 0x0F
 _OSF_BIT       = 0x80   # bit 7 of status register
 
 # ---------------------------------------------------------------------------
-# NTP constants (RFC 4330 SNTPv4 over UDP)
+# NTP & HTTP constants
 # ---------------------------------------------------------------------------
 _NTP_EPOCH_DELTA = 2208988800   # seconds between 1900-01-01 and 1970-01-01
 _NTP_PACKET_FMT  = "!12I"       # 12 unsigned 32-bit integers, big-endian
 _NTP_PORT        = 123
-_NTP_TIMEOUT_SEC = 3.0
-_NTP_SERVERS     = [
+_NTP_TIMEOUT_SEC = 2.5          # fast timeout to avoid delaying boot
+
+# Prioritize Indian NTP pool servers for optimal latency in Maharashtra
+_NTP_SERVERS = [
+    "0.in.pool.ntp.org",
+    "1.in.pool.ntp.org",
+    "2.in.pool.ntp.org",
+    "3.in.pool.ntp.org",
+    "time.google.com",
     "time.cloudflare.com",
     "pool.ntp.org",
-    "time.google.com",
     "time.windows.com",
-    "0.pool.ntp.org",
 ]
+
+_HTTP_TIME_URLS = [
+    "https://clients3.google.com/generate_204",
+    "https://www.cloudflare.com",
+    "https://www.google.com",
+]
+
+
+# ---------------------------------------------------------------------------
+# Timezone helpers (Maharashtra, India: Asia/Kolkata / IST, UTC+05:30)
+# ---------------------------------------------------------------------------
+def get_local_tz() -> datetime.tzinfo:
+    """Return tzinfo for India/Maharashtra (Asia/Kolkata, UTC+05:30)."""
+    try:
+        from config import get_timezone_obj
+        return get_timezone_obj()
+    except Exception:
+        pass
+    try:
+        import zoneinfo
+        return zoneinfo.ZoneInfo("Asia/Kolkata")
+    except Exception:
+        return datetime.timezone(datetime.timedelta(hours=5, minutes=30), name="IST")
+
+
+def get_local_now() -> datetime.datetime:
+    """Return current wall-clock datetime in India/Maharashtra timezone (Asia/Kolkata / IST)."""
+    return datetime.datetime.now(get_local_tz())
+
+
+def configure_os_timezone(tz_name: str = "Asia/Kolkata") -> None:
+    """Set process timezone environment variable (TZ) and call time.tzset() if supported."""
+    try:
+        os.environ["TZ"] = tz_name
+        if hasattr(time, "tzset"):
+            time.tzset()
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -83,8 +125,9 @@ _NTP_SERVERS     = [
 @dataclass
 class SyncResult:
     success:      bool
-    source:       str           # "ntp" | "ds3231" | "system"
+    source:       str           # "internet_ntp" | "internet_http" | "pi_local" | "ds3231" | "system"
     utc_time:     Optional[datetime.datetime] = None
+    local_time:   Optional[datetime.datetime] = None
     ntp_server:   Optional[str] = None
     rtc_written:  bool          = False
     sysclock_set: bool          = False
@@ -103,7 +146,7 @@ def _bcd_to_dec(b: int) -> int:
 
 
 # ---------------------------------------------------------------------------
-# NTP query (raw socket — no external dependency)
+# NTP query (raw UDP socket — zero external dependencies)
 # ---------------------------------------------------------------------------
 def _query_ntp(host: str, timeout: float = _NTP_TIMEOUT_SEC) -> Optional[datetime.datetime]:
     """
@@ -122,7 +165,6 @@ def _query_ntp(host: str, timeout: float = _NTP_TIMEOUT_SEC) -> Optional[datetim
         if len(raw) < 48:
             return None
 
-        # Transmit timestamp is at offset 40 (words 10 & 11)
         unpacked = struct.unpack(_NTP_PACKET_FMT, raw[:48])
         tx_secs  = unpacked[10] - _NTP_EPOCH_DELTA
         tx_frac  = unpacked[11]
@@ -144,23 +186,66 @@ def query_ntp(servers=None, timeout=_NTP_TIMEOUT_SEC):
 
 
 # ---------------------------------------------------------------------------
+# HTTP Date header fallback
+# ---------------------------------------------------------------------------
+def query_http_time(urls=None, timeout: float = 2.0) -> Optional[datetime.datetime]:
+    """
+    Fallback method to fetch internet time via HTTP Date header.
+    Particularly effective on cellular / 4G connections where UDP port 123 may be blocked.
+    """
+    import email.utils
+    import urllib.request
+
+    for url in (urls or _HTTP_TIME_URLS):
+        try:
+            req = urllib.request.Request(url, method="HEAD")
+            req.add_header("User-Agent", "SWSTP-Edge-RTC/1.0")
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                date_hdr = resp.headers.get("Date")
+                if date_hdr:
+                    parsed = email.utils.parsedate_to_datetime(date_hdr)
+                    if parsed is not None:
+                        return parsed.astimezone(datetime.timezone.utc)
+        except Exception:
+            continue
+    return None
+
+
+def query_internet_time(servers=None, timeout: float = _NTP_TIMEOUT_SEC):
+    """
+    Query internet time using NTP first, falling back to HTTP Date headers.
+    Returns (datetime_utc, source_label, server_name) or (None, None, None).
+    """
+    dt, host = query_ntp(servers=servers, timeout=timeout)
+    if dt is not None:
+        return dt, "internet_ntp", host
+
+    dt_http = query_http_time(timeout=2.0)
+    if dt_http is not None:
+        return dt_http, "internet_http", "HTTP Date header"
+
+    return None, None, None
+
+
+# ---------------------------------------------------------------------------
 # System clock setter
 # ---------------------------------------------------------------------------
-def _set_system_clock(dt_utc: datetime.datetime, dry_run: bool = False) -> bool:
+def _set_system_clock(dt: datetime.datetime, dry_run: bool = False) -> bool:
     """
-    Set the Linux system clock to dt_utc.
+    Set the Linux system clock to dt (converted to UTC).
 
     Tries three methods in order:
-      1. `sudo date -s` (works if sudo is passwordless for date)
-      2. `date` directly (works if running as root)
+      1. `sudo date -u -s` (works if sudo is passwordless for date)
+      2. `date -u -s` directly (works if running as root)
       3. Python ctypes clock_settime (requires CAP_SYS_TIME)
     """
+    dt_utc = dt.astimezone(datetime.timezone.utc) if dt.tzinfo else dt
     iso = dt_utc.strftime("%Y-%m-%d %H:%M:%S")
     if dry_run:
         print(f"  [DRY-RUN] Would set system clock to: {iso} UTC")
         return True
 
-    # Method 1: sudo date
+    # Method 1: sudo / direct date
     for cmd in (
         ["sudo", "date", "-u", "-s", iso],
         ["date", "-u", "-s", iso],
@@ -203,14 +288,13 @@ def _ds3231_read(bus) -> Optional[datetime.datetime]:
     try:
         status = bus.read_byte_data(_DS3231_ADDR, _REG_STATUS)
         if status & _OSF_BIT:
-            print("  [RTC] OSF flag set — DS3231 lost power; time unreliable.")
+            print("  [RTC] OSF flag set - DS3231 lost power; time unreliable.")
             return None
 
         raw = bus.read_i2c_block_data(_DS3231_ADDR, _REG_SECONDS, 7)
         sec  = _bcd_to_dec(raw[0] & 0x7F)
         mn   = _bcd_to_dec(raw[1] & 0x7F)
         hr   = _bcd_to_dec(raw[2] & 0x3F)   # 24-h mode
-        # raw[3] = day-of-week (1-7) — not needed for datetime
         day  = _bcd_to_dec(raw[4] & 0x3F)
         mon  = _bcd_to_dec(raw[5] & 0x1F)
         yr   = _bcd_to_dec(raw[6]) + 2000   # DS3231 stores 00-99
@@ -222,15 +306,16 @@ def _ds3231_read(bus) -> Optional[datetime.datetime]:
         return None
 
 
-def _ds3231_write(bus, dt_utc: datetime.datetime, dry_run: bool = False) -> bool:
+def _ds3231_write(bus, dt: datetime.datetime, dry_run: bool = False) -> bool:
     """
-    Write dt_utc to the DS3231 time registers and clear the OSF flag.
+    Write dt (converted to UTC) to the DS3231 time registers and clear OSF flag.
     """
+    dt_utc = dt.astimezone(datetime.timezone.utc) if dt.tzinfo else dt
     if dry_run:
         print(f"  [DRY-RUN] Would write {dt_utc.strftime('%Y-%m-%d %H:%M:%S')} UTC to DS3231.")
         return True
     try:
-        dow = dt_utc.isoweekday()   # Monday=1 … Sunday=7
+        dow = dt_utc.isoweekday()   # Monday=1 ... Sunday=7
         yr  = dt_utc.year - 2000
         regs = [
             _dec_to_bcd(dt_utc.second),
@@ -253,207 +338,272 @@ def _ds3231_write(bus, dt_utc: datetime.datetime, dry_run: bool = False) -> bool
 
 
 def _hwclock_systohc(dry_run: bool = False) -> bool:
-    """Write system clock → DS3231 using the kernel hwclock tool."""
+    """Write system clock -> DS3231 using the kernel hwclock tool."""
     if dry_run:
         print("  [DRY-RUN] Would run: sudo hwclock --systohc")
         return True
-    try:
-        r = subprocess.run(["sudo", "hwclock", "--systohc"], capture_output=True, timeout=5)
-        return r.returncode == 0
-    except Exception:
-        return False
+    for cmd in (["sudo", "hwclock", "--systohc"], ["hwclock", "--systohc"]):
+        try:
+            r = subprocess.run(cmd, capture_output=True, timeout=5)
+            if r.returncode == 0:
+                return True
+        except Exception:
+            pass
+    return False
 
 
 def _hwclock_hctosys(dry_run: bool = False) -> bool:
-    """Read DS3231 → system clock using the kernel hwclock tool."""
+    """Read DS3231 -> system clock using the kernel hwclock tool."""
     if dry_run:
         print("  [DRY-RUN] Would run: sudo hwclock --hctosys")
         return True
-    try:
-        r = subprocess.run(["sudo", "hwclock", "--hctosys"], capture_output=True, timeout=5)
-        return r.returncode == 0
-    except Exception:
-        return False
+    for cmd in (["sudo", "hwclock", "--hctosys"], ["hwclock", "--hctosys"]):
+        try:
+            r = subprocess.run(cmd, capture_output=True, timeout=5)
+            if r.returncode == 0:
+                return True
+        except Exception:
+            pass
+    return False
+
+
+def _write_rtc_module(bus, dt_target: datetime.datetime, dry_run: bool = False) -> bool:
+    """Helper to write time to DS3231 using direct smbus2 or kernel hwclock."""
+    written = False
+    if bus is not None:
+        written = _ds3231_write(bus, dt_target, dry_run=dry_run)
+    if not written:
+        written = _hwclock_systohc(dry_run=dry_run)
+    return written
 
 
 # ---------------------------------------------------------------------------
-# Main sync function
+# Core Synchronization Logic
 # ---------------------------------------------------------------------------
-def sync(ntp_servers=None, dry_run: bool = False, verbose: bool = True) -> SyncResult:
+def sync(ntp_servers=None, dry_run: bool = False, verbose: bool = True,
+         try_internet: bool = True) -> SyncResult:
     """
-    Run the full NTP → DS3231 → system synchronisation cascade.
+    Main clock synchronisation entry point called at boot.
 
-    Returns a SyncResult describing what happened.
+    Logic:
+      1. Configure process timezone for Maharashtra, India (Asia/Kolkata / IST).
+      2. If internet access is available after boot (try_internet=True):
+         Use internet time (NTP / HTTP) to set the system clock and DS3231 RTC module.
+      3. If internet is NOT available:
+         Refer to the Raspberry Pi's local machine time, setting the DS3231 RTC module
+         to match it without blocking boot.
     """
     def log(msg):
         if verbose:
             print(msg)
 
-    log("\n[RTC-SYNC] Starting clock synchronisation…")
+    configure_os_timezone("Asia/Kolkata")
+    local_tz = get_local_tz()
 
-    # ── Open smbus2 once (used for both read and write if available) ──────
+    log("\n[RTC-SYNC] Initialising clock synchronisation (Timezone: Asia/Kolkata, IST)...")
+
+    # Open smbus2 if available
     bus = None
     try:
         import smbus2  # type: ignore
         bus = smbus2.SMBus(1)
     except Exception as exc:
-        log(f"  [RTC-SYNC] smbus2 unavailable ({exc}) — will use hwclock commands only.")
+        log(f"  [RTC-SYNC] smbus2 unavailable ({exc}) - using hwclock commands if needed.")
 
-    # ─────────────────────────────────────────────────────────────────────
-    # Priority 1: NTP
-    # ─────────────────────────────────────────────────────────────────────
-    log("  [1/3] Querying NTP servers…")
-    ntp_time, ntp_server = query_ntp(servers=ntp_servers)
+    # ── Step 1: Internet Check (if enabled for boot) ────────────────────
+    if try_internet:
+        log("  [1/2] Checking internet access for accurate network time...")
+        net_time, src_label, srv_name = query_internet_time(servers=ntp_servers, timeout=_NTP_TIMEOUT_SEC)
 
-    if ntp_time is not None:
-        log(f"  [1/3] ✓ NTP OK: {ntp_time.strftime('%Y-%m-%d %H:%M:%S')} UTC  (server: {ntp_server})")
-        result = SyncResult(success=True, source="ntp", utc_time=ntp_time, ntp_server=ntp_server)
+        if net_time is not None:
+            local_time = net_time.astimezone(local_tz)
+            log(f"  [1/2] [OK] Internet access available: {local_time.strftime('%Y-%m-%d %H:%M:%S')} IST ({srv_name})")
 
-        # Set system clock
-        result.sysclock_set = _set_system_clock(ntp_time, dry_run=dry_run)
-        if result.sysclock_set:
-            log("  [1/3] ✓ System clock updated from NTP.")
-        else:
-            log("  [1/3] ⚠ Could not set system clock (need sudo / root).")
+            result = SyncResult(
+                success=True,
+                source=src_label,
+                utc_time=net_time,
+                local_time=local_time,
+                ntp_server=srv_name,
+            )
 
-        # Write to DS3231 — try smbus2 first, fall back to hwclock
-        if bus is not None:
-            result.rtc_written = _ds3231_write(bus, ntp_time, dry_run=dry_run)
-            if result.rtc_written:
-                log(f"  [1/3] ✓ DS3231 RTC written via smbus2 (0x{_DS3231_ADDR:02X}).")
-        if not result.rtc_written:
-            # If system clock was set, hwclock --systohc copies it to the RTC
+            # Update system clock
+            result.sysclock_set = _set_system_clock(net_time, dry_run=dry_run)
             if result.sysclock_set:
-                result.rtc_written = _hwclock_systohc(dry_run=dry_run)
-                if result.rtc_written:
-                    log("  [1/3] ✓ DS3231 RTC written via hwclock --systohc.")
-                else:
-                    log("  [1/3] ⚠ hwclock --systohc failed; RTC not written.")
-
-        if bus is not None:
-            try: bus.close()
-            except Exception: pass
-        log("[RTC-SYNC] Done. Source: NTP\n")
-        return result
-
-    log("  [1/3] ✗ NTP unavailable (no internet or all servers timed out).")
-
-    # ─────────────────────────────────────────────────────────────────────
-    # Priority 2: DS3231 hardware
-    # ─────────────────────────────────────────────────────────────────────
-    log("  [2/3] Reading DS3231 hardware RTC…")
-    rtc_time: Optional[datetime.datetime] = None
-
-    if bus is not None:
-        rtc_time = _ds3231_read(bus)
-        if rtc_time is not None:
-            log(f"  [2/3] ✓ DS3231 time: {rtc_time.strftime('%Y-%m-%d %H:%M:%S')} UTC")
-
-    # If smbus2 unavailable or read failed, try hwclock --hctosys
-    if rtc_time is None:
-        ok = _hwclock_hctosys(dry_run=dry_run)
-        if ok:
-            # hwclock already updated the system clock; read it back
-            rtc_time = datetime.datetime.now(datetime.timezone.utc)
-            log(f"  [2/3] ✓ hwclock --hctosys OK: {rtc_time.strftime('%Y-%m-%d %H:%M:%S')} UTC")
-
-    if rtc_time is not None:
-        result = SyncResult(success=True, source="ds3231", utc_time=rtc_time)
-
-        # Set system clock from DS3231 if not done by hwclock above
-        if bus is not None:   # smbus2 path — need to set clock manually
-            result.sysclock_set = _set_system_clock(rtc_time, dry_run=dry_run)
-            if result.sysclock_set:
-                log("  [2/3] ✓ System clock set from DS3231.")
+                log("  [1/2] [OK] Linux system clock calibrated from internet.")
             else:
-                log("  [2/3] ⚠ Could not set system clock (need sudo / root).")
-        else:
-            result.sysclock_set = True   # hwclock already did it
+                log("  [1/2] [WARN] System clock set skipped (requires sudo/root privileges).")
 
-        if bus is not None:
-            try: bus.close()
-            except Exception: pass
-        log("[RTC-SYNC] Done. Source: DS3231 hardware backup\n")
-        return result
+            # Write accurate time to DS3231 hardware RTC
+            result.rtc_written = _write_rtc_module(bus, net_time, dry_run=dry_run)
+            if result.rtc_written:
+                log(f"  [1/2] [OK] DS3231 RTC module calibrated with internet time.")
+            else:
+                log("  [1/2] [WARN] DS3231 RTC write unsuccessful.")
 
-    log("  [2/3] ✗ DS3231 unavailable or OSF flag set.")
+            if bus is not None:
+                try: bus.close()
+                except Exception: pass
 
-    # ─────────────────────────────────────────────────────────────────────
-    # Priority 3: System clock as-is
-    # ─────────────────────────────────────────────────────────────────────
-    log("  [3/3] ⚠ Using existing system clock (may be inaccurate).")
-    sys_time = datetime.datetime.now(datetime.timezone.utc)
-    log(f"  [3/3] System clock: {sys_time.strftime('%Y-%m-%d %H:%M:%S')} UTC")
+            log(f"[RTC-SYNC] Synchronisation complete. Source: {src_label.upper()}.\n")
+            return result
+
+        log("  [1/2] [FAIL] Internet unavailable at boot.")
+
+    # ── Step 2: Fallback to Raspberry Pi Local Machine Time ──────────────
+    log("  [2/2] Referring to Raspberry Pi local machine time...")
+    local_now = get_local_now()
+    utc_now   = local_now.astimezone(datetime.timezone.utc)
+
+    log(f"  [2/2] [OK] Local machine time: {local_now.strftime('%Y-%m-%d %H:%M:%S')} IST")
+
+    result = SyncResult(
+        success=True,
+        source="pi_local",
+        utc_time=utc_now,
+        local_time=local_now,
+        sysclock_set=True,
+    )
+
+    # Set the DS3231 hardware RTC module using the local machine time
+    result.rtc_written = _write_rtc_module(bus, utc_now, dry_run=dry_run)
+    if result.rtc_written:
+        log("  [2/2] [OK] DS3231 RTC module set from Raspberry Pi local machine time.")
+    else:
+        log("  [2/2] [WARN] Could not write to DS3231 (using local system clock).")
 
     if bus is not None:
         try: bus.close()
         except Exception: pass
 
-    log("[RTC-SYNC] Done. Source: system clock (fallback)\n")
+    log("[RTC-SYNC] Synchronisation complete. Source: PI_LOCAL (Timezone: Asia/Kolkata).\n")
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Hourly Internet Recalibration
+# ---------------------------------------------------------------------------
+def recalibrate_from_internet(ntp_servers=None, dry_run: bool = False,
+                              verbose: bool = True) -> SyncResult:
+    """
+    Recalibrate the system clock and DS3231 RTC module using internet time (NTP/HTTP).
+    Invoked every hour by periodic_sync_loop.
+    """
+    def log(msg):
+        if verbose:
+            print(msg)
+
+    local_tz = get_local_tz()
+    log("\n[RTC-RECALIBRATE] Starting hourly internet recalibration...")
+
+    bus = None
+    try:
+        import smbus2  # type: ignore
+        bus = smbus2.SMBus(1)
+    except Exception:
+        pass
+
+    net_time, src_label, srv_name = query_internet_time(servers=ntp_servers, timeout=3.0)
+
+    if net_time is not None:
+        local_time = net_time.astimezone(local_tz)
+        log(f"  [RECALIBRATE] [OK] Internet time verified: {local_time.strftime('%Y-%m-%d %H:%M:%S')} IST ({srv_name})")
+
+        sysclock_set = _set_system_clock(net_time, dry_run=dry_run)
+        rtc_written  = _write_rtc_module(bus, net_time, dry_run=dry_run)
+
+        # Update rtc.sync_source if sensors.rtc module is loaded
+        try:
+            import sensors.rtc as _rtc
+            _rtc.sync_source = src_label
+        except Exception:
+            pass
+
+        if bus is not None:
+            try: bus.close()
+            except Exception: pass
+
+        log(f"  [RECALIBRATE] [OK] Clock & DS3231 calibrated successfully (sysclock={sysclock_set}, rtc={rtc_written}).\n")
+        return SyncResult(
+            success=True,
+            source=src_label,
+            utc_time=net_time,
+            local_time=local_time,
+            ntp_server=srv_name,
+            rtc_written=rtc_written,
+            sysclock_set=sysclock_set,
+        )
+
+    if bus is not None:
+        try: bus.close()
+        except Exception: pass
+
+    log("  [RECALIBRATE] [WARN] Internet unreachable during hourly recalibration; current timing maintained.\n")
+    local_now = get_local_now()
     return SyncResult(
         success=False,
         source="system",
-        utc_time=sys_time,
-        error="NTP unreachable and DS3231 unavailable or invalid",
+        utc_time=local_now.astimezone(datetime.timezone.utc),
+        local_time=local_now,
+        error="Internet unreachable for recalibration",
     )
 
 
 # ---------------------------------------------------------------------------
-# Periodic re-sync (background thread helper)
+# Periodic Sync Loop (Hourly)
 # ---------------------------------------------------------------------------
-def periodic_sync_loop(interval_hours: float = 6.0, stop_event=None) -> None:
+def periodic_sync_loop(interval_hours: float = 1.0, stop_event=None) -> None:
     """
-    Re-sync the system clock and DS3231 from NTP every `interval_hours`.
-    Designed to run as a daemon thread from main.py.
-
-    If NTP is unavailable at a re-sync attempt the DS3231 is used, keeping the
-    system clock accurate even over long offline periods.
+    Recalibrate the system clock and DS3231 from internet every `interval_hours` (default: 1.0 h = hourly).
+    Designed to run as a background daemon thread from main.py.
     """
     import threading
     _stop = stop_event or threading.Event()
     while not _stop.is_set():
         _stop.wait(interval_hours * 3600)
         if not _stop.is_set():
-            print("\n[RTC-SYNC] Scheduled re-sync…")
-            sync(verbose=True)
+            recalibrate_from_internet(verbose=True)
 
 
 # ---------------------------------------------------------------------------
-# CLI entry point
+# Standalone CLI entry point
 # ---------------------------------------------------------------------------
 def _cli():
     parser = argparse.ArgumentParser(
-        description="SWSTP RTC/NTP synchronisation utility — "
-                    "sets DS3231 from internet time, falls back to DS3231 if offline."
+        description="SWSTP RTC/NTP synchronisation utility (Maharashtra / Asia/Kolkata)."
     )
-    parser.add_argument("--ntp-host", nargs="+", default=None,
-                        metavar="HOST",
-                        help="NTP server(s) to query (default: cloudflare, pool.ntp.org, google)")
+    parser.add_argument("--ntp-host", nargs="+", default=None, metavar="HOST",
+                        help="NTP server(s) to query")
     parser.add_argument("--dry-run", action="store_true",
-                        help="Show what would be done without writing anything")
+                        help="Show what would be done without modifying hardware or clock")
     parser.add_argument("--interval", type=float, default=0,
-                        help="If > 0, re-sync every N hours in a loop (Ctrl-C to stop)")
+                        help="If > 0, run recalibration loop every N hours")
+    parser.add_argument("--no-internet", action="store_true",
+                        help="Force local machine time without checking internet")
     args = parser.parse_args()
 
-    result = sync(ntp_servers=args.ntp_host, dry_run=args.dry_run, verbose=True)
+    result = sync(ntp_servers=args.ntp_host, dry_run=args.dry_run, verbose=True,
+                  try_internet=not args.no_internet)
 
-    print("─" * 50)
+    print("-" * 55)
+    print(f"  Timezone      : Asia/Kolkata (IST, UTC+05:30)")
     print(f"  Sync source   : {result.source.upper()}")
-    print(f"  UTC time      : {result.utc_time.strftime('%Y-%m-%d %H:%M:%S') if result.utc_time else 'unknown'}")
+    print(f"  Local time    : {result.local_time.strftime('%Y-%m-%d %H:%M:%S') if result.local_time else 'unknown'} IST")
+    print(f"  UTC time      : {result.utc_time.strftime('%Y-%m-%d %H:%M:%S') if result.utc_time else 'unknown'} UTC")
     print(f"  System clock  : {'updated' if result.sysclock_set else 'not updated'}")
     print(f"  DS3231 written: {'yes' if result.rtc_written else 'no'}")
     if result.ntp_server:
-        print(f"  NTP server    : {result.ntp_server}")
+        print(f"  Server        : {result.ntp_server}")
     if result.error:
         print(f"  Warning       : {result.error}")
-    print("─" * 50)
+    print("-" * 55)
 
     if args.interval > 0:
-        print(f"\n[RTC-SYNC] Entering periodic re-sync loop (every {args.interval} h). Ctrl-C to stop.\n")
+        print(f"\n[RTC-SYNC] Entering periodic recalibration loop (every {args.interval} h). Ctrl-C to stop.\n")
         try:
             while True:
                 time.sleep(args.interval * 3600)
-                sync(ntp_servers=args.ntp_host, dry_run=args.dry_run, verbose=True)
+                recalibrate_from_internet(ntp_servers=args.ntp_host, dry_run=args.dry_run, verbose=True)
         except KeyboardInterrupt:
             print("\n[RTC-SYNC] Stopped.")
 

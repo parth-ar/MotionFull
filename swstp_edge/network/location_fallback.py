@@ -150,13 +150,13 @@ def gps_fallback_worker(stop_event: threading.Event,
                         latest_sensor["location_source"] = "last_known"
 
             else:
-                # GNSS recovered — disengage fallback
+                # NavCast recovered — disengage fallback
                 if latest_sensor.get("location_source") in ("fallback", "last_known"):
-                    latest_sensor["location_source"] = "gnss"
+                    latest_sensor["location_source"] = "navcast"
                     hardware_state["gps"]["logged_fallback"] = False
                     print("\n" + "=" * 65)
-                    print(" [HARDWARE] GPS FALLBACK -> GNSS RECOVERED")
-                    print("            Hardware GNSS fix restored — IP fallback disengaged.")
+                    print(" [HARDWARE] GPS FALLBACK -> NAVCAST RECOVERED")
+                    print("            NavCast GNSS fix restored — IP fallback disengaged.")
                     print("=" * 65 + "\n")
 
         stop_event.wait(5.0)

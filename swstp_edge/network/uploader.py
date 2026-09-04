@@ -206,6 +206,9 @@ def live_frame_streamer(backend_url: str, device_id: str, fps: float,
     frame_lock  — threading.Lock protecting the shared frame buffer (passed from main.py)
     get_frame   — callable() → numpy array | None; returns the latest BGR frame
                   (injected by main.py to avoid a circular import)
+
+    Resilience: throttled error logging + exponential back-off reconnect so a transient
+    network drop doesn't spam the console or stall frame delivery.
     """
     from telemetry import latest_sensor, hardware_state
     import cv2
@@ -213,22 +216,36 @@ def live_frame_streamer(backend_url: str, device_id: str, fps: float,
     target_fps = max(1.0, min(30.0, fps))
     interval   = 1.0 / target_fps
 
-    session = requests.Session()
-    adapter = requests.adapters.HTTPAdapter(pool_connections=5, pool_maxsize=10, max_retries=0)
-    session.mount("http://", adapter)
-    session.mount("https://", adapter)
-
-    logged_first_ok    = False
-    last_sent_frame_id = None
-
     # Provide a no-op fallback if the caller doesn't inject frame accessors
     _lock      = frame_lock or threading.Lock()
     _get_frame = get_frame or (lambda: None)
 
+    def _make_session():
+        s = requests.Session()
+        a = requests.adapters.HTTPAdapter(pool_connections=5, pool_maxsize=10, max_retries=0)
+        s.mount("http://", a)
+        s.mount("https://", a)
+        return s
+
+    session            = _make_session()
+    logged_first_ok    = False
+    last_sent_frame_id = None
+
+    # Error back-off state
+    _err_count         = 0
+    _last_err_log      = 0.0
+    _ERR_LOG_INTERVAL  = 10.0   # seconds between repeated error messages
+    _backoff_until     = 0.0    # epoch: don't attempt to send until this time
+
     while not stop_event.is_set():
         loop_start = time.time()
-        frame_to_send = None
 
+        # Honour back-off window (reconnect delay after repeated failures)
+        if loop_start < _backoff_until:
+            stop_event.wait(min(0.5, _backoff_until - loop_start))
+            continue
+
+        frame_to_send = None
         with _lock:
             candidate = _get_frame()
             if candidate is not None and id(candidate) != last_sent_frame_id:
@@ -239,13 +256,13 @@ def live_frame_streamer(backend_url: str, device_id: str, fps: float,
             try:
                 _, enc = cv2.imencode('.jpg', frame_to_send, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
                 frame_bytes = enc.tobytes()
-                cur_dev   = latest_sensor.get("deviceId") or dynamic_session_info.get("deviceId") or device_id
+                cur_dev    = latest_sensor.get("deviceId") or dynamic_session_info.get("deviceId") or device_id
                 stream_url = f"{backend_url.rstrip('/')}/api/camera/{cur_dev}/frame"
                 resp = session.post(
                     stream_url,
                     data=frame_bytes,
                     headers={"Content-Type": "image/jpeg", "Connection": "keep-alive"},
-                    timeout=1.0,
+                    timeout=1.5,
                 )
                 if resp.status_code == 200:
                     hardware_state["backend"]["connected"]  = True
@@ -253,15 +270,51 @@ def live_frame_streamer(backend_url: str, device_id: str, fps: float,
                     if not logged_first_ok:
                         logged_first_ok = True
                         print(f"\n[CAMERA STREAM] Active -> Streaming frames to {stream_url} @ {target_fps:.1f} FPS (HTTP 200 OK)\n")
-            except Exception:
+                    # Reset error counters on success
+                    _err_count     = 0
+                    _backoff_until = 0.0
+                else:
+                    # Non-200 but server responded: count as a soft error, no back-off
+                    hardware_state["backend"]["connected"] = False
+                    now = time.time()
+                    if now - _last_err_log > _ERR_LOG_INTERVAL:
+                        print(f"[CAMERA STREAM] Backend returned HTTP {resp.status_code} — will retry.")
+                        _last_err_log = now
+
+            except (requests.exceptions.Timeout,
+                    requests.exceptions.ConnectionError) as net_err:
                 hardware_state["backend"]["connected"] = False
-                time.sleep(0.5)
+                _err_count += 1
+                now = time.time()
+                if now - _last_err_log > _ERR_LOG_INTERVAL:
+                    print(f"[CAMERA STREAM] Network error (attempt {_err_count}): {net_err}")
+                    _last_err_log = now
+                # Exponential back-off: 0.5 s, 1 s, 2 s … up to 8 s
+                backoff = min(8.0, 0.5 * (2 ** min(_err_count - 1, 4)))
+                _backoff_until = now + backoff
+                # Rebuild session to clear any stale connections
+                try:
+                    session.close()
+                except Exception:
+                    pass
+                session = _make_session()
+
+            except Exception as exc:
+                hardware_state["backend"]["connected"] = False
+                now = time.time()
+                if now - _last_err_log > _ERR_LOG_INTERVAL:
+                    print(f"[CAMERA STREAM] Unexpected error: {exc}")
+                    _last_err_log = now
 
         elapsed   = time.time() - loop_start
         sleep_dur = max(0.005, interval - elapsed)
         stop_event.wait(sleep_dur)
 
-    session.close()
+    try:
+        session.close()
+    except Exception:
+        pass
+
 
 
 # ---------------------------------------------------------------------------

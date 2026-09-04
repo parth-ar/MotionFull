@@ -2,7 +2,7 @@
 main.py — SWSTP Edge Gateway for Raspberry Pi 4B.
 
 Single-device replacement for the original Arduino Uno + PC two-device stack.
-Sensors (DS3231 RTC, MPU-6500 IMU, NEO-6M GNSS) are read natively from the Pi.
+Sensors (DS3231 RTC, MPU-6500 IMU, NavCast GNSS) are read natively from the Pi.
 
 Run from a terminal:
     python3 main.py [--headless] [--backend-url URL] [--device-id ID] ...
@@ -170,7 +170,7 @@ def main() -> None:
     print("\n=== SWSTP Pi EDGE SENSOR INIT ===")
     rtc_ok   = rtc_sensor.init()
     imu_ok   = imu_sensor.init()
-    gnss_ok  = gnss_sensor.init()   # starts background gpsdclient thread
+    gnss_ok  = gnss_sensor.init()   # starts background NavCast TCP reader thread
 
     # LEDs
     try:
@@ -178,24 +178,27 @@ def main() -> None:
     except Exception as exc:
         print(f"[LEDS] init skipped: {exc}")
 
-    # ── Periodic RTC re-sync thread (every 6 h) ─────────────────────────
+    # ── Periodic RTC re-sync thread (every hour) ────────────────────────
+    resync_interval = getattr(_cfg, "RTC_RESYNC_INTERVAL_HOURS", 1.0)
     t_rtc_resync = threading.Thread(
         target=periodic_sync_loop,
-        args=(6.0,),   # re-sync every 6 hours
+        args=(resync_interval,),   # recalibrate timing every hour
         daemon=True, name="rtc-resync",
     )
     t_rtc_resync.start()
 
+    tz_name = getattr(_cfg, "load_timezone", lambda: "Asia/Kolkata")()
     print("\n========================================================")
     print(" SWSTP EDGE GATEWAY INITIALIZING (Raspberry Pi 4B)")
     print(f" Backend Endpoint: {effective_backend_url}")
     print(f" Device ID:        {device_id}")
     print(f" ULB ID:           {effective_ulb_id}")
     print(f" Session ID:       {effective_session_id if effective_session_id else 'DYNAMIC HARDWARE BIND'}")
+    print(f" Timezone:         {tz_name} (IST, UTC+05:30)")
     print(f" Motion Captures:  {os.path.abspath(args.save_dir)}")
-    print(f" RTC:              {'OK (kernel + DS3231)' if rtc_ok else 'FALLBACK (system clock)'}")
+    print(f" RTC:              {'OK (kernel + DS3231)' if rtc_ok else 'FALLBACK (system clock)'} [Source: {rtc_sensor.sync_source.upper()}]")
     print(f" IMU:              {'OK (MPU-6500 @ 0x69)' if imu_ok else 'FAULT'}")
-    print(f" GNSS:             Started (NEO-6M via gpsd on /dev/serial0)")
+    print(f" GNSS:             NavCast TCP reader started ({_cfg.NAVCAST_HOST}:{_cfg.NAVCAST_PORT})")
     print("========================================================\n")
 
     # ── Camera / video source ────────────────────────────────────────────

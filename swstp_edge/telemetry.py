@@ -59,7 +59,7 @@ import sensors.imu  as imu_sensor
 import sensors.gnss as gnss_sensor
 import sensors.leds as leds
 
-from config import TELEMETRY_RATE_HZ, TELEMETRY_INTERVAL_SEC
+from config import TELEMETRY_RATE_HZ, TELEMETRY_INTERVAL_SEC, get_timezone_obj
 from geofence import (
     snap_coordinates_to_road, compute_heading_from_gps_history,
     track_field_events, haversine_dist_meters, is_in_safe_zone,
@@ -103,7 +103,7 @@ hardware_state: dict = {
     "camera":  {"detected": False, "source": None, "resolution": None, "fps": None},
     "serial":  {"connected": True, "port": "Pi-native", "baud": None, "desc": "Raspberry Pi native sensors"},
     "rtc":     {"detected": False, "module": "DS3231 (I2C 0x68)", "last_ts": None, "logged_online": False, "logged_error": False},
-    "gps":     {"detected": False, "module": "NEO-6M (HW-UART /dev/serial0 → gpsd)", "fix": False, "coords": None, "logged_detected": False, "logged_fix": False, "logged_fallback": False},
+    "gps":     {"detected": False, "module": "NavCast (TCP USB tethering)", "fix": False, "coords": None, "logged_detected": False, "logged_fix": False, "logged_fallback": False},
     "backend": {"connected": False, "last_ping": 0, "upload_count": 0, "telemetry_count": 0, "active_session_id": 0},
 }
 
@@ -126,7 +126,7 @@ def build_telemetry_packet(device_id: str) -> dict:
     """
     # --- 1. RTC ---
     rtc_data  = rtc_sensor.read()
-    iso_time  = rtc_data.get("timestamp") or datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    iso_time  = rtc_data.get("timestamp") or datetime.datetime.now(get_timezone_obj()).strftime("%Y-%m-%d %H:%M:%S")
     epoch_ms  = rtc_data.get("epoch") or int(time.time() * 1000)
 
     # --- 2. IMU ---
@@ -142,7 +142,7 @@ def build_telemetry_packet(device_id: str) -> dict:
     if gnss_data.get("data_received") and not hardware_state["gps"]["logged_detected"]:
         hardware_state["gps"]["detected"]        = True
         hardware_state["gps"]["logged_detected"] = True
-        _log_hardware("GPS MODULE (NEO-6M)", "STREAM DETECTED", "gpsd stream active.")
+        _log_hardware("GPS MODULE (NavCast)", "STREAM DETECTED", "NavCast NMEA TCP stream active.")
 
     if gnss_fix and lat_raw is not None and lon_raw is not None:
         if abs(lat_raw) > 0.001 and abs(lon_raw) > 0.001:
@@ -153,7 +153,7 @@ def build_telemetry_packet(device_id: str) -> dict:
                 hardware_state["gps"]["fix"]        = True
                 hardware_state["gps"]["logged_fix"] = True
                 _log_hardware(
-                    "GPS MODULE (NEO-6M)", "SATELLITE FIX & ROAD SNAP",
+                    "GPS MODULE (NavCast)", "SATELLITE FIX & ROAD SNAP",
                     f"Raw GPS: ({lat_raw:.6f}, {lon_raw:.6f}) -> Road: ({snapped_lat:.6f}, {snapped_lon:.6f}) "
                     f"[Drift: {drift_m:.1f}m | SafeZone: {in_sz} | Snapped: {is_snapped}]"
                 )
