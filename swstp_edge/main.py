@@ -311,9 +311,14 @@ def main() -> None:
     # ── GUI window ────────────────────────────────────────────────────────
     WIN_TITLE = "SWSTP Motion & Telemetry Gateway (Pi)"
     if not args.headless:
-        cv2.namedWindow(WIN_TITLE, cv2.WINDOW_NORMAL)
-        cv2.resizeWindow(WIN_TITLE, 960, 540)
-        cv2.setMouseCallback(WIN_TITLE, on_mouse_roi, {"width": cam_w, "height": cam_h})
+        try:
+            cv2.namedWindow(WIN_TITLE, cv2.WINDOW_NORMAL)
+            cv2.resizeWindow(WIN_TITLE, 960, 540)
+            cv2.setMouseCallback(WIN_TITLE, on_mouse_roi, {"width": cam_w, "height": cam_h})
+        except Exception as exc:
+            print("[GUI] Graphical display or HighGUI not available (headless build).")
+            print("[GUI] Automatically falling back to HEADLESS mode.")
+            args.headless = True
 
     delay       = max(1, int(1000 / (fps if (fps and 0 < fps < 120) else 30)))
     is_file     = isinstance(source, str)

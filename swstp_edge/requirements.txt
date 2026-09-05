@@ -1,9 +1,8 @@
 # SWSTP Edge — Raspberry Pi 4B requirements
 # Install with: pip3 install -r requirements.txt
 
-# ── Core vision & numerics ────────────────────────────────────────────────────
-# Headless build (no Qt / X11 display dependency — essential for systemd & headless edge units)
-opencv-python- >=4.8.0
+# Full GUI build (supports cv2.imshow & mouse ROI plotting when run interactively, and headless via QT_QPA_PLATFORM=offscreen under systemd)
+opencv-python>=4.8.0
 numpy>=1.24.0
 imutils>=0.5.4
 
@@ -17,10 +16,8 @@ smbus2>=0.4.3
 # NEO-6M GNSS via gpsd (optional fallback if NavCast TCP is not used)
 gpsdclient>=1.0.0
 
-# Status LED GPIO control
+# Status LED GPIO control (hardware pin factory provided via apt: python3-lgpio)
 gpiozero>=2.0
-# Hardware GPIO pin factory for gpiozero on Raspberry Pi OS Bookworm / Python 3.13+
-rpi-lgpio>=0.6
 
 # ── pyserial ─────────────────────────────────────────────────────────────────
 # Removed: the Arduino serial link no longer exists.
