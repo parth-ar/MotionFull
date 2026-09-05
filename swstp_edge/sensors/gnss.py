@@ -48,6 +48,12 @@ from config import (
     NAVCAST_HOST,
     NAVCAST_PORT,
 )
+try:
+    from config import NAVCAST_AUTO_DETECT
+except ImportError:
+    NAVCAST_AUTO_DETECT = True
+
+from sensors.navcast_discovery import discover_navcast
 
 # ---------------------------------------------------------------------------
 # Module-level constants
@@ -330,17 +336,31 @@ def _dispatch(line: str) -> None:
 def _navcast_thread() -> None:
     """
     Connects to NavCast TCP server, reads NMEA sentences line-by-line,
-    and dispatches them.  Auto-reconnects on any error.
+    and dispatches them. Automatically discovers phone tethering IP and port,
+    and auto-reconnects on any error or disconnection.
     """
     global gnss_ok
 
     host = NAVCAST_HOST
     port = NAVCAST_PORT
-    print(f"[GNSS] NavCast TCP reader connecting to {host}:{port} …")
 
     while not _stop_event.is_set():
+        # Auto-detect tethering IP & port when enabled
+        if NAVCAST_AUTO_DETECT:
+            try:
+                disc_host, disc_port = discover_navcast(
+                    preferred_host=host, preferred_port=port, timeout=0.25
+                )
+                if disc_host and disc_port:
+                    if disc_host != host or disc_port != port:
+                        print(f"[GNSS] Auto-detected NavCast @ {disc_host}:{disc_port}")
+                    host, port = disc_host, disc_port
+            except Exception:
+                pass
+
         sock = None
         try:
+            print(f"[GNSS] Connecting to NavCast @ {host}:{port} …")
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.settimeout(_SOCKET_TIMEOUT)
             sock.connect((host, port))

@@ -50,6 +50,17 @@ import time
 from collections import deque
 from datetime import datetime
 
+_HERE = os.path.dirname(os.path.abspath(__file__))
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
+
+try:
+    from sensors.navcast_discovery import auto_detect_navcast, discover_navcast, get_candidate_ips
+except ImportError:
+    auto_detect_navcast = None
+    discover_navcast = None
+    get_candidate_ips = None
+
 # Optional dependency: pyserial for COM port access
 try:
     import serial
@@ -467,7 +478,6 @@ def render_dashboard(state: GNSSState, connection_info: str):
     clr = "\033[K"  # Clear from cursor to end of line to prevent ghost characters
 
     has_fix = state.latitude is not None and state.longitude is not None
-    fix_color = green if (has_fix and "FIX" in state.fix_status) else yellow
 
     # Clear terminal screen once, then overwrite in-place for flicker-free 10Hz updates
     if _first_render:
@@ -624,7 +634,7 @@ def run_tcp_client_stream(host: str, port: int, state: GNSSState, log_nmea_fp, l
     """Connect to NavCast TCP server running on the phone."""
     print(f"[*] Connecting to NavCast TCP server at {host}:{port}...")
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.settimeout(10.0)
+    sock.settimeout(2.0)
     try:
         sock.connect((host, port))
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
@@ -632,11 +642,29 @@ def run_tcp_client_stream(host: str, port: int, state: GNSSState, log_nmea_fp, l
         print(f"[+] Connected to {host}:{port} successfully!")
     except Exception as e:
         print(f"\n[!] Connection failed to {host}:{port}: {e}")
-        print("\nTroubleshooting tips for USB Tethering:")
-        print(" 1. Ensure USB Tethering is turned ON in Android Settings.")
-        print(" 2. In NavCast, check the output settings: ensure TCP Server is enabled and note the Port (e.g. 10110).")
-        print(" 3. Check Phone IP (usually 192.168.42.129 or 10.208.43.190).")
-        sys.exit(1)
+        connected_ok = False
+        if discover_navcast:
+            print("[*] Probing candidate tethering interfaces and ports for active NavCast server...")
+            disc_host, disc_port = discover_navcast(preferred_port=port, timeout=0.3)
+            if disc_host and disc_port and (disc_host != host or disc_port != port):
+                print(f"[+] Found active NavCast server @ {disc_host}:{disc_port}! Connecting...")
+                host, port = disc_host, disc_port
+                try:
+                    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    sock.settimeout(10.0)
+                    sock.connect((host, port))
+                    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                    sock.settimeout(0.02)
+                    print(f"[+] Connected to {host}:{port} successfully!")
+                    connected_ok = True
+                except Exception as e2:
+                    print(f"[!] Auto-discovered connection failed: {e2}")
+        if not connected_ok:
+            print("\nTroubleshooting tips for USB Tethering:")
+            print(" 1. Ensure USB Tethering is turned ON in Android Settings.")
+            print(" 2. In NavCast, check the output settings: ensure TCP Server is enabled and running.")
+            print(" 3. Re-plug the USB cable or toggle USB Tethering off and on in phone settings.")
+            sys.exit(1)
 
     connection_info = f"TCP CLIENT -> {host}:{port}"
     last_render = 0.0
@@ -759,10 +787,10 @@ Examples:
                         help="Serial COM port (e.g. COM3, COM4, /dev/ttyUSB0)")
     parser.add_argument("--baud", type=int, default=115200,
                         help="Serial baud rate (default: 115200)")
-    parser.add_argument("--host", default="10.208.43.190",
-                        help="NavCast TCP server host IP (default: 10.208.43.190)")
-    parser.add_argument("--net-port", type=int, default=10110,
-                        help="Network port for TCP or UDP (default: 10110)")
+    parser.add_argument("--host", default="auto",
+                        help="NavCast TCP server host IP (default: 'auto' — automatically detects USB tethering phone IP)")
+    parser.add_argument("--net-port", type=int, default=None,
+                        help="Network port for TCP or UDP (default: auto-detected or 10110)")
     parser.add_argument("--stream", action="store_true",
                         help="Print scrolling single-line logs of Lat/Lon/Alt/Speed instead of dashboard")
     parser.add_argument("--scan", action="store_true",
@@ -813,7 +841,18 @@ Examples:
             run_serial_stream(port, args.baud, state, log_nmea_fp, log_csv_writer, stream_mode=args.stream)
 
         elif args.mode == "tcp":
-            run_tcp_client_stream(args.host, args.net_port, state, log_nmea_fp, log_csv_writer, stream_mode=args.stream)
+            host = args.host
+            port = args.net_port
+            if host == "auto" or not host:
+                if auto_detect_navcast:
+                    host, disc_port = auto_detect_navcast(preferred_port=port or 10110, log_prefix="[*]")
+                    if not port:
+                        port = disc_port
+                else:
+                    host = "10.208.43.190"
+            if not port:
+                port = 10110
+            run_tcp_client_stream(host, port, state, log_nmea_fp, log_csv_writer, stream_mode=args.stream)
 
         elif args.mode == "udp":
             run_udp_stream("0.0.0.0", args.net_port, state, log_nmea_fp, log_csv_writer, stream_mode=args.stream)

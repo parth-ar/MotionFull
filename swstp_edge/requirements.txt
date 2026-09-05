@@ -2,8 +2,8 @@
 # Install with: pip3 install -r requirements.txt
 
 # ── Core vision & numerics ────────────────────────────────────────────────────
-# Full GUI build required (cv2.imshow + mouse ROI plotting must work on the Pi desktop)
-opencv-python>=4.8.0
+# Headless build (no Qt / X11 display dependency — essential for systemd & headless edge units)
+opencv-python- >=4.8.0
 numpy>=1.24.0
 imutils>=0.5.4
 
@@ -14,13 +14,13 @@ requests>=2.31.0
 # MPU-6500 I2C register access (replaces MPU6500_WE Arduino library)
 smbus2>=0.4.3
 
-# NEO-6M GNSS via gpsd (replaces hand-rolled NMEA parsing + SoftwareSerial)
-# Requires gpsd daemon: sudo apt install gpsd gpsd-clients
+# NEO-6M GNSS via gpsd (optional fallback if NavCast TCP is not used)
 gpsdclient>=1.0.0
 
-# Status LED GPIO control (replaces digitalWrite)
-# Requires pigpiod or RPi.GPIO kernel module on Pi
+# Status LED GPIO control
 gpiozero>=2.0
+# Hardware GPIO pin factory for gpiozero on Raspberry Pi OS Bookworm / Python 3.13+
+rpi-lgpio>=0.6
 
 # ── pyserial ─────────────────────────────────────────────────────────────────
 # Removed: the Arduino serial link no longer exists.

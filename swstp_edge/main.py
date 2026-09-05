@@ -20,6 +20,10 @@ import threading
 import time
 import uuid
 
+# Headless / systemd safety: prevent OpenCV Qt plugin from aborting when no display is present
+if "--headless" in sys.argv or "DISPLAY" not in os.environ:
+    os.environ["QT_QPA_PLATFORM"] = "offscreen"
+
 import cv2
 import imutils
 import numpy as np
@@ -334,12 +338,11 @@ def main() -> None:
     print("[INIT] Edge Gateway running.")
     print("  Controls: [t] Toggle Camera | [r] Plot Area of Interest | [c] Clear Pointers | [q] Quit\n")
 
-    # Signal LED that system is operational (headless mode)
-    if args.headless:
-        try:
-            leds.set_system_ready()
-        except Exception:
-            pass
+    # Signal LED driver that system is operational and ready to capture
+    try:
+        leds.set_system_ready()
+    except Exception:
+        pass
 
     try:
         while not stop_event.is_set():
@@ -635,12 +638,11 @@ def main() -> None:
     finally:
         stop_event.set()
         # Signal fault LED before closing (yellow off, red blink briefly)
-        if args.headless:
-            try:
-                leds.set_fault("Edge gateway shutting down")
-                time.sleep(0.5)   # brief visible fault indication
-            except Exception:
-                pass
+        try:
+            leds.set_fault("Edge gateway shutting down")
+            time.sleep(0.5)   # brief visible fault indication
+        except Exception:
+            pass
         power_sensor.stop()
         _telemetry.stop()
         gnss_sensor.stop()

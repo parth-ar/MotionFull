@@ -18,6 +18,7 @@ ExecStart=/usr/bin/python3 /home/pi/swstp_edge/main.py --headless
 # Optional: override the backend URL without editing config.py
 # Environment=SWSTP_BACKEND_URL=https://solidwasteapi.scipl.info.in
 Environment=PYTHONUNBUFFERED=1
+Environment=QT_QPA_PLATFORM=offscreen
 
 # ── Restart policy ───────────────────────────────────────────────────────────
 # Restart automatically 5 seconds after any failure

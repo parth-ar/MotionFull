@@ -1,0 +1,310 @@
+SWSTP EDGE — RASPBERRY PI COMMAND REFERENCE
+================================================
+
+Project:
+    /home/solidwaste-1/MotionFull/swstp_edge
+
+Python environment:
+    /home/solidwaste-1/MotionFull/swstp_edge/venv
+
+Systemd service:
+    swstp-edge.service
+
+
+1. ENTER THE PROJECT
+--------------------
+
+cd ~/MotionFull/swstp_edge
+
+Check current directory:
+pwd
+
+List project files:
+ls -la
+
+
+2. PYTHON / VIRTUAL ENVIRONMENT
+-------------------------------
+
+Check Python:
+which python3
+python3 --version
+
+Check virtual environment Python:
+./venv/bin/python --version
+
+Check installed packages:
+./venv/bin/python -m pip list
+
+Check a specific package:
+./venv/bin/python -m pip show <package>
+
+Test a package import:
+./venv/bin/python -c "import <package>; print('<package> OK')"
+
+
+3. CREATE THE VIRTUAL ENVIRONMENT (ONLY IF NEEDED)
+--------------------------------------------------
+
+Install venv support:
+sudo apt update
+sudo apt install -y python3-venv python3-full
+
+Create the environment:
+cd ~/MotionFull/swstp_edge
+python3 -m venv venv
+
+Upgrade pip inside the project environment:
+./venv/bin/python -m pip install --upgrade pip
+
+Install project requirements:
+./venv/bin/python -m pip install -r requirements.txt
+
+Install an individual package:
+./venv/bin/python -m pip install <package>
+
+IMPORTANT:
+Use ./venv/bin/python -m pip for this project.
+Do not use plain pip/pip3 for project packages.
+
+
+4. TEST THE APPLICATION MANUALLY
+--------------------------------
+
+Headless mode (the mode used by systemd):
+cd ~/MotionFull/swstp_edge
+./venv/bin/python main.py --headless
+
+Normal GUI mode (only when a graphical display is available):
+cd ~/MotionFull/swstp_edge
+./venv/bin/python main.py
+
+Stop a manually running program:
+Ctrl+C
+
+
+5. SYSTEMD SERVICE SETUP
+------------------------
+
+Create/edit the service:
+sudo nano /etc/systemd/system/swstp-edge.service
+
+Expected service configuration:
+
+[Unit]
+Description=SWSTP Edge Application
+After=network.target
+
+[Service]
+Type=simple
+User=solidwaste-1
+WorkingDirectory=/home/solidwaste-1/MotionFull/swstp_edge
+ExecStart=/home/solidwaste-1/MotionFull/swstp_edge/venv/bin/python /home/solidwaste-1/MotionFull/swstp_edge/main.py --headless
+Environment=PYTHONUNBUFFERED=1
+Environment=QT_QPA_PLATFORM=offscreen
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+
+
+6. INSTALL / RELOAD / ENABLE THE SERVICE
+-----------------------------------------
+
+After creating or changing the service file:
+
+sudo systemctl daemon-reload
+
+Enable automatic startup on every boot:
+sudo systemctl enable swstp-edge.service
+
+Start it now:
+sudo systemctl start swstp-edge.service
+
+Restart it now:
+sudo systemctl restart swstp-edge.service
+
+Stop it:
+sudo systemctl stop swstp-edge.service
+
+
+7. CHECK SERVICE STATUS
+-----------------------
+
+Check status:
+sudo systemctl status swstp-edge.service
+
+Check whether enabled for boot:
+sudo systemctl is-enabled swstp-edge.service
+
+Expected:
+enabled
+
+Check whether currently running:
+sudo systemctl is-active swstp-edge.service
+
+Expected:
+active
+
+
+8. VIEW LIVE APPLICATION LOGS
+-----------------------------
+
+Follow live logs:
+sudo journalctl -u swstp-edge.service -f
+
+Cleaner live logs:
+sudo journalctl -u swstp-edge.service -f -o cat
+
+Show the last 100 log lines:
+sudo journalctl -u swstp-edge.service -n 100 --no-pager
+
+Show logs without systemd paging:
+sudo journalctl -u swstp-edge.service --no-pager
+
+Show logs from the current boot:
+sudo journalctl -u swstp-edge.service -b --no-pager
+
+Exit live log view:
+Ctrl+C
+
+
+9. DEBUGGING A CRASH / RESTART LOOP
+-----------------------------------
+
+Stop the automatic restart loop:
+sudo systemctl stop swstp-edge.service
+
+View recent errors:
+sudo journalctl -u swstp-edge.service -n 100 --no-pager
+
+Follow errors live:
+sudo journalctl -u swstp-edge.service -f -o cat
+
+Check service status:
+sudo systemctl status swstp-edge.service
+
+Test the exact command used by systemd manually:
+cd ~/MotionFull/swstp_edge
+./venv/bin/python main.py --headless
+
+
+10. AFTER EDITING main.py
+--------------------------
+
+Test manually first:
+cd ~/MotionFull/swstp_edge
+./venv/bin/python main.py --headless
+
+If successful, restart systemd:
+sudo systemctl restart swstp-edge.service
+
+Check:
+sudo systemctl status swstp-edge.service
+
+Watch logs:
+sudo journalctl -u swstp-edge.service -f
+
+
+11. AFTER EDITING THE .SERVICE FILE
+-----------------------------------
+
+sudo systemctl daemon-reload
+sudo systemctl restart swstp-edge.service
+sudo systemctl status swstp-edge.service
+
+NOTE:
+systemctl daemon-reload is required after changing the service file.
+systemctl enable only needs to be run again if the service was disabled or the enable configuration changed.
+
+
+12. BOOT TEST
+------------
+
+Reboot the Pi:
+sudo reboot
+
+After reconnecting by SSH:
+sudo systemctl status swstp-edge.service
+
+Confirm boot enablement:
+sudo systemctl is-enabled swstp-edge.service
+
+Check logs:
+sudo journalctl -u swstp-edge.service -b --no-pager
+
+
+13. FIND GUI / HEADLESS CODE
+----------------------------
+
+Find OpenCV GUI calls:
+cd ~/MotionFull/swstp_edge
+grep -R "cv2.imshow\|cv2.namedWindow\|waitKey\|destroyAllWindows" -n --exclude-dir=venv .
+
+The application currently provides a --headless option.
+Use --headless when running under systemd without a graphical display.
+
+
+14. USEFUL SYSTEM INFORMATION
+-----------------------------
+
+Check disk space:
+df -h
+
+Check memory:
+free -h
+
+Check CPU / processes:
+top
+
+Check service process:
+ps aux | grep main.py
+
+Check current date/time:
+date
+
+Check network:
+ip addr
+
+Check Python executable used by the venv:
+readlink -f ./venv/bin/python
+
+
+15. IMPORTANT RULES
+-------------------
+
+• The service is intended to run HEADLESS at boot.
+• systemd starts the application independently of SSH or a terminal.
+• Keep the venv directory:
+      ~/MotionFull/swstp_edge/venv
+• The systemd service must use:
+      /home/solidwaste-1/MotionFull/swstp_edge/venv/bin/python
+• The systemd ExecStart includes:
+      main.py --headless
+• If the application crashes, Restart=always causes systemd to restart it.
+• Always check journalctl when diagnosing crashes.
+• Do not repeatedly reinstall packages into the system Python.
+• Install project packages into the venv with:
+      ./venv/bin/python -m pip install <package>
+• For a complete dependency setup, prefer:
+      ./venv/bin/python -m pip install -r requirements.txt
+
+
+16. QUICK START AFTER A REBOOT
+------------------------------
+
+sudo systemctl status swstp-edge.service
+
+sudo journalctl -u swstp-edge.service -f -o cat
+
+
+17. QUICK RESTART AFTER A CODE CHANGE
+-------------------------------------
+
+cd ~/MotionFull/swstp_edge
+./venv/bin/python main.py --headless
+
+If manual test succeeds:
+sudo systemctl restart swstp-edge.service
+sudo journalctl -u swstp-edge.service -f -o cat

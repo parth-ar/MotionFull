@@ -216,9 +216,10 @@ def build_telemetry_packet(device_id: str) -> dict:
 
     # --- 8. Update LED state ---
     leds.update(
-        rtc  = bool(rtc_data.get("valid")),
-        imu  = bool(imu_data.get("valid")),
-        gnss = bool(gnss_data.get("fix")),
+        rtc            = bool(rtc_data.get("valid")),
+        imu            = bool(imu_data.get("valid")),
+        gnss_fix       = bool(gnss_data.get("fix")),
+        gnss_connected = bool(gnss_data.get("data_received")),
     )
 
     # --- 9. Snapshot latest_sensor values for packet (avoids race) ---

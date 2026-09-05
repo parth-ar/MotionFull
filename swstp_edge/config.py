@@ -1,3 +1,5 @@
+
+
 """
 config.py — Centralised runtime configuration for the SWSTP Edge Pi node.
 
@@ -86,8 +88,9 @@ GNSS_SATELLITE_SNAP_SEC  = 5.0        # drop satellite detail if snapshot > 5 s 
 # ---------------------------------------------------------------------------
 # NavCast GNSS — phone app streaming NMEA over USB tethering TCP
 # ---------------------------------------------------------------------------
-NAVCAST_HOST = "10.208.43.190"        # phone USB tethering IP (set in NavCast app)
+NAVCAST_HOST = "10.208.43.190"        # phone USB tethering fallback IP
 NAVCAST_PORT = 10110                   # NavCast TCP port
+NAVCAST_AUTO_DETECT = True             # Auto-detect tethering gateway IP & port on connect
 
 # ---------------------------------------------------------------------------
 # IMU complementary filter
