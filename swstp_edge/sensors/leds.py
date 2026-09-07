@@ -15,6 +15,7 @@ LED Hardware Mapping (BCM GPIO pins — config.py):
   YELLOW     (BCM 23): System ready & snap indicator:
                        - Solid ON when system is healthy and ready to click motion frames
                        - Blinks 3× when a motion frame is captured, then returns to solid ON
+                       - Repeating 3× blinks when scanning for webcam / video source (algorithm on hold)
                        - OFF if ANY module fails or program error occurs
   RED        (BCM 24): Fault indicator:
                        - Blinking (400 ms) if ANY module fails or program error is encountered
@@ -91,6 +92,12 @@ _last_fault_toggle: float = 0.0
 _gnss_blink_state: bool = False
 _last_gnss_toggle: float = 0.0
 
+# Camera scanning state (repeating triple blink on Yellow LED)
+_camera_scanning: bool = False
+_camera_scan_thread: threading.Thread | None = None
+_camera_scan_stop_event = threading.Event()
+_camera_scan_lock = threading.Lock()
+
 
 # ---------------------------------------------------------------------------
 # Init / Shutdown
@@ -114,8 +121,11 @@ def init() -> None:
 
 def close() -> None:
     """Release GPIO handles on shutdown."""
-    global _system_ready
+    global _system_ready, _camera_scanning
     _system_ready = False
+    with _camera_scan_lock:
+        _camera_scanning = False
+        _camera_scan_stop_event.set()
     _stop_event.set()
     _all_off()
     for led in _leds.values():
@@ -153,12 +163,88 @@ def set_headless_mode(enabled: bool) -> None:
     pass
 
 
+def _camera_scan_worker() -> None:
+    """Background worker that continuously outputs repeating triple blinks
+    on the status LED (Yellow / BCM 23) while scanning for a webcam.
+
+    Pattern:
+      3 rapid pulses:
+        120 ms ON / 120 ms OFF x 3
+      Pause:
+        600 ms OFF
+      Repeats continuously until _camera_scanning is disabled or stop_event is set.
+    """
+    global _camera_scanning
+    while not _camera_scan_stop_event.is_set() and not _stop_event.is_set():
+        with _camera_scan_lock:
+            if not _camera_scanning or _program_fault:
+                break
+
+        # 3 rapid blinks: ON -> OFF -> ON -> OFF -> ON -> OFF
+        for _ in range(3):
+            if _camera_scan_stop_event.is_set() or _stop_event.is_set() or _program_fault:
+                break
+            with _camera_scan_lock:
+                if not _camera_scanning:
+                    break
+            if _leds and "yellow" in _leds:
+                _leds["yellow"].on()
+            time.sleep(0.12)
+            if _leds and "yellow" in _leds:
+                _leds["yellow"].off()
+            time.sleep(0.12)
+
+        # Pause interval between bursts (≈ 600 ms)
+        for _ in range(6):
+            if _camera_scan_stop_event.is_set() or _stop_event.is_set() or _program_fault:
+                break
+            with _camera_scan_lock:
+                if not _camera_scanning:
+                    break
+            time.sleep(0.10)
+
+    # Ensure Yellow LED is turned off when scanning ends if system is not yet ready
+    if _leds and "yellow" in _leds and not _system_ready:
+        _leds["yellow"].off()
+
+
+def set_camera_scanning(enabled: bool = True) -> None:
+    """
+    Signal whether the system is actively scanning for a webcam / video source.
+    When enabled, triggers repeating triple LED blinks on the Yellow LED
+    to visually showcase that video ports are being scanned and the motion
+    algorithm is on hold.
+    """
+    global _camera_scanning, _camera_scan_thread, _system_ready
+    with _camera_scan_lock:
+        if enabled:
+            _system_ready = False
+            if not _camera_scanning:
+                _camera_scanning = True
+                _camera_scan_stop_event.clear()
+                _camera_scan_thread = threading.Thread(
+                    target=_camera_scan_worker,
+                    name="led-cam-scan-blink",
+                    daemon=True,
+                )
+                _camera_scan_thread.start()
+                print("[LEDS] Camera SCANNING active — repeating triple LED blinks.")
+        else:
+            if _camera_scanning:
+                _camera_scanning = False
+                _camera_scan_stop_event.set()
+                print("[LEDS] Camera scanning stopped.")
+
+
 def set_system_ready() -> None:
     """
     Signal that the edge application and camera loop have initialized and are
     actively ready to capture motion frames.
     """
-    global _system_ready, _program_fault, _fault_reason
+    global _system_ready, _program_fault, _fault_reason, _camera_scanning
+    with _camera_scan_lock:
+        _camera_scanning = False
+        _camera_scan_stop_event.set()
     _system_ready = True
     _program_fault = False
     _fault_reason = ""
@@ -170,10 +256,13 @@ def set_fault(reason: str = "") -> None:
     Signal a program or system-level fault.
     Yellow LED turns OFF immediately. Red LED starts blinking.
     """
-    global _program_fault, _fault_reason
+    global _program_fault, _fault_reason, _camera_scanning
     _program_fault = True
     _fault_reason = reason
-    if _leds:
+    with _camera_scan_lock:
+        _camera_scanning = False
+        _camera_scan_stop_event.set()
+    if _leds and "yellow" in _leds:
         _leds["yellow"].off()
     if reason:
         print(f"[LEDS] System FAULT: {reason} — Yellow OFF, Red blinking.")
@@ -319,7 +408,7 @@ def update(
         _leds["red"].off()
 
     # ── 6. Yellow LED (Solid ON when ready & healthy, OFF on any error) ─
-    if not _snap_blinking:
+    if not _snap_blinking and not _camera_scanning:
         system_working_and_ready = _system_ready and (not has_fault)
         if system_working_and_ready:
             _leds["yellow"].on()

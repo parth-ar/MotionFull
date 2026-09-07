@@ -72,7 +72,7 @@ from telemetry import (
 from motion import (
     load_roi_polygon, save_roi_polygon,
     apply_polygon_roi_mask, on_mouse_roi,
-    overlay_metadata, generate_virtual_video_frame,
+    overlay_metadata,
     cleanup_old_local_captures, get_rtc_timestamp,
     active_polygon_roi, is_drawing_polygon, drawn_polygon_pts, camera_feed_active,
 )
@@ -135,6 +135,62 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Simulate low battery alert after N seconds for testing")
     return parser
 
+
+
+# ---------------------------------------------------------------------------
+# Camera & Video Port Scanning Helpers
+# ---------------------------------------------------------------------------
+def probe_video_source(src):
+    """Attempt to open and read a test frame from camera source `src`.
+    Returns (cap, width, height, fps) if open & readable, else (None, 0, 0, 0).
+    """
+    try:
+        if isinstance(src, int) or (isinstance(src, str) and src.isdigit()):
+            dev_idx = int(src)
+            # On Linux/Pi, prefer V4L2 backend
+            if sys.platform.startswith("linux"):
+                c = cv2.VideoCapture(dev_idx, cv2.CAP_V4L2)
+                if not c.isOpened():
+                    c.release()
+                    c = cv2.VideoCapture(dev_idx)
+            else:
+                c = cv2.VideoCapture(dev_idx)
+        else:
+            c = cv2.VideoCapture(src)
+
+        if c.isOpened():
+            ret, test_frame = c.read()
+            if ret and test_frame is not None and test_frame.size > 0:
+                w = int(c.get(cv2.CAP_PROP_FRAME_WIDTH)) or test_frame.shape[1]
+                h = int(c.get(cv2.CAP_PROP_FRAME_HEIGHT)) or test_frame.shape[0]
+                cam_fps = c.get(cv2.CAP_PROP_FPS) or 30.0
+                if cam_fps <= 0 or cam_fps > 120:
+                    cam_fps = 30.0
+                return c, w, h, cam_fps
+            c.release()
+    except Exception:
+        pass
+    return None, 0, 0, 0
+
+
+def get_candidate_video_ports(preferred_source):
+    """Build list of candidate camera ports/sources to probe."""
+    candidates = []
+    if preferred_source is not None and preferred_source != "":
+        candidates.append(preferred_source)
+    for idx in [0, 1, 2, 3, 4]:
+        if idx not in candidates:
+            candidates.append(idx)
+    return candidates
+
+
+def scan_for_camera(candidates):
+    """Scan candidate ports in order and return (cap, active_source, w, h, fps) if found."""
+    for cand in candidates:
+        c, w, h, cam_fps = probe_video_source(cand)
+        if c is not None:
+            return c, cand, w, h, cam_fps
+    return None, None, 0, 0, 0
 
 
 # ---------------------------------------------------------------------------
@@ -218,42 +274,34 @@ def main() -> None:
 
     # ── Camera / video source ────────────────────────────────────────────
     VIDEO_SOURCE = 0
-    source = (
+    initial_source = (
         int(args.source)
         if (args.source and args.source.isdigit())
         else (args.source if args.source else VIDEO_SOURCE)
     )
-    cap = None
-    use_synthetic_video = False
+    candidate_ports = get_candidate_video_ports(initial_source)
 
-    if isinstance(source, int):
-        for idx in [source, 0, 1, 2]:
-            try:
-                # Linux/Pi: V4L2 backend (no CAP_DSHOW)
-                c = cv2.VideoCapture(idx)
-                if c.isOpened():
-                    cap    = c
-                    source = idx
-                    break
-                c.release()
-            except Exception:
-                pass
-    elif isinstance(source, str):
-        cap = cv2.VideoCapture(source)
+    cap, source, cam_w, cam_h, fps = scan_for_camera(candidate_ports)
 
-    if cap is None or not cap.isOpened():
-        print("[CAMERA] No hardware webcam found — operating in synthetic video simulation mode.")
-        use_synthetic_video = True
-        cam_w, cam_h, fps = 640, 360, 30.0
-        hardware_state["camera"] = {"detected": True, "source": "Virtual Edge Stream",
-                                     "resolution": f"{cam_w}x{cam_h}", "fps": fps}
+    if cap is not None:
+        hardware_state["camera"] = {
+            "detected": True, "source": source,
+            "resolution": f"{cam_w}x{cam_h}", "fps": fps
+        }
+        print(f"[CAMERA] Active: Port {source} ({cam_w}x{cam_h} @ {fps:.1f} FPS)")
     else:
-        cam_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))  or 640
-        cam_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 360
-        fps   = cap.get(cv2.CAP_PROP_FPS) or 30.0
-        hardware_state["camera"] = {"detected": True, "source": source,
-                                     "resolution": f"{cam_w}x{cam_h}", "fps": fps}
-        print(f"[CAMERA] Active: {cam_w}x{cam_h} @ {fps:.1f} FPS")
+        source = initial_source
+        cam_w, cam_h, fps = 640, 360, 30.0
+        hardware_state["camera"] = {
+            "detected": False, "source": None,
+            "resolution": "N/A", "fps": 0
+        }
+        print(f"[CAMERA] No hardware webcam found on ports {candidate_ports}.")
+        print("[CAMERA] Keeping motion algorithm ON HOLD. Starting port scanning & repeating triple LED blinks...")
+        try:
+            leds.set_camera_scanning(True)
+        except Exception:
+            pass
 
     stop_event = threading.Event()
 
@@ -348,16 +396,86 @@ def main() -> None:
     print("[INIT] Edge Gateway running.")
     print("  Controls: [t] Toggle Camera | [r] Plot Area of Interest | [c] Clear Pointers | [q] Quit\n")
 
-    # Signal LED driver that system is operational and ready to capture
-    try:
-        leds.set_system_ready()
-    except Exception:
-        pass
+    # Signal LED driver: READY if camera active, else SCANNING (repeating triple blink)
+    if cap is not None:
+        try:
+            leds.set_system_ready()
+        except Exception:
+            pass
+    else:
+        try:
+            leds.set_camera_scanning(True)
+        except Exception:
+            pass
 
     try:
         while not stop_event.is_set():
 
-            # ── Camera feed paused state ──────────────────────────────────
+            # ── 1. Camera Scanning & Algorithm On Hold ────────────────────
+            if cap is None or not cap.isOpened():
+                try:
+                    leds.set_camera_scanning(True)
+                except Exception:
+                    pass
+
+                # Scan candidate ports
+                new_cap, new_src, new_w, new_h, new_fps = scan_for_camera(candidate_ports)
+                if new_cap is not None:
+                    cap = new_cap
+                    source = new_src
+                    cam_w, cam_h, fps = new_w, new_h, new_fps
+                    delay = max(1, int(1000 / (fps if (fps and 0 < fps < 120) else 30)))
+                    is_file = isinstance(source, str) and not source.isdigit() and not str(source).startswith("/dev/video")
+                    bg_model = None
+                    frame_count = 0
+                    _motion_mod.reset_tracking()
+                    hardware_state["camera"] = {
+                        "detected": True, "source": source,
+                        "resolution": f"{cam_w}x{cam_h}", "fps": fps
+                    }
+                    print(f"\n[CAMERA] ✔ Webcam connected on port {source} ({cam_w}x{cam_h} @ {fps:.1f} FPS).")
+                    print("[CAMERA] Resuming motion detection algorithm.")
+                    try:
+                        leds.set_camera_scanning(False)
+                        leds.set_system_ready()
+                    except Exception:
+                        pass
+                    if not args.headless:
+                        try:
+                            cv2.setMouseCallback(WIN_TITLE, on_mouse_roi, {"width": cam_w, "height": cam_h})
+                        except Exception:
+                            pass
+                    continue
+
+                # Standby / Hold screen
+                standby_frame = np.zeros((cam_h or 360, cam_w or 640, 3), dtype=np.uint8)
+                sh, sw = standby_frame.shape[:2]
+                cv2.rectangle(standby_frame, (0, 0), (sw, sh), (20, 20, 24), -1)
+                banner_y = sh // 2
+                cv2.rectangle(standby_frame, (0, max(0, banner_y - 45)), (sw, min(sh, banner_y + 45)), (15, 15, 18), -1)
+                cv2.rectangle(standby_frame, (0, max(0, banner_y - 45)), (sw, min(sh, banner_y + 45)), (0, 165, 255), 2)
+                cv2.putText(standby_frame, "NO WEBCAM DETECTED - SCANNING PORTS...",
+                            (max(10, sw // 2 - 240), banner_y - 8),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 215, 255), 2, cv2.LINE_AA)
+                cv2.putText(standby_frame, f"Probing {candidate_ports} | Algorithm ON HOLD | Triple LED blinks",
+                            (max(10, sw // 2 - 260), banner_y + 22),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.50, (180, 180, 180), 1, cv2.LINE_AA)
+
+                display_frame = overlay_metadata(standby_frame)
+                with latest_frame_lock:
+                    latest_stream_frame = (display_frame, time.monotonic())
+
+                if not args.headless:
+                    cv2.imshow(WIN_TITLE, display_frame)
+                    k = cv2.waitKey(250) & 0xFF
+                    if k == ord('q'):
+                        print("[EXIT] Quit requested by user.")
+                        break
+                else:
+                    stop_event.wait(0.5)
+                continue
+
+            # ── 2. Camera feed paused state ───────────────────────────────
             if not _motion_mod.camera_feed_active:
                 if last_known_frame is not None:
                     paused_frame = cv2.convertScaleAbs(last_known_frame.copy(), alpha=0.35, beta=0)
@@ -391,21 +509,37 @@ def main() -> None:
                     time.sleep(0.1)
                 continue
 
-            # ── Frame acquisition ─────────────────────────────────────────
-            if use_synthetic_video:
-                frame   = generate_virtual_video_frame(cam_w, cam_h, frame_count)
-                success = True
-                time.sleep(1.0 / fps)
-            else:
-                success, frame = cap.read()
-                if not success:
-                    if is_file and LOOP_VIDEO:
-                        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                        bg_model    = None
-                        frame_count = 0
-                        continue
-                    else:
-                        break
+            # ── 3. Frame acquisition ──────────────────────────────────────
+            success, frame = cap.read()
+            if not success:
+                if is_file and LOOP_VIDEO:
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                    bg_model    = None
+                    frame_count = 0
+                    continue
+                elif is_file:
+                    print(f"[CAMERA] End of video file '{source}'.")
+                    break
+                else:
+                    print(f"\n[CAMERA] Video feed dropped on port {source} (device disconnected).")
+                    print("[CAMERA] Releasing camera, holding algorithm, and resuming port scanning...")
+                    try:
+                        cap.release()
+                    except Exception:
+                        pass
+                    cap = None
+                    hardware_state["camera"] = {
+                        "detected": False, "source": None,
+                        "resolution": "N/A", "fps": 0
+                    }
+                    bg_model = None
+                    frame_count = 0
+                    _motion_mod.reset_tracking()
+                    try:
+                        leds.set_camera_scanning(True)
+                    except Exception:
+                        pass
+                    continue
 
             orig_frame   = frame.copy()
             last_known_frame = orig_frame.copy()
