@@ -1,5 +1,5 @@
 {
-  "device_id": "SWSTP_AMRMC_001",
+  "device_id": "SWSTP-AMRMC-001",
   "timezone": "Asia/Kolkata",
   "_comment": "Edit 'device_id' to match your provisioned device code in the SWSTP backend. 'timezone' sets the local timezone (Asia/Kolkata for Maharashtra, India)."
 }

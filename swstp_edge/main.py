@@ -164,12 +164,17 @@ def main() -> None:
     effective_backend_url = auto_detect_backend_url(args.backend_url)
     sync_backend_metadata(effective_backend_url, effective_ulb_id)
 
-    # ── Session bind ─────────────────────────────────────────────────────
+    # ── Session bind & strict device authentication ──────────────────────
     effective_session_id = args.session_id
     if device_id and device_id not in ("UNPROVISIONED", "UNASSIGNED"):
         sid = ensure_hardware_session(effective_backend_url, device_id)
         if sid > 0:
             effective_session_id = sid
+        else:
+            print(f"\n[CRITICAL AUTH] Device '{device_id}' failed backend authentication!")
+            print("[CRITICAL AUTH] Telemetry, evidence images, and live stream uploads are BLOCKED.\n")
+    else:
+        print(f"\n[CRITICAL AUTH] Device ID '{device_id}' is unprovisioned. Backend uploads are BLOCKED.\n")
     dynamic_session_info["deviceId"] = device_id
     latest_sensor["deviceId"]        = device_id
 
