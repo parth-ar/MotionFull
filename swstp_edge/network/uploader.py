@@ -29,10 +29,11 @@ import geofence
 
 # Dynamic session metadata (shared mutable — mirrors the original globals)
 dynamic_session_info: dict = {
-    "sessionId":  0,
-    "ulbId":      DEFAULT_ULB_ID,
-    "vehicleReg": DEFAULT_VEHICLE_ID,
-    "deviceId":   "UNASSIGNED",
+    "sessionId":     0,
+    "ulbId":         DEFAULT_ULB_ID,
+    "vehicleReg":    DEFAULT_VEHICLE_ID,
+    "deviceId":      "UNASSIGNED",
+    "authenticated": False,
 }
 
 
@@ -135,29 +136,20 @@ def sync_backend_metadata(backend_url: str, ulb_id: str) -> None:
     except Exception as ex:
         print(f"[API METADATA NOTE] Safe zones sync note: {ex}")
 
-    # 5. Discover Active Session & Vehicle from API if exists
-    try:
-        r_sess = requests.get(f"{base}/api/officer/sessions?ulbId={resolved_ulb}&status=ACTIVE", timeout=3.0)
-        if r_sess.status_code == 200:
-            sessions = r_sess.json()
-            if isinstance(sessions, list) and len(sessions) > 0:
-                from telemetry import latest_sensor, hardware_state
-                active_s = sessions[0]
-                sid = active_s.get("operationalSessionId") or active_s.get("sessionId") or 0
-                dynamic_session_info["sessionId"]  = sid
-                dynamic_session_info["vehicleReg"] = active_s.get("vehicleRegistrationNumber") or dynamic_session_info["vehicleReg"]
-                dynamic_session_info["ulbId"]      = active_s.get("ulbId") or resolved_ulb
-                dynamic_session_info["deviceId"]   = active_s.get("deviceCode") or active_s.get("deviceId") or dynamic_session_info["deviceId"]
-                latest_sensor["active_session_id"] = sid
-                hardware_state["backend"]["active_session_id"] = sid
-                print(f"[API METADATA] Existing Active Session detected: #{sid} (Vehicle: {dynamic_session_info['vehicleReg']})")
-    except Exception as ex:
-        print(f"[API METADATA NOTE] Active session sync note: {ex}")
+    # Note: Sessions are strictly bound per device identity via ensure_hardware_session().
+    # Never hijack arbitrary sessions from other devices.
 
 
 def ensure_hardware_session(backend_url: str, device_code: str) -> int:
-    """Dynamically activates or binds the hardware session in the DB for the identified device."""
-    if not device_code or device_code in ("AUTO", "UNASSIGNED", "DISCONNECTED"):
+    """Dynamically activates or binds the hardware session in the DB for the identified device.
+    
+    Device ID is the primary source of authentication. If registration fails or the device
+    code is invalid, session creation is blocked and no telemetry/evidence is uploaded.
+    """
+    if not device_code or device_code in ("AUTO", "UNASSIGNED", "DISCONNECTED", "UNPROVISIONED"):
+        log_hardware("AUTH REJECTED", "BLOCKED", f"Invalid or unprovisioned device ID: '{device_code}'. All portal uploads disabled.")
+        dynamic_session_info["sessionId"]     = 0
+        dynamic_session_info["authenticated"] = False
         return 0
 
     base = backend_url.rstrip('/')
@@ -172,14 +164,15 @@ def ensure_hardware_session(backend_url: str, device_code: str) -> int:
             sid  = sess.get("sessionId") or 0
             if sid > 0:
                 from telemetry import latest_sensor, hardware_state
-                dynamic_session_info["sessionId"]  = sid
-                dynamic_session_info["vehicleReg"] = (
+                dynamic_session_info["sessionId"]     = sid
+                dynamic_session_info["vehicleReg"]    = (
                     sess.get("vehicleRegistrationNumber") or
                     (sess.get("vehicle") or {}).get("registrationNumber") or
                     dynamic_session_info["vehicleReg"]
                 )
-                dynamic_session_info["ulbId"]    = sess.get("ulbId") or (sess.get("ulb") or {}).get("ulbId") or dynamic_session_info["ulbId"]
-                dynamic_session_info["deviceId"] = device_code
+                dynamic_session_info["ulbId"]         = sess.get("ulbId") or (sess.get("ulb") or {}).get("ulbId") or dynamic_session_info["ulbId"]
+                dynamic_session_info["deviceId"]      = device_code
+                dynamic_session_info["authenticated"] = True
                 latest_sensor["active_session_id"]             = sid
                 hardware_state["backend"]["active_session_id"] = sid
 
@@ -187,11 +180,19 @@ def ensure_hardware_session(backend_url: str, device_code: str) -> int:
                 if last_seq > latest_sensor.get("sequence", 0):
                     latest_sensor["sequence"] = int(last_seq)
 
-                print(f"[SESSION BIND] Dynamic Telemetry Session #{sid} active for Vehicle '{dynamic_session_info['vehicleReg']}' (Device: {device_code}) [LastSeq: {latest_sensor['sequence']}]")
+                print(f"[SESSION BIND] Telemetry Session #{sid} AUTHENTICATED for Vehicle '{dynamic_session_info['vehicleReg']}' (Device: {device_code})")
                 return sid
+        else:
+            log_hardware("AUTH FAILED", "REJECTED", f"Backend rejected device '{device_code}': HTTP {r.status_code} - {r.text}")
+            dynamic_session_info["sessionId"]     = 0
+            dynamic_session_info["authenticated"] = False
+            return 0
     except Exception as ex:
-        print(f"[SESSION BIND NOTE] Session creation note: {ex}")
-    return dynamic_session_info.get("sessionId", 0)
+        log_hardware("AUTH ERROR", "EXCEPTION", f"Failed to authenticate device '{device_code}': {ex}")
+        dynamic_session_info["sessionId"]     = 0
+        dynamic_session_info["authenticated"] = False
+        return 0
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -238,6 +239,11 @@ def live_frame_streamer(backend_url: str, device_id: str, fps: float,
     _backoff_until     = 0.0    # epoch: don't attempt to send until this time
 
     while not stop_event.is_set():
+        if not dynamic_session_info.get("authenticated", False):
+            # Block frame streaming if device is not authenticated
+            stop_event.wait(2.0)
+            continue
+
         loop_start = time.time()
 
         # Honour back-off window (reconnect delay after repeated failures)
@@ -346,27 +352,20 @@ def telemetry_streamer(backend_url: str, session_id_arg: int, ulb_id: str,
     last_session_check = 0.0
 
     while not stop_event.is_set():
-        now_time = time.time()
-        active_dyn_sid = dynamic_session_info.get("sessionId") or latest_sensor.get("active_session_id") or 0
-        if active_dyn_sid > 0:
-            current_session_id = active_dyn_sid
+        active_dyn_sid = dynamic_session_info.get("sessionId", 0)
+        is_auth = dynamic_session_info.get("authenticated", False)
 
-        if not session_id_arg and not active_dyn_sid and (now_time - last_session_check) > 3.0:
-            last_session_check = now_time
-            try:
-                s_resp = session.get(active_session_query_url, timeout=2.0)
-                if s_resp.status_code == 200:
-                    sessions_list = s_resp.json()
-                    if sessions_list and isinstance(sessions_list, list) and len(sessions_list) > 0:
-                        first_active = sessions_list[0]
-                        sid = first_active.get("operationalSessionId") or first_active.get("sessionId") or 0
-                        if sid != current_session_id and sid > 0:
-                            current_session_id = sid
-                            latest_sensor["active_session_id"] = sid
-                            hardware_state["backend"]["active_session_id"] = sid
-                            print(f"[EDGE SESSION] Automatically locked to active operational session #{sid}")
-            except Exception:
-                pass
+        if not is_auth or active_dyn_sid <= 0:
+            # Drop telemetry queue while unauthenticated
+            while not telemetry_queue.empty():
+                try:
+                    telemetry_queue.get_nowait()
+                except queue.Empty:
+                    break
+            stop_event.wait(2.0)
+            continue
+
+        current_session_id = active_dyn_sid
 
         packets = []
         while not telemetry_queue.empty() and len(packets) < 50:
@@ -453,10 +452,21 @@ def evidence_upload_worker(backend_url: str, device_id: str, ulb_id: str,
     session.mount("http://", adapter)
     session.mount("https://", adapter)
 
+    _last_auth_warn = 0.0
     while not stop_event.is_set():
         try:
             item = upload_queue.get(timeout=1.0)
         except queue.Empty:
+            continue
+
+        active_sid = dynamic_session_info.get("sessionId", 0)
+        is_auth = dynamic_session_info.get("authenticated", False)
+
+        if not is_auth or active_sid <= 0:
+            now_t = time.time()
+            if now_t - _last_auth_warn > 10.0:
+                _last_auth_warn = now_t
+                print(f"[AUTH BLOCKED] Evidence upload DROPPED: Device '{device_id}' is not authenticated in backend. No session active.")
             continue
 
         try:
