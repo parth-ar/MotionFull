@@ -129,6 +129,16 @@ SAVE_COOLDOWN_SEC = 5.0   # 5-second buffer between motion captures
 FRAME_SIZE       = (320, 180)
 
 # ---------------------------------------------------------------------------
+# Vehicle Stop & Motion Detection Parameters (Dual GNSS + IMU)
+# ---------------------------------------------------------------------------
+STOP_SPEED_GATE            = 5.0    # km/h threshold: speed > 5.0 km/h ends stop event
+REST_SPEED_THRESHOLD_KMH   = 3.0    # km/h threshold: speed < 3.0 km/h indicates candidate rest
+IMU_REST_ACCEL_TOLERANCE   = 0.45   # m/s² max dynamic acceleration deviation (|accel_mag - 9.80665|)
+IMU_REST_GYRO_TOLERANCE    = 4.0    # deg/s max angular velocity magnitude for rest (sqrt(gx^2+gy^2+gz^2))
+REST_DEBOUNCE_SEC          = 1.0    # Sustained seconds of rest condition required to confirm stop
+MOTION_DEBOUNCE_SEC        = 0.6    # Sustained seconds of motion (speed > 5 km/h) to confirm stop end
+
+# ---------------------------------------------------------------------------
 # Power Management & Backup Battery Settings
 # ---------------------------------------------------------------------------
 POWER_MANAGEMENT_ENABLED = True

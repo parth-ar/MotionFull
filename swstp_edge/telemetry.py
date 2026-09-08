@@ -97,6 +97,11 @@ latest_sensor: dict = {
     "is_inside_safe_zone":     False,
     "is_snapped":              False,
     "road_bearing":            None,
+    "is_vehicle_stopped":      False,
+    "vehicle_motion_state":    "MOVING",
+    "stop_duration_sec":       0.0,
+    "stop_event_id":           0,
+    "stop_capture_count":      0,
 }
 
 hardware_state: dict = {

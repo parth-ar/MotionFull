@@ -215,16 +215,32 @@ def overlay_metadata(frame):
     except Exception:
         pwr_badge = "PWR:OK"
 
-    hud_text = f"[SWSTP-PI] {cam_badge} | {rtc_badge} | {imu_badge} | {gps_badge} | {pwr_badge} | {net_badge}"
-    cv2.putText(frame, hud_text, (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (220, 220, 220), 1, cv2.LINE_AA)
+    # Vehicle rest/motion state badge
+    is_veh_stopped = bool(latest_sensor.get("is_vehicle_stopped"))
+    stop_sec = int(latest_sensor.get("stop_duration_sec") or 0)
+    stop_caps = int(latest_sensor.get("stop_capture_count") or 0)
+    mins, s = divmod(stop_sec, 60)
+    if is_veh_stopped:
+        veh_badge = f"VEH:STOP({mins:02d}:{s:02d}|{stop_caps}c)"
+    else:
+        curr_spd = float(latest_sensor.get("speed") or 0.0)
+        veh_badge = f"VEH:MOV({curr_spd:.1f}kph)"
 
+    hud_text = f"[SWSTP-PI] {cam_badge} | {rtc_badge} | {imu_badge} | {gps_badge} | {veh_badge} | {pwr_badge} | {net_badge}"
+    cv2.putText(frame, hud_text, (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (220, 220, 220), 1, cv2.LINE_AA)
 
     # Bottom Metadata Strip
     banner_slice = frame[h - strip_height:h, 0:w]
     cv2.convertScaleAbs(banner_slice, banner_slice, alpha=0.25, beta=0)
 
+    if is_veh_stopped:
+        stop_info_text = f" | [STOP #{latest_sensor.get('stop_event_id', 1)}: {mins:02d}m {s:02d}s | Caps: {stop_caps}]"
+        full_ts_text = f"{ts_text}{stop_info_text}"
+    else:
+        full_ts_text = ts_text
+
     y_pos = h - strip_height + line_spacing
-    cv2.putText(frame, ts_text,  (12, y_pos), cv2.FONT_HERSHEY_SIMPLEX, font_scale, ts_color,  thickness, cv2.LINE_AA)
+    cv2.putText(frame, full_ts_text, (12, y_pos), cv2.FONT_HERSHEY_SIMPLEX, font_scale, ts_color, thickness, cv2.LINE_AA)
     y_pos += line_spacing
     cv2.putText(frame, loc_text, (12, y_pos), cv2.FONT_HERSHEY_SIMPLEX, font_scale, loc_color, thickness, cv2.LINE_AA)
 

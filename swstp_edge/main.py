@@ -93,6 +93,7 @@ from network.uploader import (
     live_frame_streamer, telemetry_streamer, evidence_upload_worker,
     dynamic_session_info,
 )
+from stop_detector import VehicleStopDetector
 from network.location_fallback import gps_fallback_worker
 
 # ---------------------------------------------------------------------------
@@ -452,16 +453,8 @@ def main() -> None:
     saved_count    = 0
     last_known_frame = None
 
-    # ── Stop-collection event state ───────────────────────────────────────
-    # A stop event begins when motion is detected AND vehicle speed < 5 km/h.
-    # It ends when the vehicle speeds up or motion is absent for STOP_IDLE_TIMEOUT s.
-    STOP_IDLE_TIMEOUT    = 10.0      # seconds of no-motion before auto-closing event
-    MOTION_SPEED_GATE    = 5.0       # km/h threshold
-    _stop_ev_active      = False
-    _stop_ev_start       = 0.0       # monotonic timestamp of event start
-    _stop_ev_lat         = None
-    _stop_ev_lon         = None
-    _stop_last_motion    = 0.0       # monotonic time of last frame with motion
+    # ── Vehicle Stop & Motion Detector (Dual GNSS + IMU) ──────────────────
+    stop_detector = VehicleStopDetector()
 
     print("[INIT] Edge Gateway running.")
     print("  Controls: [t] Toggle Camera | [r] Plot Area of Interest | [c] Clear Pointers | [q] Quit\n")
@@ -738,42 +731,42 @@ def main() -> None:
                             f"PLOTTING AREA OF INTEREST: Click to place pointers ({len(prog_pts)} set) | Press 'r' again when done to connect & save",
                             (10, 48), cv2.FONT_HERSHEY_SIMPLEX, 0.44, (0, 255, 255), 1, cv2.LINE_AA)
 
+            # ── Vehicle Stop & Motion Detection (Dual GNSS + IMU) ─────────
+            now_mono           = time.monotonic()
+            vehicle_speed      = float(latest_sensor.get("speed") or 0.0)
+            imu_data           = latest_sensor.get("imu")
+            cap_lat            = latest_sensor.get("lat")
+            cap_lon            = latest_sensor.get("lon")
+            gps_valid          = bool(latest_sensor.get("gps_valid"))
+            rtc_ts             = get_rtc_timestamp()
+
+            stop_status = stop_detector.update(
+                vehicle_speed=vehicle_speed,
+                imu_data=imu_data,
+                latitude=cap_lat,
+                longitude=cap_lon,
+                rtc_timestamp=rtc_ts,
+                gps_valid=gps_valid,
+                now_mono=now_mono,
+            )
+
+            is_vehicle_stopped     = stop_status["is_stopped"]
+            current_event_duration = stop_status["duration_sec"]
+            current_stop_id        = stop_status["stop_event_id"]
+            current_capture_count  = stop_status["capture_count"]
+
+            # Keep latest_sensor updated so overlay HUD and telemetry packets stay in sync
+            latest_sensor["is_vehicle_stopped"]   = is_vehicle_stopped
+            latest_sensor["vehicle_motion_state"] = stop_status["state"]
+            latest_sensor["stop_duration_sec"]    = current_event_duration
+            latest_sensor["stop_event_id"]        = current_stop_id
+            latest_sensor["stop_capture_count"]   = current_capture_count
+
             display_frame = overlay_metadata(orig_frame.copy())
 
             # Update live stream buffer (tuple with write timestamp for stall-free streaming)
             with latest_frame_lock:
                 latest_stream_frame = (display_frame, time.monotonic())
-
-            # ── Stop-collection event state machine ───────────────────────
-            now_mono       = time.monotonic()
-            vehicle_speed  = latest_sensor.get("speed") or 0.0
-            is_vehicle_stopped = vehicle_speed < MOTION_SPEED_GATE
-
-            if motion_detected and is_vehicle_stopped:
-                # Keep motion timestamp alive
-                _stop_last_motion = now_mono
-                # Open a new stop event if not already active
-                if not _stop_ev_active:
-                    _stop_ev_active = True
-                    _stop_ev_start  = now_mono
-                    _stop_ev_lat    = latest_sensor.get("lat")
-                    _stop_ev_lon    = latest_sensor.get("lon")
-                    print(f"[STOP EVENT] Collection event started "
-                          f"@ ({_stop_ev_lat}, {_stop_ev_lon}) "
-                          f"| Speed: {vehicle_speed:.1f} km/h")
-
-            if _stop_ev_active:
-                # Close event if vehicle sped up OR motion idle too long
-                idle_secs = now_mono - _stop_last_motion
-                if (not is_vehicle_stopped) or (idle_secs > STOP_IDLE_TIMEOUT):
-                    duration_sec = now_mono - _stop_ev_start
-                    reason = "speed > 5 km/h" if not is_vehicle_stopped else "motion idle timeout"
-                    print(f"[STOP EVENT] Collection event ended — "
-                          f"Duration: {duration_sec:.1f}s | Reason: {reason}")
-                    _stop_ev_active = False
-
-            # Current event duration (0 if no active event)
-            current_event_duration = (now_mono - _stop_ev_start) if _stop_ev_active else 0.0
 
             # ── Motion capture & upload ───────────────────────────────────────
             if motion_detected:
@@ -796,8 +789,8 @@ def main() -> None:
                     evidence_bytes = enc_evidence.tobytes()
 
                     utc_iso  = datetime.datetime.now(datetime.timezone.utc).isoformat()
-                    rtc_ts   = get_rtc_timestamp() or utc_iso
-                    clean_ts = RE_CLEAN_FILENAME.sub("_", rtc_ts)
+                    cur_rtc_ts = get_rtc_timestamp() or utc_iso
+                    clean_ts = RE_CLEAN_FILENAME.sub("_", cur_rtc_ts)
                     base_name = f"motion_RTC_{clean_ts}_{saved_count:04d}"
                     local_path = os.path.join(args.save_dir, f"{base_name}.jpg")
                     meta_path  = os.path.join(args.save_dir, f"{base_name}.json")
@@ -807,8 +800,6 @@ def main() -> None:
                         f.write(evidence_bytes)
 
                     # Capture GPS coordinates
-                    cap_lat = latest_sensor.get("lat")
-                    cap_lon = latest_sensor.get("lon")
                     if cap_lat is None or cap_lon is None or (abs(cap_lat) < 0.001 and abs(cap_lon) < 0.001):
                         cap_lat = latest_sensor.get("last_known_valid_lat") or 0.0
                         cap_lon = latest_sensor.get("last_known_valid_lon") or 0.0
@@ -816,8 +807,8 @@ def main() -> None:
                     item_meta = {
                         "image_file":           f"{base_name}.jpg",
                         "captured_at":          utc_iso,
-                        "rtc_timestamp":        rtc_ts,
-                        "collection_event_id":  0,
+                        "rtc_timestamp":        cur_rtc_ts,
+                        "collection_event_id":  current_stop_id,
                         "idempotency_key":      str(uuid.uuid4()),
                         "width":                orig_w,
                         "height":               orig_h,
@@ -828,7 +819,14 @@ def main() -> None:
                         "vehicle_speed_kmh":    round(float(vehicle_speed), 2),
                         "stop_duration_sec":    round(float(current_event_duration), 2),
                         "motion_confidence":    0.95,
+                        "saved_count":          saved_count,
+                        "local_path":           local_path,
                     }
+
+                    # Register capture in active stop event record
+                    stop_detector.record_capture(item_meta)
+                    if stop_detector.active_stop is not None:
+                        latest_sensor["stop_capture_count"] = len(stop_detector.active_stop.captures)
 
                     # Write sidecar JSON so offline backups retain all context across restarts
                     try:
@@ -849,7 +847,7 @@ def main() -> None:
                         print(f"[OFFLINE BACKUP] Upload queue full; {base_name}.jpg safely retained in local storage for backlog sync.")
 
                     print(f"[CAPTURE #{saved_count}] Staged local backup: {local_path} "
-                          f"| Event duration: {current_event_duration:.1f}s "
+                          f"| Stop #{current_stop_id} duration: {current_event_duration:.1f}s "
                           f"| Speed: {vehicle_speed:.1f} km/h "
                           f"| Queued for backend upload & confirmation cleanup.")
                     cleanup_old_local_captures(args.save_dir, retention_days=3)
@@ -895,6 +893,12 @@ def main() -> None:
 
     finally:
         stop_event.set()
+        if stop_detector.active_stop is not None:
+            stop_detector.active_stop.end_mono = time.monotonic()
+            stop_detector.active_stop.end_rtc = get_rtc_timestamp()
+            stop_detector.active_stop.duration_sec = max(0.0, time.monotonic() - stop_detector.active_stop.start_mono)
+            stop_detector.active_stop.end_reason = "Edge gateway shutdown"
+            print("\n" + stop_detector.active_stop.format_summary() + "\n")
         # Signal fault LED before closing (yellow off, red blink briefly)
         try:
             leds.set_fault("Edge gateway shutting down")
