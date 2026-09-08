@@ -109,6 +109,22 @@ Pi GPIO outputs are 3.3 V at up to ~16 mA per pin.
 
 ---
 
+### Image Storage Architecture: Offline Backup & Upload Confirmation Deletion
+
+The Edge Gateway implements an offline-resilient store-and-forward architecture designed for zero persistent disk footprint during normal operation and complete data safety when offline:
+
+1. **Local Staging & Metadata Sidecar**:
+   - Each capture writes a `.jpg` image and companion `.json` metadata sidecar (preserving GPS, timestamp, speed, and stop duration at capture moment) to `captures/`.
+2. **Immediate Local Cleanup on Confirmed Upload**:
+   - As soon as the backend confirms receipt with `HTTP 200/201`, the local `.jpg` and `.json` files are **deleted immediately**.
+   - Under normal online operation, local storage remains completely empty, preventing SD card wear and storage exhaustion.
+3. **Offline Backup & Persistent Backlog Synchronizer**:
+   - If the vehicle loses cellular connectivity, the backend is unreachable, or the device is unauthenticated, captures remain safely backed up on disk.
+   - Once connectivity and backend session authentication are restored, an automated backlog synchronizer uploads the offline captures in chronological order and deletes them from local storage upon confirmation.
+   - On boot/startup, any backlog left over from a previous trip or power cut is automatically synchronized and removed.
+
+---
+
 ### Power Management & Secondary Battery Deployment
 
 In field deployment, the Pi is powered by the vehicle's main power supply (12V/24V via DC-DC converter). When the vehicle is turned off, a secondary battery (UPS HAT, Supercapacitor, or 18650 Li-ion pack) keeps the Pi running temporarily.
@@ -118,7 +134,7 @@ In field deployment, the Pi is powered by the vehicle's main power supply (12V/2
 - **Logic**: Active-LOW by default (pulled to GND on low battery warning).
 - When low battery is detected:
   1. **Camera feed halted**: Prevents new capture items.
-  2. **Evidence Flushed**: The worker immediately uploads all pending images in `upload_queue` to `POST /api/evidence/upload`.
+  2. **Evidence Flushed**: The worker immediately uploads all pending images in `upload_queue` to `POST /api/evidence/upload`. Any files confirmed uploaded are deleted; any remaining un-uploaded files stay safely on disk for upload on next boot.
   3. **Telemetry Flushed**: Telemetry queue is drained and a final status is posted.
   4. **Filesystem Synced**: `os.sync()` is executed to ensure SD card integrity.
   5. **Safe OS Shutdown**: Calls `sudo shutdown -h now` so the operating system safely halts.

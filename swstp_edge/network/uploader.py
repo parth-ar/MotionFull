@@ -16,6 +16,8 @@ No changes to payload shapes, endpoint paths, or HTTP behavior.
 """
 
 import datetime
+import json
+import os
 import queue
 import time
 import threading
@@ -438,13 +440,275 @@ def telemetry_streamer(backend_url: str, session_id_arg: int, ulb_id: str,
 
 
 # ---------------------------------------------------------------------------
-# Evidence Upload Worker (POST /api/evidence/upload)
+# Evidence Upload Worker & Offline Backlog Synchronizer (POST /api/evidence/upload)
 # ---------------------------------------------------------------------------
-def evidence_upload_worker(backend_url: str, device_id: str, ulb_id: str,
-                            stop_event: threading.Event) -> None:
-    """Consumes motion detection captures from queue and uploads to backend with full GPS, session, and device metadata."""
-    from telemetry import latest_sensor, hardware_state, upload_queue
+_in_flight_evidence_files: set = set()
+_in_flight_evidence_lock = threading.Lock()
 
+
+def _upload_and_cleanup_evidence(session: requests.Session,
+                                 url: str,
+                                 backend_url: str,
+                                 device_id: str,
+                                 ulb_id: str,
+                                 active_sid: int,
+                                 item: dict) -> bool:
+    """Uploads one capture to POST /api/evidence/upload and deletes local backup upon confirmed receipt (HTTP 200/201).
+    
+    Returns True if confirmed and local files deleted; False if upload failed (files retained as backup).
+    """
+    from telemetry import latest_sensor, hardware_state
+
+    local_path = item.get("local_path")
+    meta_path  = item.get("meta_path")
+    jpeg_bytes = item.get("jpeg_bytes")
+
+    # If bytes not in memory, read from local backup on disk
+    if not jpeg_bytes and local_path and os.path.exists(local_path):
+        try:
+            with open(local_path, "rb") as f:
+                jpeg_bytes = f.read()
+        except Exception as read_err:
+            print(f"[EVIDENCE UPLOAD] Error reading local capture {local_path}: {read_err}")
+            return False
+
+    if not jpeg_bytes:
+        print(f"[EVIDENCE UPLOAD] No JPEG bytes available for item: {local_path}")
+        return False
+
+    captured_at         = item.get("captured_at") or datetime.datetime.now(datetime.timezone.utc).isoformat()
+    collection_event_id = item.get("collection_event_id", 0)
+    idempotency_key     = item.get("idempotency_key") or str(uuid.uuid4())
+    width               = item.get("width",  1280)
+    height              = item.get("height", 720)
+    compression_quality = item.get("compression_quality", 80)
+
+    lat = item.get("latitude")
+    lon = item.get("longitude")
+    if lat is None or lon is None or (abs(lat) < 0.001 and abs(lon) < 0.001):
+        lat = latest_sensor.get("lat")
+        lon = latest_sensor.get("lon")
+        if lat is None or lon is None or (abs(lat) < 0.001 and abs(lon) < 0.001):
+            lat = latest_sensor.get("last_known_valid_lat") or 0.0
+            lon = latest_sensor.get("last_known_valid_lon") or 0.0
+
+    speed = item.get("speed_kph", item.get("vehicle_speed_kmh", 0.0))
+    if speed is None:
+        speed = latest_sensor.get("speed") or 0.0
+
+    data = {
+        "collectionEventId":  collection_event_id,
+        "capturedAt":         captured_at,
+        "width":              width,
+        "height":             height,
+        "compressionQuality": compression_quality,
+        "idempotencyKey":     idempotency_key,
+        "latitude":           round(float(lat), 8) if lat is not None else 0.0,
+        "longitude":          round(float(lon), 8) if lon is not None else 0.0,
+        "speedKph":           speed,
+        "motionConfidence":   item.get("motionConfidence", 0.95),
+        "sessionId":          active_sid,
+        "deviceId":           device_id,
+        "ulbId":              ulb_id,
+    }
+
+    file_display_name = os.path.basename(local_path) if local_path else f"evidence_{idempotency_key[:8]}.jpg"
+    resp = None
+    for attempt in range(2):
+        try:
+            resp = session.post(
+                url,
+                files={"file": (file_display_name, jpeg_bytes, "image/jpeg")},
+                data=data,
+                timeout=15.0,
+            )
+            if resp.status_code in (200, 201):
+                break
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as req_err:
+            if attempt == 0:
+                time.sleep(1.0)
+                continue
+            print(f"[EVIDENCE UPLOAD] Network/timeout error connecting to backend: {req_err}")
+            print(f"[OFFLINE BACKUP] Retaining local backup on disk: {file_display_name}")
+            return False
+        except Exception as exc:
+            print(f"[EVIDENCE UPLOAD] Unexpected error: {exc}")
+            return False
+
+    if resp is not None and resp.status_code in (200, 201):
+        try:
+            res_json = resp.json()
+        except Exception:
+            res_json = {}
+
+        hardware_state["backend"]["upload_count"] += 1
+        img_id  = res_json.get("evidenceImageId") or res_json.get("id") or "N/A"
+        img_url = res_json.get("imageUrl") or f"{backend_url.rstrip('/')}/api/evidence/images/{img_id}"
+
+        near_h, h_dist = geofence.get_nearest_house(lat, lon)
+        house_tag = (
+            f"{near_h['id']} - {near_h['name']} (@ {h_dist:.1f}m)"
+            if (near_h and h_dist <= 25.0)
+            else "Road Corridor (Auto-allocated)"
+        )
+
+        raw_lat_val = latest_sensor.get("raw_gps_lat") or lat
+        raw_lon_val = latest_sensor.get("raw_gps_lon") or lon
+
+        print("\n" + "=" * 65)
+        print(f"[FIELD LOG] 📸 EVIDENCE UPLOADED & CONFIRMED BY BACKEND")
+        print(f"            EvidenceImageId: #{img_id}")
+        print(f"            Server Path:     {res_json.get('relativePath', 'N/A')}")
+        if geofence.is_in_safe_zone(raw_lat_val, raw_lon_val):
+            print(f"            GPS Coordinates: ({lat:.8f}, {lon:.8f}) [🛡 SAFE ZONE - NO SNAP]")
+        elif abs(raw_lat_val - lat) > 0.00000001 or abs(raw_lon_val - lon) > 0.00000001:
+            drift_val = geofence.haversine_dist_meters(raw_lat_val, raw_lon_val, lat, lon)
+            print(f"            Real Raw GPS:    ({raw_lat_val:.8f}, {raw_lon_val:.8f})")
+            print(f"            Road Snapped GPS:({lat:.8f}, {lon:.8f}) [Correction: {drift_val:.1f}m]")
+        else:
+            print(f"            GPS Coordinates: ({lat:.8f}, {lon:.8f})")
+        print(f"            Associated House:{house_tag}")
+        print(f"            Access URL:      {img_url}")
+        print(f"            Session ID:      #{active_sid}")
+        print("=" * 65)
+
+        # ── IMMEDIATE LOCAL CLEANUP ──────────────────────────────────────────
+        # Upload is confirmed by backend -> Delete local staging/backup files immediately
+        deleted_list = []
+        if local_path and os.path.exists(local_path):
+            try:
+                os.remove(local_path)
+                deleted_list.append(os.path.basename(local_path))
+            except Exception as e:
+                print(f"[LOCAL STORAGE] Warning removing local image file {local_path}: {e}")
+        if meta_path and os.path.exists(meta_path):
+            try:
+                os.remove(meta_path)
+                deleted_list.append(os.path.basename(meta_path))
+            except Exception:
+                pass
+        if deleted_list:
+            print(f"[LOCAL STORAGE CLEANUP] ✔ Upload confirmed -> Deleted local backup: {', '.join(deleted_list)}\n")
+        return True
+    elif resp is not None:
+        print(f"[EVIDENCE UPLOAD FAILED] HTTP {resp.status_code}: {resp.text}")
+        print(f"[OFFLINE BACKUP] Retaining local backup on disk: {file_display_name}")
+        return False
+
+    return False
+
+
+def sync_offline_captures_backlog(backend_url: str,
+                                  device_id: str,
+                                  ulb_id: str,
+                                  active_sid: int,
+                                  session: requests.Session,
+                                  save_dir: str) -> int:
+    """Scans save_dir for offline backed-up .jpg captures and their .json sidecars.
+    Uploads each to backend in chronological order and deletes the local backup
+    upon confirmed HTTP 200/201 response.
+    Returns the count of successfully synchronized captures.
+    """
+    if not os.path.exists(save_dir):
+        return 0
+
+    candidates = []
+    try:
+        with os.scandir(save_dir) as entries:
+            for entry in entries:
+                if entry.is_file():
+                    name_lower = entry.name.lower()
+                    if name_lower.endswith(".jpg") or name_lower.endswith(".jpeg"):
+                        candidates.append((entry.stat().st_mtime, entry.path))
+    except Exception as ex:
+        print(f"[BACKLOG SYNC] Error scanning {save_dir}: {ex}")
+        return 0
+
+    if not candidates:
+        return 0
+
+    # Sort oldest first (chronological replay)
+    candidates.sort(key=lambda x: x[0])
+    url = f"{backend_url.rstrip('/')}/api/evidence/upload"
+    uploaded_count = 0
+
+    for mtime, img_path in candidates:
+        abs_path = os.path.abspath(img_path)
+        with _in_flight_evidence_lock:
+            if abs_path in _in_flight_evidence_files:
+                continue
+            _in_flight_evidence_files.add(abs_path)
+
+        try:
+            meta_path = os.path.splitext(img_path)[0] + ".json"
+            meta_dict = {}
+            if os.path.exists(meta_path):
+                try:
+                    with open(meta_path, "r", encoding="utf-8") as f_m:
+                        meta_dict = json.load(f_m)
+                except Exception as je:
+                    print(f"[BACKLOG SYNC] Note reading sidecar {meta_path}: {je}")
+
+            # Fallback metadata if sidecar missing
+            if not meta_dict:
+                utc_from_mtime = datetime.datetime.fromtimestamp(mtime, datetime.timezone.utc).isoformat()
+                meta_dict = {
+                    "captured_at":         utc_from_mtime,
+                    "collection_event_id": 0,
+                    "idempotency_key":     str(uuid.uuid4()),
+                    "width":               1280,
+                    "height":              720,
+                    "compression_quality": 80,
+                    "latitude":            0.0,
+                    "longitude":           0.0,
+                    "speed_kph":           0.0,
+                    "motion_confidence":   0.95,
+                }
+
+            meta_dict["local_path"] = img_path
+            meta_dict["meta_path"]  = meta_path if os.path.exists(meta_path) else None
+
+            print(f"[BACKLOG SYNC] Uploading offline backup: {os.path.basename(img_path)}...")
+            success = _upload_and_cleanup_evidence(
+                session=session,
+                url=url,
+                backend_url=backend_url,
+                device_id=device_id,
+                ulb_id=ulb_id,
+                active_sid=active_sid,
+                item=meta_dict,
+            )
+            if success:
+                uploaded_count += 1
+            else:
+                # Backend unavailable or failed — abort remaining backlog to avoid spamming
+                print(f"[BACKLOG SYNC] Pausing sync; remaining offline captures preserved locally.")
+                break
+        finally:
+            with _in_flight_evidence_lock:
+                _in_flight_evidence_files.discard(abs_path)
+
+    if uploaded_count > 0:
+        print(f"[BACKLOG SYNC] ✔ Synchronized and deleted {uploaded_count} offline capture(s) from local storage.")
+    return uploaded_count
+
+
+def evidence_upload_worker(backend_url: str, device_id: str, ulb_id: str,
+                            stop_event: threading.Event,
+                            save_dir: str | None = None) -> None:
+    """Consumes motion detection captures from upload_queue and uploads to backend.
+    
+    Image Storage Architecture:
+      - All captures are initially staged on disk as a backup.
+      - Upon confirmed backend upload (HTTP 200/201), the local files are deleted immediately.
+      - If offline or unauthenticated, captures remain safely stored locally.
+      - As soon as connectivity & authentication are confirmed, the offline backlog
+        is uploaded in chronological order and deleted from local storage upon receipt.
+    """
+    from telemetry import upload_queue
+    from config import CAPTURES_DIR
+
+    target_save_dir = save_dir or CAPTURES_DIR
     url = f"{backend_url.rstrip('/')}/api/evidence/upload"
 
     session = requests.Session()
@@ -452,112 +716,69 @@ def evidence_upload_worker(backend_url: str, device_id: str, ulb_id: str,
     session.mount("http://", adapter)
     session.mount("https://", adapter)
 
-    _last_auth_warn = 0.0
+    _last_auth_warn   = 0.0
+    _last_backlog_chk = 0.0
+    _BACKLOG_INTERVAL = 10.0   # seconds between offline backlog scans
+
     while not stop_event.is_set():
-        try:
-            item = upload_queue.get(timeout=1.0)
-        except queue.Empty:
-            continue
-
         active_sid = dynamic_session_info.get("sessionId", 0)
-        is_auth = dynamic_session_info.get("authenticated", False)
+        is_auth    = dynamic_session_info.get("authenticated", False)
 
+        # If not authenticated, do not consume items from upload_queue; let them stay in queue & disk
         if not is_auth or active_sid <= 0:
             now_t = time.time()
             if now_t - _last_auth_warn > 10.0:
                 _last_auth_warn = now_t
-                print(f"[AUTH BLOCKED] Evidence upload DROPPED: Device '{device_id}' is not authenticated in backend. No session active.")
+                print(f"[AUTH HOLD] Evidence upload waiting: Device '{device_id}' is not authenticated in backend. Captures remain safely in local backup.")
+            stop_event.wait(2.0)
             continue
 
+        # 1. Process live queue items
         try:
-            jpeg_bytes           = item["jpeg_bytes"]
-            captured_at          = item.get("captured_at") or datetime.datetime.now(datetime.timezone.utc).isoformat()
-            collection_event_id  = item.get("collection_event_id", 0)
-            idempotency_key      = item.get("idempotency_key") or str(uuid.uuid4())
-            width                = item.get("width",  1280)
-            height               = item.get("height", 720)
-            compression_quality  = item.get("compression_quality", 80)
+            item = upload_queue.get(timeout=1.0)
+        except queue.Empty:
+            item = None
 
-            lat = latest_sensor.get("lat")
-            lon = latest_sensor.get("lon")
-            if lat is None or lon is None or (abs(lat) < 0.001 and abs(lon) < 0.001):
-                lat = latest_sensor.get("last_known_valid_lat") or 0.0
-                lon = latest_sensor.get("last_known_valid_lon") or 0.0
+        if item is not None:
+            local_path = item.get("local_path")
+            abs_path   = os.path.abspath(local_path) if local_path else None
+            if abs_path:
+                with _in_flight_evidence_lock:
+                    _in_flight_evidence_files.add(abs_path)
 
-            speed      = latest_sensor.get("speed") or 0.0
-            active_sid = latest_sensor.get("active_session_id") or dynamic_session_info.get("sessionId") or 0
-
-            data = {
-                "collectionEventId":  collection_event_id,
-                "capturedAt":         captured_at,
-                "width":              width,
-                "height":             height,
-                "compressionQuality": compression_quality,
-                "idempotencyKey":     idempotency_key,
-                "latitude":           round(float(lat), 8) if lat is not None else 0.0,
-                "longitude":          round(float(lon), 8) if lon is not None else 0.0,
-                "speedKph":           speed,
-                "motionConfidence":   0.95,
-                "sessionId":          active_sid,
-                "deviceId":           device_id,
-                "ulbId":              ulb_id,
-            }
-
-            resp = None
-            for attempt in range(2):
-                try:
-                    resp = session.post(
-                        url,
-                        files={"file": ("evidence.jpg", jpeg_bytes, "image/jpeg")},
-                        data=data,
-                        timeout=15.0,
-                    )
-                    if resp.status_code in (200, 201):
-                        break
-                except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as req_err:
-                    if attempt == 0:
-                        time.sleep(1.0)
-                        continue
-                    raise req_err
-
-            if resp is not None and resp.status_code in (200, 201):
-                res_json = resp.json()
-                hardware_state["backend"]["upload_count"] += 1
-                img_id  = res_json.get("evidenceImageId") or res_json.get("id") or "N/A"
-                img_url = res_json.get("imageUrl") or f"{backend_url.rstrip('/')}/api/evidence/images/{img_id}"
-
-                near_h, h_dist = geofence.get_nearest_house(lat, lon)
-                house_tag = (
-                    f"{near_h['id']} - {near_h['name']} (@ {h_dist:.1f}m)"
-                    if (near_h and h_dist <= 25.0)
-                    else "Road Corridor (Auto-allocated)"
+            try:
+                _upload_and_cleanup_evidence(
+                    session=session,
+                    url=url,
+                    backend_url=backend_url,
+                    device_id=device_id,
+                    ulb_id=ulb_id,
+                    active_sid=active_sid,
+                    item=item,
                 )
+            except Exception as e:
+                print(f"[EVIDENCE UPLOAD ERROR] {e}")
+            finally:
+                if abs_path:
+                    with _in_flight_evidence_lock:
+                        _in_flight_evidence_files.discard(abs_path)
+                upload_queue.task_done()
 
-                raw_lat_val = latest_sensor.get("raw_gps_lat") or lat
-                raw_lon_val = latest_sensor.get("raw_gps_lon") or lon
-
-                print("\n" + "=" * 65)
-                print(f"[FIELD LOG] 📸 EVIDENCE UPLOADED & STORED IN BACKEND")
-                print(f"            EvidenceImageId: #{img_id}")
-                print(f"            Server Path:     {res_json.get('relativePath', 'N/A')}")
-                if geofence.is_in_safe_zone(raw_lat_val, raw_lon_val):
-                    print(f"            GPS Coordinates: ({lat:.8f}, {lon:.8f}) [🛡 SAFE ZONE - NO SNAP]")
-                elif abs(raw_lat_val - lat) > 0.00000001 or abs(raw_lon_val - lon) > 0.00000001:
-                    drift_val = geofence.haversine_dist_meters(raw_lat_val, raw_lon_val, lat, lon)
-                    print(f"            Real Raw GPS:    ({raw_lat_val:.8f}, {raw_lon_val:.8f})")
-                    print(f"            Road Snapped GPS:({lat:.8f}, {lon:.8f}) [Correction: {drift_val:.1f}m]")
-                else:
-                    print(f"            GPS Coordinates: ({lat:.8f}, {lon:.8f})")
-                print(f"            Associated House:{house_tag}")
-                print(f"            Access URL:      {img_url}")
-                print(f"            Session ID:      #{active_sid}")
-                print("=" * 65 + "\n")
-            elif resp is not None:
-                print(f"[EVIDENCE UPLOAD FAILED] HTTP {resp.status_code}: {resp.text}")
-
-        except Exception as e:
-            print(f"[EVIDENCE UPLOAD ERROR] {e}")
-        finally:
-            upload_queue.task_done()
+        # 2. Check offline backlog if queue is clear or interval elapsed
+        now_t = time.time()
+        if (upload_queue.empty() and (now_t - _last_backlog_chk >= _BACKLOG_INTERVAL)) or (_last_backlog_chk == 0.0):
+            _last_backlog_chk = now_t
+            try:
+                sync_offline_captures_backlog(
+                    backend_url=backend_url,
+                    device_id=device_id,
+                    ulb_id=ulb_id,
+                    active_sid=active_sid,
+                    session=session,
+                    save_dir=target_save_dir,
+                )
+            except Exception as b_err:
+                print(f"[BACKLOG SYNC ERROR] {b_err}")
 
     session.close()
+

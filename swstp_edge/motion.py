@@ -38,6 +38,13 @@ drawn_polygon_pts:  list = []
 camera_feed_active: bool = True
 
 
+def reset_tracking() -> None:
+
+    global is_drawing_polygon, drawn_polygon_pts
+    is_drawing_polygon = False
+    drawn_polygon_pts.clear()
+
+
 # ---------------------------------------------------------------------------
 # ROI persistence
 # ---------------------------------------------------------------------------
@@ -225,26 +232,7 @@ def overlay_metadata(frame):
 
 
 # ---------------------------------------------------------------------------
-# Synthetic video frame generator
-# ---------------------------------------------------------------------------
-def generate_virtual_video_frame(width: int, height: int, count: int):
-    """Generates a dynamic real-time simulated roadside camera frame with simulated motion."""
-    img = np.zeros((height, width, 3), dtype=np.uint8)
-    img[0:height // 2, :] = (55, 45, 35)
-    img[height // 2:, :]  = (30, 30, 30)
-    dash_offset = (count * 6) % 60
-    for x in range(-dash_offset, width, 60):
-        cv2.line(img, (x, height * 3 // 4), (min(width, x + 30), height * 3 // 4), (200, 200, 200), 2)
-    motion_x = int(width  * (0.42 + 0.12 * math.sin(count * 0.08)))
-    motion_y = int(height * (0.22 + 0.08 * math.cos(count * 0.08)))
-    cv2.rectangle(img, (motion_x - 22, motion_y - 16), (motion_x + 22, motion_y + 16), (0, 140, 255), -1)
-    cv2.putText(img, "SWSTP-PI EDGE VIDEO FEED", (width // 2 - 110, 25),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1, cv2.LINE_AA)
-    return img
-
-
-# ---------------------------------------------------------------------------
-# Local capture cleanup
+# Local capture cleanup (Safety retention guard for offline backlog)
 # ---------------------------------------------------------------------------
 _last_cleanup_time = 0.0
 
@@ -252,7 +240,7 @@ _last_cleanup_time = 0.0
 def cleanup_old_local_captures(save_dir: str = CAPTURES_DIR,
                                 retention_days: int = 3,
                                 force: bool = False) -> None:
-    """Deletes local capture frames older than retention_days with rate-limiting."""
+    """Safety guard: Deletes local capture frames and metadata sidecars older than retention_days with rate-limiting."""
     global _last_cleanup_time
     now = time.time()
     if not force and (now - _last_cleanup_time) < 60.0:
@@ -268,7 +256,13 @@ def cleanup_old_local_captures(save_dir: str = CAPTURES_DIR,
                     try:
                         if entry.stat().st_mtime < cutoff:
                             os.remove(entry.path)
+                            # If this was a jpg, also remove matching json sidecar if exists
+                            if entry.name.lower().endswith(".jpg"):
+                                json_path = os.path.splitext(entry.path)[0] + ".json"
+                                if os.path.exists(json_path):
+                                    os.remove(json_path)
                     except Exception:
                         pass
     except Exception:
         pass
+

@@ -13,6 +13,7 @@ No systemd unit / auto-start — errors print live to stdout (testing phase).
 
 import argparse
 import datetime
+import json
 import os
 import re
 import sys
@@ -24,7 +25,16 @@ import uuid
 if "--headless" in sys.argv or "DISPLAY" not in os.environ:
     os.environ["QT_QPA_PLATFORM"] = "offscreen"
 
+# Suppress OpenCV noisy C++ warning spam during device probing
+os.environ["OPENCV_LOG_LEVEL"] = "ERROR"
+os.environ["OPENCV_VIDEOIO_PRIORITY_BACKEND"] = "V4L2"
+
 import cv2
+if hasattr(cv2, "setLogLevel"):
+    try:
+        cv2.setLogLevel(0)  # LOG_LEVEL_SILENT
+    except Exception:
+        pass
 import imutils
 import numpy as np
 import requests
@@ -140,6 +150,24 @@ def build_parser() -> argparse.ArgumentParser:
 # ---------------------------------------------------------------------------
 # Camera & Video Port Scanning Helpers
 # ---------------------------------------------------------------------------
+def is_v4l2_capture_device(dev_idx: int) -> bool:
+    """Checks if /dev/videoX is an actual video capture device and not metadata/ISP/codec."""
+    sys_path = f"/sys/class/video4linux/video{dev_idx}"
+    if not os.path.exists(sys_path):
+        return False
+    name_file = os.path.join(sys_path, "name")
+    if os.path.exists(name_file):
+        try:
+            with open(name_file, "r", encoding="utf-8", errors="ignore") as f:
+                name = f.read().strip().lower()
+            # Filter out metadata stream nodes and Pi hardware codec/ISP nodes
+            if "metadata" in name or "bcm2835-codec" in name or "bcm2835-isp" in name:
+                return False
+        except Exception:
+            pass
+    return True
+
+
 def probe_video_source(src):
     """Attempt to open and read a test frame from camera source `src`.
     Returns (cap, width, height, fps) if open & readable, else (None, 0, 0, 0).
@@ -147,18 +175,38 @@ def probe_video_source(src):
     try:
         if isinstance(src, int) or (isinstance(src, str) and src.isdigit()):
             dev_idx = int(src)
-            # On Linux/Pi, prefer V4L2 backend
+            # On Linux/Pi:
             if sys.platform.startswith("linux"):
+                dev_node = f"/dev/video{dev_idx}"
+                # Must exist and be readable (handles transient udev setup on hotplug)
+                if not os.path.exists(dev_node) or not os.access(dev_node, os.R_OK):
+                    return None, 0, 0, 0
+                # Must be genuine video capture device (not metadata or codec)
+                if not is_v4l2_capture_device(dev_idx):
+                    return None, 0, 0, 0
                 c = cv2.VideoCapture(dev_idx, cv2.CAP_V4L2)
-                if not c.isOpened():
-                    c.release()
-                    c = cv2.VideoCapture(dev_idx)
             else:
                 c = cv2.VideoCapture(dev_idx)
+        elif isinstance(src, str) and src.startswith("/dev/video"):
+            dev_name = os.path.basename(src)
+            idx_str = dev_name.replace("video", "")
+            if idx_str.isdigit() and sys.platform.startswith("linux"):
+                dev_idx = int(idx_str)
+                if not os.path.exists(src) or not os.access(src, os.R_OK):
+                    return None, 0, 0, 0
+                if not is_v4l2_capture_device(dev_idx):
+                    return None, 0, 0, 0
+                c = cv2.VideoCapture(dev_idx, cv2.CAP_V4L2)
+            else:
+                c = cv2.VideoCapture(src)
         else:
             c = cv2.VideoCapture(src)
 
         if c.isOpened():
+            try:
+                c.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            except Exception:
+                pass
             ret, test_frame = c.read()
             if ret and test_frame is not None and test_frame.size > 0:
                 w = int(c.get(cv2.CAP_PROP_FRAME_WIDTH)) or test_frame.shape[1]
@@ -173,14 +221,36 @@ def probe_video_source(src):
     return None, 0, 0, 0
 
 
-def get_candidate_video_ports(preferred_source):
-    """Build list of candidate camera ports/sources to probe."""
+def get_candidate_video_ports(preferred_source=None):
+    """Build list of candidate camera ports/sources to probe, dynamically discovering attached devices."""
     candidates = []
     if preferred_source is not None and preferred_source != "":
-        candidates.append(preferred_source)
-    for idx in [0, 1, 2, 3, 4]:
-        if idx not in candidates:
-            candidates.append(idx)
+        try:
+            candidates.append(int(preferred_source) if str(preferred_source).isdigit() else preferred_source)
+        except Exception:
+            candidates.append(preferred_source)
+
+    if sys.platform.startswith("linux"):
+        import glob
+        found_devs = []
+        for p in sorted(glob.glob("/dev/video*")):
+            dev_name = os.path.basename(p)
+            idx_str = dev_name.replace("video", "")
+            if idx_str.isdigit():
+                idx = int(idx_str)
+                # Filter out metadata nodes and hardware codecs directly from candidate list
+                if is_v4l2_capture_device(idx):
+                    found_devs.append(idx)
+        for d in found_devs:
+            if d not in candidates:
+                candidates.append(d)
+        # If no /dev/video capture nodes found yet, keep preferred or fallback [0, 1]
+        if not candidates:
+            candidates = [0, 1]
+    else:
+        for idx in [0, 1, 2]:
+            if idx not in candidates:
+                candidates.append(idx)
     return candidates
 
 
@@ -345,7 +415,7 @@ def main() -> None:
     # 4. Evidence upload worker  (POST /api/evidence/upload)
     t_evidence = threading.Thread(
         target=evidence_upload_worker,
-        args=(effective_backend_url, device_id, effective_ulb_id, stop_event),
+        args=(effective_backend_url, device_id, effective_ulb_id, stop_event, args.save_dir),
         daemon=True, name="evidence-upload",
     )
     t_evidence.start()
@@ -418,7 +488,8 @@ def main() -> None:
                 except Exception:
                     pass
 
-                # Scan candidate ports
+                # Dynamically scan candidate ports (detects USB webcams attached at runtime)
+                candidate_ports = get_candidate_video_ports(initial_source)
                 new_cap, new_src, new_w, new_h, new_fps = scan_for_camera(candidate_ports)
                 if new_cap is not None:
                     cap = new_cap
@@ -428,7 +499,11 @@ def main() -> None:
                     is_file = isinstance(source, str) and not source.isdigit() and not str(source).startswith("/dev/video")
                     bg_model = None
                     frame_count = 0
-                    _motion_mod.reset_tracking()
+                    if hasattr(_motion_mod, "reset_tracking"):
+                        try:
+                            _motion_mod.reset_tracking()
+                        except Exception:
+                            pass
                     hardware_state["camera"] = {
                         "detected": True, "source": source,
                         "resolution": f"{cam_w}x{cam_h}", "fps": fps
@@ -444,7 +519,12 @@ def main() -> None:
                         try:
                             cv2.setMouseCallback(WIN_TITLE, on_mouse_roi, {"width": cam_w, "height": cam_h})
                         except Exception:
-                            pass
+                            try:
+                                cv2.namedWindow(WIN_TITLE, cv2.WINDOW_NORMAL)
+                                cv2.resizeWindow(WIN_TITLE, 960, 540)
+                                cv2.setMouseCallback(WIN_TITLE, on_mouse_roi, {"width": cam_w, "height": cam_h})
+                            except Exception:
+                                pass
                     continue
 
                 # Standby / Hold screen
@@ -534,7 +614,11 @@ def main() -> None:
                     }
                     bg_model = None
                     frame_count = 0
-                    _motion_mod.reset_tracking()
+                    if hasattr(_motion_mod, "reset_tracking"):
+                        try:
+                            _motion_mod.reset_tracking()
+                        except Exception:
+                            pass
                     try:
                         leds.set_camera_scanning(True)
                     except Exception:
@@ -714,30 +798,60 @@ def main() -> None:
                     utc_iso  = datetime.datetime.now(datetime.timezone.utc).isoformat()
                     rtc_ts   = get_rtc_timestamp() or utc_iso
                     clean_ts = RE_CLEAN_FILENAME.sub("_", rtc_ts)
-                    local_path = os.path.join(args.save_dir,
-                                              f"motion_RTC_{clean_ts}_{saved_count:04d}.jpg")
+                    base_name = f"motion_RTC_{clean_ts}_{saved_count:04d}"
+                    local_path = os.path.join(args.save_dir, f"{base_name}.jpg")
+                    meta_path  = os.path.join(args.save_dir, f"{base_name}.json")
+
+                    # 1. Write local image backup on disk
                     with open(local_path, "wb") as f:
                         f.write(evidence_bytes)
 
-                    try:
-                        upload_queue.put_nowait({
-                            "jpeg_bytes":           evidence_bytes,
-                            "captured_at":          utc_iso,
-                            "collection_event_id":  0,
-                            "idempotency_key":      str(uuid.uuid4()),
-                            "width":                orig_w,
-                            "height":               orig_h,
-                            "compression_quality":  80,
-                            "stop_duration_sec":    round(current_event_duration, 2),
-                            "vehicle_speed_kmh":    round(vehicle_speed, 2),
-                        })
-                    except Exception:
-                        pass
+                    # Capture GPS coordinates
+                    cap_lat = latest_sensor.get("lat")
+                    cap_lon = latest_sensor.get("lon")
+                    if cap_lat is None or cap_lon is None or (abs(cap_lat) < 0.001 and abs(cap_lon) < 0.001):
+                        cap_lat = latest_sensor.get("last_known_valid_lat") or 0.0
+                        cap_lon = latest_sensor.get("last_known_valid_lon") or 0.0
 
-                    print(f"[CAPTURE #{saved_count}] Saved: {local_path} "
+                    item_meta = {
+                        "image_file":           f"{base_name}.jpg",
+                        "captured_at":          utc_iso,
+                        "rtc_timestamp":        rtc_ts,
+                        "collection_event_id":  0,
+                        "idempotency_key":      str(uuid.uuid4()),
+                        "width":                orig_w,
+                        "height":               orig_h,
+                        "compression_quality":  80,
+                        "latitude":             round(float(cap_lat), 8) if cap_lat is not None else 0.0,
+                        "longitude":            round(float(cap_lon), 8) if cap_lon is not None else 0.0,
+                        "speed_kph":            round(float(vehicle_speed), 2),
+                        "vehicle_speed_kmh":    round(float(vehicle_speed), 2),
+                        "stop_duration_sec":    round(float(current_event_duration), 2),
+                        "motion_confidence":    0.95,
+                    }
+
+                    # Write sidecar JSON so offline backups retain all context across restarts
+                    try:
+                        with open(meta_path, "w", encoding="utf-8") as f_meta:
+                            json.dump(item_meta, f_meta, indent=2)
+                    except Exception as meta_err:
+                        print(f"[CAPTURE] Warning saving metadata sidecar: {meta_err}")
+
+                    # 2. Enqueue for backend upload (will delete local backup upon confirmed upload)
+                    queue_item = dict(item_meta)
+                    queue_item["local_path"] = local_path
+                    queue_item["meta_path"]  = meta_path
+                    queue_item["jpeg_bytes"] = evidence_bytes
+
+                    try:
+                        upload_queue.put_nowait(queue_item)
+                    except Exception:
+                        print(f"[OFFLINE BACKUP] Upload queue full; {base_name}.jpg safely retained in local storage for backlog sync.")
+
+                    print(f"[CAPTURE #{saved_count}] Staged local backup: {local_path} "
                           f"| Event duration: {current_event_duration:.1f}s "
                           f"| Speed: {vehicle_speed:.1f} km/h "
-                          f"| Queued for backend upload.")
+                          f"| Queued for backend upload & confirmation cleanup.")
                     cleanup_old_local_captures(args.save_dir, retention_days=3)
 
                     # ── Headless LED: blink yellow 3× to confirm snap ────────
