@@ -204,6 +204,8 @@ def probe_video_source(src):
             c = cv2.VideoCapture(src)
 
         if c.isOpened():
+            c.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+            c.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
             try:
                 c.set(cv2.CAP_PROP_BUFFERSIZE, 1)
             except Exception:
@@ -344,7 +346,7 @@ def main() -> None:
     print("========================================================\n")
 
     # ── Camera / video source ────────────────────────────────────────────
-    VIDEO_SOURCE = 0
+    VIDEO_SOURCE = 10
     initial_source = (
         int(args.source)
         if (args.source and args.source.isdigit())
