@@ -185,7 +185,7 @@ def probe_video_source(src):
                 # Must be genuine video capture device (not metadata or codec)
                 if not is_v4l2_capture_device(dev_idx):
                     return None, 0, 0, 0
-                c = cv2.VideoCapture(dev_idx, cv2.CAP_V4L2)
+                c = cv2.VideoCapture(dev_node, cv2.CAP_V4L2)
             else:
                 c = cv2.VideoCapture(dev_idx)
         elif isinstance(src, str) and src.startswith("/dev/video"):
@@ -197,7 +197,7 @@ def probe_video_source(src):
                     return None, 0, 0, 0
                 if not is_v4l2_capture_device(dev_idx):
                     return None, 0, 0, 0
-                c = cv2.VideoCapture(dev_idx, cv2.CAP_V4L2)
+                c = cv2.VideoCapture(src, cv2.CAP_V4L2)
             else:
                 c = cv2.VideoCapture(src)
         else:
