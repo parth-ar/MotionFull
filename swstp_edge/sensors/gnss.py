@@ -202,11 +202,16 @@ def _parse_rmc(fields: list) -> None:
     Parse $RMC / $GNRMC — Recommended minimum (includes speed + course).
     """
     # fields: [id, time, status, lat, N/S, lon, E/W, speed_knots, course, date, ...]
-    if len(fields) < 9:
+    if len(fields) < 3:
         return
 
+    now = time.monotonic()
+    with _lock:
+        _state["data_received"] = True
+        _state["last_data_time"] = now
+
     active = fields[2].strip().upper() == "A"
-    if not active:
+    if not active or len(fields) < 9:
         return
 
     lat = _parse_lat(fields[3], fields[4])
@@ -216,10 +221,7 @@ def _parse_rmc(fields: list) -> None:
 
     speed_kmh = round(speed_kn * 1.852, 2) if speed_kn is not None else None
 
-    now = time.monotonic()
     with _lock:
-        _state["data_received"] = True
-        _state["last_data_time"] = now
         if lat is not None and lon is not None:
             _state["fix"]        = True
             _state["status"]     = "FIX"
@@ -323,6 +325,15 @@ def _dispatch(line: str) -> None:
         return
     sentence_id = fields[0].upper()
     parser = _PARSERS.get(sentence_id)
+    if not parser:
+        if sentence_id.endswith("GGA"):
+            parser = _parse_gga
+        elif sentence_id.endswith("RMC"):
+            parser = _parse_rmc
+        elif sentence_id.endswith("GSA"):
+            parser = _parse_gsa
+        elif sentence_id.endswith("GSV"):
+            parser = _parse_gsv
     if parser:
         try:
             parser(fields)
