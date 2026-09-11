@@ -181,7 +181,7 @@ def run_roi_setup_phase(cap, win_title: str, frame_w: int, frame_h: int) -> list
                             cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 200, 255), 1)
             cx = int(np.mean([p[0] for p in saved_px]))
             cy = int(np.mean([p[1] for p in saved_px]))
-            cv2.putText(display, "SAVED ROI / AoD", (cx - 70, cy),
+            cv2.putText(display, "SAVED AREA OF INTEREST", (cx - 110, cy),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 255), 2, cv2.LINE_AA)
 
         # ── Draw new polygon being placed ──
@@ -208,7 +208,7 @@ def run_roi_setup_phase(cap, win_title: str, frame_w: int, frame_h: int) -> list
 
         # ── Top banner ──
         cv2.rectangle(display, (0, 0), (w, 50), (15, 15, 18), -1)
-        cv2.putText(display, "SETUP  —  Region of Interest / Area of Disinterest",
+        cv2.putText(display, "SETUP  —  Area of Interest (AoI)",
                     (10, 32), cv2.FONT_HERSHEY_DUPLEX, 0.75, (0, 220, 255), 1, cv2.LINE_AA)
 
         # ── Bottom instruction strip ──
@@ -359,11 +359,10 @@ def overlay_metadata(frame, litter_engine=None):
         loc_color = (0, 165, 255)
 
     h, w = frame.shape[:2]
-    font_scale   = max(0.4, (h / 480.0) * 0.45)
-    thickness    = max(1, int(h / 360))
+    font_scale  = max(0.4, (h / 480.0) * 0.45)
+    thickness   = max(1, int(h / 360))
     line_spacing = int(font_scale * 24)
-    hud_lines    = 3 if litter_engine is not None else 2
-    strip_height = line_spacing * hud_lines + 15
+    strip_height = line_spacing * 2 + 15
 
     # Top Status HUD
     cam_badge = "CAM:OK" if hardware_state["camera"]["detected"] else "CAM:OFF"
@@ -401,25 +400,8 @@ def overlay_metadata(frame, litter_engine=None):
         curr_spd = float(latest_sensor.get("speed") or 0.0)
         veh_badge = f"VEH:MOV({curr_spd:.1f}kph)"
 
-    # Litter engine badge
-    if litter_engine is not None:
-        if litter_engine.model_ready:
-            if litter_engine.op_mode == "GNSS_DISTANCE":
-                lit_badge = (f"LITTER:{litter_engine.distance_since_trigger:.1f}/"
-                             f"{litter_engine.distance_interval_m:.0f}m "
-                             f"T{litter_engine.trigger_count} E{litter_engine.event_count}")
-            else:
-                lit_badge = f"LITTER:CLK T{litter_engine.trigger_count} E{litter_engine.event_count}"
-        else:
-            lit_badge = "LITTER:LOADING"
-    else:
-        lit_badge = ""
-
-    hud_text = (f"[SWSTP-UNIFIED] {cam_badge} | {rtc_badge} | {imu_badge} | "
-                f"{gps_badge} | {veh_badge} | {pwr_badge} | {net_badge}")
-    cv2.putText(frame, hud_text, (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (220, 220, 220), 1, cv2.LINE_AA)
-    if lit_badge:
-        cv2.putText(frame, lit_badge, (10, 38), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 230, 255), 1, cv2.LINE_AA)
+    hud_text = f"[SWSTP-PI] {cam_badge} | {rtc_badge} | {imu_badge} | {gps_badge} | {veh_badge} | {pwr_badge} | {net_badge}"
+    cv2.putText(frame, hud_text, (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (220, 220, 220), 1, cv2.LINE_AA)
 
     # Bottom Metadata Strip
     banner_slice = frame[h - strip_height:h, 0:w]

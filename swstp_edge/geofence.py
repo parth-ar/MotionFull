@@ -60,6 +60,9 @@ def haversine_dist_meters(lat1: float, lon1: float, lat2: float, lon2: float) ->
     return R * 2.0 * math.atan2(math.sqrt(a), math.sqrt(1.0 - a))
 
 
+haversine_distance_m = haversine_dist_meters
+
+
 def angular_distance(a, b) -> float:
     """Calculates the minimal circular distance between two angles in degrees (0 - 180)."""
     if a is None or b is None:

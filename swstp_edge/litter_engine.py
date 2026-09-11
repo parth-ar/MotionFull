@@ -47,6 +47,22 @@ import sensors.gnss as gnss_sensor
 import sensors.leds as leds
 
 
+def _haversine_distance_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Haversine distance between two coordinates in meters."""
+    if lat1 is None or lon1 is None or lat2 is None or lon2 is None:
+        return 0.0
+    try:
+        import math
+        R = 6371000.0
+        p1, p2 = math.radians(float(lat1)), math.radians(float(lat2))
+        dp = math.radians(float(lat2) - float(lat1))
+        dl = math.radians(float(lon2) - float(lon1))
+        a = math.sin(dp / 2.0)**2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2.0)**2
+        return R * 2.0 * math.atan2(math.sqrt(a), math.sqrt(max(0.0, 1.0 - a)))
+    except Exception:
+        return 0.0
+
+
 # ---------------------------------------------------------------------------
 # Geometry helpers
 # ---------------------------------------------------------------------------
@@ -265,7 +281,7 @@ class LitterEngine:
         trigger = False
 
         if self._op_mode == "GNSS_DISTANCE" and has_fix and self._last_trigger_lat is not None:
-            dist = gnss_sensor.haversine_distance_m(
+            dist = _haversine_distance_m(
                 self._last_trigger_lat, self._last_trigger_lon, lat, lon
             )
             self._distance_since_trig = dist

@@ -478,3 +478,18 @@ def read() -> dict:
         "satellites_detail":  detail,
         "hdop":               snap["hdop"],
     }
+
+
+def haversine_distance_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """
+    Calculate the great-circle distance between two GPS coordinates in meters.
+    Uses the Haversine formula with mean Earth radius R = 6,371,000 m.
+    """
+    if lat1 is None or lon1 is None or lat2 is None or lon2 is None:
+        return 0.0
+    R = 6371000.0
+    p1, p2 = math.radians(float(lat1)), math.radians(float(lat2))
+    dp = math.radians(float(lat2) - float(lat1))
+    dl = math.radians(float(lon2) - float(lon1))
+    a = math.sin(dp / 2.0)**2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2.0)**2
+    return R * 2.0 * math.atan2(math.sqrt(a), math.sqrt(max(0.0, 1.0 - a)))

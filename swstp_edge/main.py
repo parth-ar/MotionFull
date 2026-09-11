@@ -109,6 +109,29 @@ latest_stream_frame: tuple | None = None
 RE_CLEAN_FILENAME = re.compile(r"[^\w]")
 
 
+def draw_area_of_interest_overlay(frame, roi_pts, motion_detected: bool = False) -> None:
+    """Draw Area of Interest polygon and pointers matching original visual appearance."""
+    if not roi_pts or len(roi_pts) < 3:
+        return
+    orig_h, orig_w = frame.shape[:2]
+    disp_pts = []
+    for p in roi_pts:
+        px = int(p[0] * orig_w) if p[0] <= 1.0 else int(p[0])
+        py = int(p[1] * orig_h) if p[1] <= 1.0 else int(p[1])
+        disp_pts.append([px, py])
+
+    if len(disp_pts) >= 3 and not _motion.is_drawing_polygon:
+        poly_color = (0, 0, 255) if motion_detected else (0, 255, 200)
+        cv2.polylines(frame, [np.array(disp_pts, dtype=np.int32)],
+                      isClosed=True, color=poly_color, thickness=2)
+        for pt in disp_pts:
+            cv2.circle(frame, tuple(pt), 4, (0, 255, 255), -1)
+        cv2.putText(frame,
+                    f"AREA OF INTEREST ({len(disp_pts)} pts, press 'r' to re-plot)",
+                    (disp_pts[0][0] + 5, max(20, disp_pts[0][1] - 8)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, poly_color, 1, cv2.LINE_AA)
+
+
 # ---------------------------------------------------------------------------
 # Argument parser
 # ---------------------------------------------------------------------------
@@ -268,8 +291,6 @@ def scan_for_camera(candidates):
 def main() -> None:
     global latest_stream_frame
 
-    import motion as _motion_mod
-
     parser = build_parser()
     args, _ = parser.parse_known_args()
 
@@ -426,7 +447,7 @@ def main() -> None:
     litter_engine: LitterEngine | None = None
 
     # ── GUI window ─────────────────────────────────────────────────────────
-    WIN_TITLE = "SWSTP Unified Gateway (Motion + Litter)"
+    WIN_TITLE = "SWSTP Motion & Telemetry Gateway (Pi)"
     if not args.headless:
         try:
             cv2.namedWindow(WIN_TITLE, cv2.WINDOW_NORMAL)
@@ -510,9 +531,9 @@ def main() -> None:
                     is_file = isinstance(source, str) and not source.isdigit() and not str(source).startswith("/dev/video")
                     bg_model    = None
                     frame_count = 0
-                    if hasattr(_motion_mod, "reset_tracking"):
+                    if hasattr(_motion, "reset_tracking"):
                         try:
-                            _motion_mod.reset_tracking()
+                            _motion.reset_tracking()
                         except Exception:
                             pass
                     hardware_state["camera"] = {
@@ -557,7 +578,7 @@ def main() -> None:
                 continue
 
             # ── 2. Camera feed paused ────────────────────────────────────
-            if not _motion_mod.camera_feed_active:
+            if not _motion.camera_feed_active:
                 if last_known_frame is not None:
                     paused_frame = cv2.convertScaleAbs(last_known_frame.copy(), alpha=0.35, beta=0)
                 else:
@@ -580,7 +601,7 @@ def main() -> None:
                     if k == ord('q'):
                         break
                     elif k == ord('t'):
-                        _motion_mod.camera_feed_active = True
+                        _motion.camera_feed_active = True
                         print("\n[CAMERA] Camera feed ACTIVATED / ON.")
                 else:
                     time.sleep(0.1)
@@ -607,9 +628,9 @@ def main() -> None:
                     hardware_state["camera"] = {"detected": False, "source": None, "resolution": "N/A", "fps": 0}
                     bg_model    = None
                     frame_count = 0
-                    if hasattr(_motion_mod, "reset_tracking"):
+                    if hasattr(_motion, "reset_tracking"):
                         try:
-                            _motion_mod.reset_tracking()
+                            _motion.reset_tracking()
                         except Exception:
                             pass
                     try:
@@ -619,6 +640,7 @@ def main() -> None:
                     continue
 
             orig_frame       = frame.copy()
+            raw_frame        = frame.copy()
             last_known_frame = orig_frame.copy()
             orig_h, orig_w   = orig_frame.shape[:2]
 
@@ -644,8 +666,11 @@ def main() -> None:
             cv2.accumulateWeighted(gray_blur, bg_model, BG_ALPHA)
             frame_count += 1
 
+            roi_pts = _motion.active_polygon_roi or load_roi_polygon()
+
             # ── 5. Warm-up ────────────────────────────────────────────────
             if frame_count <= WARMUP_FRAMES:
+                draw_area_of_interest_overlay(orig_frame, roi_pts, motion_detected=False)
                 display_frame = overlay_metadata(orig_frame.copy(), litter_engine)
                 with latest_frame_lock:
                     latest_stream_frame = (display_frame, time.monotonic())
@@ -655,7 +680,8 @@ def main() -> None:
                     if k == ord('q'):
                         break
                     elif k == ord('t'):
-                        _motion_mod.camera_feed_active = not _motion_mod.camera_feed_active
+                        _motion.camera_feed_active = not _motion.camera_feed_active
+                        print(f"\n[CAMERA] Camera feed {'ACTIVATED / ON' if _motion.camera_feed_active else 'PAUSED / OFF'}.")
                 continue
 
             # ── 6. Background subtraction ─────────────────────────────────
@@ -663,7 +689,6 @@ def main() -> None:
             diff     = cv2.absdiff(bg_uint8, gray_blur)
             _, thresh = cv2.threshold(diff, DIFF_THRESHOLD, 255, cv2.THRESH_BINARY)
 
-            roi_pts = _motion_mod.active_polygon_roi
             thresh  = apply_polygon_roi_mask(thresh, roi_pts, FRAME_SIZE[0], FRAME_SIZE[1])
             dilated = cv2.dilate(thresh, None, iterations=1)
 
@@ -685,34 +710,21 @@ def main() -> None:
                               (orig_x + orig_bw, orig_y + orig_bh),
                               (0, 255, 0), box_thickness)
 
-            # ── 7. Draw ROI polygon overlay (= AoD for litter) ────────────
-            disp_pts = []
-            for p in roi_pts:
-                px = int(p[0] * orig_w) if p[0] <= 1.0 else int(p[0])
-                py = int(p[1] * orig_h) if p[1] <= 1.0 else int(p[1])
-                disp_pts.append([px, py])
+            # ── 7. Draw Area of Interest polygon overlay ──────────────────
+            draw_area_of_interest_overlay(orig_frame, roi_pts, motion_detected=motion_detected)
 
-            if len(disp_pts) >= 3 and not _motion_mod.is_drawing_polygon:
-                poly_color = (0, 0, 255) if motion_detected else (0, 255, 200)
-                cv2.polylines(orig_frame, [np.array(disp_pts, dtype=np.int32)],
-                              isClosed=True, color=poly_color, thickness=2)
-                for pt in disp_pts:
-                    cv2.circle(orig_frame, tuple(pt), 4, (0, 255, 255), -1)
-                cv2.putText(orig_frame,
-                            f"ROI (Motion) / AoD (Litter) | {len(disp_pts)} pts | 'r' to re-plot",
-                            (disp_pts[0][0] + 5, max(20, disp_pts[0][1] - 8)),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.40, poly_color, 1, cv2.LINE_AA)
-
-            # In-progress polygon drawing overlay
-            if _motion_mod.is_drawing_polygon:
+            # ── In-progress polygon drawing overlay ───────────────────────
+            if _motion.is_drawing_polygon:
                 prog_pts = [
                     [int(p[0] * orig_w), int(p[1] * orig_h)]
-                    for p in _motion_mod.drawn_polygon_pts
+                    for p in _motion.drawn_polygon_pts
                 ]
                 for idx, pt in enumerate(prog_pts):
                     pt_color = (0, 255, 0) if (idx == 0 and len(prog_pts) >= 3) else (0, 165, 255)
                     cv2.circle(orig_frame, tuple(pt), 6, pt_color, -1)
                     cv2.circle(orig_frame, tuple(pt), 10, (255, 255, 255), 1)
+                    cv2.line(orig_frame, (pt[0] - 12, pt[1]), (pt[0] + 12, pt[1]), (0, 255, 255), 1)
+                    cv2.line(orig_frame, (pt[0], pt[1] - 12), (pt[0], pt[1] + 12), (0, 255, 255), 1)
                     cv2.putText(orig_frame, f"P{idx+1}", (pt[0] + 8, pt[1] - 8),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
                 if len(prog_pts) >= 2:
@@ -720,8 +732,11 @@ def main() -> None:
                                   isClosed=False, color=(0, 255, 255), thickness=2)
                     if len(prog_pts) >= 3:
                         cv2.line(orig_frame, tuple(prog_pts[-1]), tuple(prog_pts[0]), (0, 200, 100), 1, cv2.LINE_AA)
+                        cv2.circle(orig_frame, tuple(prog_pts[0]), 14, (0, 255, 0), 2)
+                        cv2.putText(orig_frame, "P1 (Snap/Close)", (prog_pts[0][0] + 16, prog_pts[0][1] + 4),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1, cv2.LINE_AA)
                 cv2.putText(orig_frame,
-                            f"PLOTTING ROI/AoD: Click pointers ({len(prog_pts)} set) | Press 'r' to finish",
+                            f"PLOTTING AREA OF INTEREST: Click to place pointers ({len(prog_pts)} set) | Press 'r' again when done to connect & save",
                             (10, 48), cv2.FONT_HERSHEY_SIMPLEX, 0.44, (0, 255, 255), 1, cv2.LINE_AA)
 
             # ── 8. Vehicle Stop & Motion Detection ────────────────────────
@@ -763,18 +778,21 @@ def main() -> None:
             # Note: update_gnss() is called every frame (lightweight haversine check).
             # try_trigger() only posts to queue when 10 m threshold is crossed.
             if litter_engine is not None:
-                if litter_engine.update_gnss(cap_lat, cap_lon):
-                    # Grab a clean copy of the original (unprocessed) frame
-                    litter_frame = orig_frame.copy()
-                    litter_engine.try_trigger(
-                        frame    = litter_frame,
-                        lat      = cap_lat,
-                        lon      = cap_lon,
-                        gnss_data = latest_sensor,
-                        rtc_ts   = rtc_ts,
-                    )
-                    # Cleanup old litter captures (rate-limited to once/minute)
-                    cleanup_old_litter_captures(LITTER_CAPTURES_DIR, retention_days=3)
+                try:
+                    if litter_engine.update_gnss(cap_lat, cap_lon):
+                        # Grab a clean copy of the original (unprocessed) frame
+                        litter_frame = raw_frame.copy()
+                        litter_engine.try_trigger(
+                            frame    = litter_frame,
+                            lat      = cap_lat,
+                            lon      = cap_lon,
+                            gnss_data = latest_sensor,
+                            rtc_ts   = rtc_ts,
+                        )
+                        # Cleanup old litter captures (rate-limited to once/minute)
+                        cleanup_old_litter_captures(LITTER_CAPTURES_DIR, retention_days=3)
+                except Exception as lit_err:
+                    print(f"[LITTER] Warning in trigger evaluation: {lit_err}")
 
             # ── 10. Motion capture & upload ───────────────────────────────
             if motion_detected:
@@ -867,30 +885,33 @@ def main() -> None:
                 if k == ord('q'):
                     break
                 elif k == ord('t'):
-                    _motion_mod.camera_feed_active = not _motion_mod.camera_feed_active
-                    print(f"\n[CAMERA] Camera feed {'ACTIVATED' if _motion_mod.camera_feed_active else 'PAUSED'}.")
+                    _motion.camera_feed_active = not _motion.camera_feed_active
+                    print(f"\n[CAMERA] Camera feed {'ACTIVATED / ON' if _motion.camera_feed_active else 'PAUSED / OFF'}.")
                 elif k == ord('r'):
-                    if not _motion_mod.is_drawing_polygon:
-                        _motion_mod.is_drawing_polygon = True
-                        _motion_mod.drawn_polygon_pts  = []
-                        print("\n[ROI/AoD PLOT] Click to place pointers. Press 'r' again when done.")
+                    if not _motion.is_drawing_polygon:
+                        _motion.is_drawing_polygon = True
+                        _motion.drawn_polygon_pts  = []
+                        print("\n[ROI PLOT] Pointer selection mode ACTIVE:")
+                        print("  1. Left-click on video to place pointers (P1, P2, P3...).")
+                        print("  2. When all points are placed, press 'r' again to connect points and save polygon.\n")
                     else:
-                        if len(_motion_mod.drawn_polygon_pts) >= 3:
-                            _motion_mod.active_polygon_roi = _motion_mod.drawn_polygon_pts.copy()
-                            save_roi_polygon(_motion_mod.active_polygon_roi)
-                            _motion_mod.is_drawing_polygon = False
-                            _motion_mod.drawn_polygon_pts  = []
+                        if len(_motion.drawn_polygon_pts) >= 3:
+                            _motion.active_polygon_roi = _motion.drawn_polygon_pts.copy()
+                            save_roi_polygon(_motion.active_polygon_roi)
+                            _motion.is_drawing_polygon = False
+                            _motion.drawn_polygon_pts  = []
                             # Update litter engine AoD with new polygon
                             if litter_engine is not None:
-                                litter_engine.aod_polygon_norm = _motion_mod.active_polygon_roi
-                            print(f"\n[ROI/AoD] Saved {len(_motion_mod.active_polygon_roi)} pts. "
-                                  f"Active for both Motion ROI and Litter AoD.")
+                                litter_engine.aod_polygon_norm = _motion.active_polygon_roi
+                            print(f"\n[ROI PLOT] Connected {len(_motion.active_polygon_roi)} pointers! Area of interest set up and saved persistently.\n")
                         else:
-                            print(f"\n[ROI/AoD] Need ≥3 pts (have {len(_motion_mod.drawn_polygon_pts)}).")
+                            print(f"\n[ROI PLOT] Need at least 3 pointers (currently {len(_motion.drawn_polygon_pts)}). Click on video to add more, or press 'c' to clear.\n")
                 elif k == ord('c'):
-                    if _motion_mod.is_drawing_polygon:
-                        _motion_mod.drawn_polygon_pts = []
-                        print("\n[ROI/AoD] Cleared temporary pointers.")
+                    if _motion.is_drawing_polygon:
+                        _motion.drawn_polygon_pts = []
+                        print("\n[ROI PLOT] Cleared temporary pointers.")
+                    else:
+                        print("\n[ROI PLOT] Not currently plotting.")
 
     finally:
         stop_event.set()
