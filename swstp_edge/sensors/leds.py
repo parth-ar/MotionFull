@@ -1,27 +1,26 @@
 """
-sensors/leds.py — Status LED driver for Raspberry Pi using gpiozero.
+sensors/leds.py — Status LED driver for Raspberry Pi (SWSTP Unified).
 
 LED Hardware Mapping (BCM GPIO pins — config.py):
-  RTC_GREEN  (BCM 17): RTC module status:
-                       - Solid ON if RTC working & valid
-                       - OFF on RTC error / offline
-  IMU_GREEN  (BCM 27): IMU module status:
-                       - Solid ON if IMU working & valid
-                       - OFF on IMU error / offline
+  RTC_GREEN  (BCM 17): RTC module status — Solid ON if working, OFF on error.
+  IMU_GREEN  (BCM 27): IMU module status — Solid ON if working, OFF on error.
   GNSS_GREEN (BCM 22): GNSS module status:
-                       - Solid ON if GNSS fix is acquired
-                       - Blinking (500 ms) if GNSS is looking for fix (connected, no fix yet)
-                       - OFF if GNSS is disconnected / no data / module error
+                       - Solid ON if GNSS fix acquired
+                       - Blinking (500 ms) if looking for fix
+                       - OFF if disconnected / no data
   YELLOW     (BCM 23): System ready & snap indicator:
-                       - Solid ON when system is healthy and ready to click motion frames
-                       - Blinks 3× when a motion frame is captured, then returns to solid ON
-                       - Repeating 3× blinks when scanning for webcam / video source (algorithm on hold)
-                       - OFF if ANY module fails or program error occurs
-  RED        (BCM 24): Fault indicator:
-                       - Blinking (400 ms) if ANY module fails or program error is encountered
-                       - OFF when all modules and system are working normally
+                       - Solid ON when system is healthy and ready
+                       - Blinks 3× on a motion frame capture
+                       - Blinks 2× double-blink (Red-Yellow-Red-Yellow) NOT handled here;
+                         the litter pattern blends Red+Yellow together — see notify_litter_snap()
+                       - Repeating 3× blinks while scanning for webcam
+                       - OFF if ANY module fails
+  RED        (BCM 24): Fault & litter detection indicator:
+                       - Blinking (400 ms) if ANY module fails or program fault
+                       - Alternating Red-Yellow-Red-Yellow blink when litter is DETECTED
+                       - OFF when all modules and system are healthy
 
-All LEDs are active-HIGH (logic 1 = LED on) with current-limiting resistors (220-470 Ω).
+All LEDs are active-HIGH with current-limiting resistors (220-470 Ω).
 """
 
 import threading
@@ -32,8 +31,7 @@ from config import (
     LED_FAULT_BLINK_INTERVAL,
 )
 
-# Blinking interval for GNSS searching for fix (500 ms = 1 Hz blink)
-GNSS_SEARCH_BLINK_INTERVAL = 0.500
+GNSS_SEARCH_BLINK_INTERVAL = 0.500  # 1 Hz blink while searching for GNSS fix
 
 # ---------------------------------------------------------------------------
 # gpiozero import — gracefully degrade if not on a Pi
@@ -70,29 +68,31 @@ def _make_led(pin: int):
 _leds: dict = {}
 _stop_event = threading.Event()
 
-# System / Program health states
-_system_ready: bool = False       # True once camera and main loop are running
-_program_fault: bool = False      # True if an unhandled error or shutdown occurred
+_system_ready: bool = False
+_program_fault: bool = False
 _fault_reason: str = ""
 
-# Module health cache (updated at 20 Hz from telemetry loop)
 _last_rtc_ok: bool = False
 _last_imu_ok: bool = False
 _last_gnss_fix: bool = False
 _last_gnss_connected: bool = False
 
-# Snap blink state (Yellow LED 3× blink on capture)
+# Snap blink state
 _snap_blinking: bool = False
 _snap_lock = threading.Lock()
 
-# Blink timers
+# Litter detection blink state (Red-Yellow-Red-Yellow)
+_litter_blinking: bool = False
+_litter_lock = threading.Lock()
+
+# Fault blink timers
 _fault_blink_state: bool = False
 _last_fault_toggle: float = 0.0
 
 _gnss_blink_state: bool = False
 _last_gnss_toggle: float = 0.0
 
-# Camera scanning state (repeating triple blink on Yellow LED)
+# Camera scanning state
 _camera_scanning: bool = False
 _camera_scan_thread: threading.Thread | None = None
 _camera_scan_stop_event = threading.Event()
@@ -164,23 +164,12 @@ def set_headless_mode(enabled: bool) -> None:
 
 
 def _camera_scan_worker() -> None:
-    """Background worker that continuously outputs repeating triple blinks
-    on the status LED (Yellow / BCM 23) while scanning for a webcam.
-
-    Pattern:
-      3 rapid pulses:
-        120 ms ON / 120 ms OFF x 3
-      Pause:
-        600 ms OFF
-      Repeats continuously until _camera_scanning is disabled or stop_event is set.
-    """
+    """Background worker: repeating triple blinks on Yellow LED while scanning for webcam."""
     global _camera_scanning
     while not _camera_scan_stop_event.is_set() and not _stop_event.is_set():
         with _camera_scan_lock:
             if not _camera_scanning or _program_fault:
                 break
-
-        # 3 rapid blinks: ON -> OFF -> ON -> OFF -> ON -> OFF
         for _ in range(3):
             if _camera_scan_stop_event.is_set() or _stop_event.is_set() or _program_fault:
                 break
@@ -193,8 +182,6 @@ def _camera_scan_worker() -> None:
             if _leds and "yellow" in _leds:
                 _leds["yellow"].off()
             time.sleep(0.12)
-
-        # Pause interval between bursts (≈ 600 ms)
         for _ in range(6):
             if _camera_scan_stop_event.is_set() or _stop_event.is_set() or _program_fault:
                 break
@@ -202,19 +189,12 @@ def _camera_scan_worker() -> None:
                 if not _camera_scanning:
                     break
             time.sleep(0.10)
-
-    # Ensure Yellow LED is turned off when scanning ends if system is not yet ready
     if _leds and "yellow" in _leds and not _system_ready:
         _leds["yellow"].off()
 
 
 def set_camera_scanning(enabled: bool = True) -> None:
-    """
-    Signal whether the system is actively scanning for a webcam / video source.
-    When enabled, triggers repeating triple LED blinks on the Yellow LED
-    to visually showcase that video ports are being scanned and the motion
-    algorithm is on hold.
-    """
+    """Signal whether the system is actively scanning for a webcam / video source."""
     global _camera_scanning, _camera_scan_thread, _system_ready
     with _camera_scan_lock:
         if enabled:
@@ -237,10 +217,7 @@ def set_camera_scanning(enabled: bool = True) -> None:
 
 
 def set_system_ready() -> None:
-    """
-    Signal that the edge application and camera loop have initialized and are
-    actively ready to capture motion frames.
-    """
+    """Signal that the edge application and camera loop are ready."""
     global _system_ready, _program_fault, _fault_reason, _camera_scanning
     with _camera_scan_lock:
         _camera_scanning = False
@@ -252,10 +229,7 @@ def set_system_ready() -> None:
 
 
 def set_fault(reason: str = "") -> None:
-    """
-    Signal a program or system-level fault.
-    Yellow LED turns OFF immediately. Red LED starts blinking.
-    """
+    """Signal a program or system-level fault. Yellow OFF, Red blinks."""
     global _program_fault, _fault_reason, _camera_scanning
     _program_fault = True
     _fault_reason = reason
@@ -272,9 +246,9 @@ def set_fault(reason: str = "") -> None:
 
 def notify_motion_snap() -> None:
     """
-    Blink yellow LED 3 times (100 ms off / 100 ms on) when a motion frame
-    is captured, then return to solid ON (if system is healthy).
-    Non-blocking: runs in a background thread.
+    Blink Yellow LED 3× (100 ms off / 100 ms on) when a motion frame is captured.
+    Non-blocking — runs in a daemon background thread.
+    Pattern: triple yellow blink → restore steady state.
     """
     global _snap_blinking
     if not _leds:
@@ -284,9 +258,7 @@ def notify_motion_snap() -> None:
         global _snap_blinking
         with _snap_lock:
             _snap_blinking = True
-
         try:
-            # 3 rapid blinks: OFF -> ON -> OFF -> ON -> OFF -> ON
             for _ in range(3):
                 _leds["yellow"].off()
                 time.sleep(0.10)
@@ -295,8 +267,6 @@ def notify_motion_snap() -> None:
         finally:
             with _snap_lock:
                 _snap_blinking = False
-
-            # Restore correct steady state
             has_error = (not _last_rtc_ok) or (not _last_imu_ok) or (not _last_gnss_connected) or _program_fault
             all_healthy = _system_ready and (not has_error)
             if all_healthy:
@@ -305,6 +275,98 @@ def notify_motion_snap() -> None:
                 _leds["yellow"].off()
 
     t = threading.Thread(target=_snap_worker, name="led-snap-blink", daemon=True)
+    t.start()
+
+
+def notify_litter_capture() -> None:
+    """
+    Blink Yellow LED 2x (double-blink: 90 ms off / 90 ms on) when a frame
+    is captured and queued for YOLO litter inference.
+    Non-blocking — runs in a daemon background thread.
+    Pattern: double yellow blink -> restore steady state.
+    """
+    global _snap_blinking
+    if not _leds:
+        return
+
+    def _worker():
+        global _snap_blinking
+        with _snap_lock:
+            _snap_blinking = True
+        try:
+            for _ in range(2):
+                if _leds and "yellow" in _leds:
+                    _leds["yellow"].off()
+                time.sleep(0.09)
+                if _leds and "yellow" in _leds:
+                    _leds["yellow"].on()
+                time.sleep(0.09)
+        finally:
+            with _snap_lock:
+                _snap_blinking = False
+            has_error = (not _last_rtc_ok) or (not _last_imu_ok) or (not _last_gnss_connected) or _program_fault
+            all_healthy = _system_ready and (not has_error)
+            if _leds and "yellow" in _leds:
+                if all_healthy:
+                    _leds["yellow"].on()
+                else:
+                    _leds["yellow"].off()
+
+    t = threading.Thread(target=_worker, name="led-litter-capture-blink", daemon=True)
+    t.start()
+
+
+def notify_litter_snap() -> None:
+    """
+    Litter DETECTED indicator: Red-Yellow-Red-Yellow alternating blink (2 cycles).
+    Fires only when the YOLO model detects litter in a triggered frame.
+    Non-blocking — runs in a daemon background thread.
+
+    Pattern (per cycle): Red ON + Yellow OFF → Red OFF + Yellow ON
+      Each phase: 120 ms. Total: 4 phases × 120 ms = ~480 ms per cycle × 2 cycles ≈ 960 ms.
+    After completion: both LEDs restore to their correct steady state.
+    """
+    global _litter_blinking
+    if not _leds:
+        return
+
+    def _litter_worker():
+        global _litter_blinking
+        with _litter_lock:
+            _litter_blinking = True
+        try:
+            for _ in range(2):
+                # Phase 1: Red ON, Yellow OFF
+                if _leds and "red" in _leds:
+                    _leds["red"].on()
+                if _leds and "yellow" in _leds:
+                    _leds["yellow"].off()
+                time.sleep(0.12)
+                # Phase 2: Red OFF, Yellow ON
+                if _leds and "red" in _leds:
+                    _leds["red"].off()
+                if _leds and "yellow" in _leds:
+                    _leds["yellow"].on()
+                time.sleep(0.12)
+            # Final phase: both off briefly then restore
+            if _leds and "red" in _leds:
+                _leds["red"].off()
+            if _leds and "yellow" in _leds:
+                _leds["yellow"].off()
+            time.sleep(0.05)
+        finally:
+            with _litter_lock:
+                _litter_blinking = False
+            # Restore correct LED steady state
+            has_error = (not _last_rtc_ok) or (not _last_imu_ok) or (not _last_gnss_connected) or _program_fault
+            all_healthy = _system_ready and (not has_error)
+            if _leds and "yellow" in _leds:
+                _leds["yellow"].on() if all_healthy else _leds["yellow"].off()
+            # Red returns to off (fault blinking handled by update() 20 Hz loop)
+            if _leds and "red" in _leds and not has_error and not _program_fault:
+                _leds["red"].off()
+
+    t = threading.Thread(target=_litter_worker, name="led-litter-blink", daemon=True)
     t.start()
 
 
@@ -323,21 +385,12 @@ def update(
     Called at ~20 Hz from the telemetry loop with current sensor module states.
 
     Rules:
-      1. RTC Green:
-         - Solid ON if RTC is working, OFF if error
-      2. IMU Green:
-         - Solid ON if IMU is working, OFF if error
-      3. GNSS Green:
-         - Solid ON if GNSS has fix
-         - Blinking (500 ms) if GNSS is connected and looking for fix
-         - OFF if GNSS module error / disconnected / no data
-      4. Red LED:
-         - Blinking (400 ms) if ANY module fails (RTC/IMU/GNSS offline) OR program fault
-         - OFF if all modules and program are healthy
-      5. Yellow LED:
-         - Solid ON if system is ready and all modules healthy
-         - Blinks 3× on motion snap (managed by notify_motion_snap)
-         - OFF if ANY module fails or program error occurs
+      1. RTC Green:  Solid ON if working, OFF on error.
+      2. IMU Green:  Solid ON if working, OFF on error.
+      3. GNSS Green: Solid ON (fix), Blinking (no fix, connected), OFF (disconnected).
+      4. Red LED:    Blinking (400 ms) on ANY module failure or program fault.
+      5. Yellow LED: Solid ON when all healthy & ready; 3× on motion snap;
+                     Red-Yellow alternating on litter detection (managed by notify_litter_snap).
     """
     global _last_rtc_ok, _last_imu_ok, _last_gnss_fix, _last_gnss_connected
     global _fault_blink_state, _last_fault_toggle
@@ -346,7 +399,6 @@ def update(
     if not _leds:
         return
 
-    # Normalize GNSS arguments
     has_fix = bool(gnss if gnss_fix is None else gnss_fix)
     if gnss_connected is None:
         if "gnss_data" in kwargs:
@@ -354,7 +406,6 @@ def update(
         elif "gnss_active" in kwargs:
             is_connected = bool(kwargs["gnss_active"])
         else:
-            # Fallback: if has_fix is True, it is definitely connected; otherwise assume True if gnss passed
             is_connected = True if has_fix else bool(gnss)
     else:
         is_connected = bool(gnss_connected)
@@ -366,51 +417,39 @@ def update(
 
     now = time.monotonic()
 
-    # Toggle fault blink tick for Red LED (400 ms)
     if (now - _last_fault_toggle) > LED_FAULT_BLINK_INTERVAL:
         _fault_blink_state = not _fault_blink_state
         _last_fault_toggle = now
 
-    # Toggle GNSS search blink tick for GNSS Green LED (500 ms)
     if (now - _last_gnss_toggle) > GNSS_SEARCH_BLINK_INTERVAL:
         _gnss_blink_state = not _gnss_blink_state
         _last_gnss_toggle = now
 
-    # ── 1. RTC Green LED ───────────────────────────────────────────────
+    # RTC Green
     _leds["rtc_green"].on() if rtc else _leds["rtc_green"].off()
 
-    # ── 2. IMU Green LED ───────────────────────────────────────────────
+    # IMU Green
     _leds["imu_green"].on() if imu else _leds["imu_green"].off()
 
-    # ── 3. GNSS Green LED ──────────────────────────────────────────────
+    # GNSS Green
     if has_fix:
-        _leds["gnss_green"].on()                  # Solid ON: Fix acquired
+        _leds["gnss_green"].on()
     elif is_connected:
-        if _gnss_blink_state:                     # Blinking: Looking for fix
-            _leds["gnss_green"].on()
-        else:
-            _leds["gnss_green"].off()
+        _leds["gnss_green"].on() if _gnss_blink_state else _leds["gnss_green"].off()
     else:
-        _leds["gnss_green"].off()                 # OFF: Disconnected / error
+        _leds["gnss_green"].off()
 
-    # ── 4. Health Evaluation ───────────────────────────────────────────
-    # Module failure = any sensor completely disconnected or erroring
     module_failure = (not rtc) or (not imu) or (not is_connected)
     has_fault = module_failure or _program_fault
 
-    # ── 5. Red LED (Blinks on ANY module failure or program fault) ─────
-    if has_fault:
-        if _fault_blink_state:
-            _leds["red"].on()
+    # Red LED — skip if litter blink is active (it controls red directly)
+    if not _litter_blinking:
+        if has_fault:
+            _leds["red"].on() if _fault_blink_state else _leds["red"].off()
         else:
             _leds["red"].off()
-    else:
-        _leds["red"].off()
 
-    # ── 6. Yellow LED (Solid ON when ready & healthy, OFF on any error) ─
-    if not _snap_blinking and not _camera_scanning:
+    # Yellow LED — skip if snap or litter blink is active
+    if not _snap_blinking and not _camera_scanning and not _litter_blinking:
         system_working_and_ready = _system_ready and (not has_fault)
-        if system_working_and_ready:
-            _leds["yellow"].on()
-        else:
-            _leds["yellow"].off()
+        _leds["yellow"].on() if system_working_and_ready else _leds["yellow"].off()

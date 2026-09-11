@@ -1,0 +1,50 @@
+[Unit]
+Description=SWSTP Unified Edge Gateway — Motion Detection + Litter Detection (Raspberry Pi 4B)
+Documentation=https://github.com/your-org/swstp_unified
+After=network-online.target time-sync.target
+Wants=network-online.target
+
+[Service]
+# ── Identity ─────────────────────────────────────────────────────────────────
+# Change 'pi' to the actual user that owns the project directory.
+User=pi
+Group=pi
+
+# ── Working directory & interpreter ──────────────────────────────────────────
+WorkingDirectory=/home/pi/swstp_unified
+ExecStart=/usr/bin/python3 /home/pi/swstp_unified/main.py --headless
+
+# ── Environment ───────────────────────────────────────────────────────────────
+# Optional: override the backend URL without editing config.py
+# Environment=SWSTP_BACKEND_URL=https://solidwasteapi.scipl.info.in
+Environment=PYTHONUNBUFFERED=1
+Environment=OPENCV_LOG_LEVEL=ERROR
+Environment=OPENCV_VIDEOIO_PRIORITY_BACKEND=V4L2
+Environment=QT_QPA_PLATFORM=offscreen
+
+# ── Restart policy ────────────────────────────────────────────────────────────
+# Restart automatically 5 seconds after any failure
+Restart=on-failure
+RestartSec=5s
+
+# Give the program a full minute to start (sensor + YOLO model load + network init)
+TimeoutStartSec=90
+
+# Allow up to 10 quick restarts in 30 seconds before systemd gives up
+StartLimitBurst=10
+StartLimitIntervalSec=30
+
+# ── Output / logging ──────────────────────────────────────────────────────────
+# stdout/stderr go to the systemd journal; read with:
+#   sudo journalctl -u swstp-unified -f
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=swstp-unified
+
+# ── Capabilities / security ───────────────────────────────────────────────────
+# GPIO access requires 'gpio' group. If using I2C (DS3231/MPU-6500):
+#   sudo usermod -aG gpio,i2c,video pi
+SupplementaryGroups=gpio i2c video
+
+[Install]
+WantedBy=multi-user.target
