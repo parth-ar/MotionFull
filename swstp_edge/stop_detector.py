@@ -263,8 +263,9 @@ class VehicleStopDetector:
             gnss_at_rest = gnss_in_motion = False
 
         else:
-            # Neither sensor valid
-            is_rest_candidate = is_motion_candidate = False
+            # Neither sensor valid (bench testing or sensor initialization phase)
+            is_rest_candidate   = (speed < self.rest_speed_threshold)
+            is_motion_candidate = (speed > self.stop_speed_gate)
             imu_rest_agreement = imu_motion_agreement = None
             gnss_at_rest = gnss_in_motion = False
 
@@ -401,7 +402,7 @@ class VehicleStopDetector:
                         self.active_stop.duration_sec     = max(0.0, now_mono - self.active_stop.start_mono)
                         self.active_stop.trigger_speed_kmh = metrics["speed_kmh"]
                         self.active_stop.end_reason = (
-                            f"Speed rose above {self.stop_speed_gate:.1f} km/h "
+                            f"Vehicle back in motion: Speed rose above {self.stop_speed_gate:.1f} km/h "
                             f"(current: {metrics['speed_kmh']:.1f} km/h) | {m_agree_label} | "
                             f"{'No frames captured — house status unchanged' if not self.active_stop.captures else f'{len(self.active_stop.captures)} frame(s) captured'}"
                         )

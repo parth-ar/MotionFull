@@ -15,6 +15,8 @@ Also contains:
 No changes to payload shapes, endpoint paths, or HTTP behavior.
 """
 
+from __future__ import annotations
+
 import datetime
 import json
 import os
