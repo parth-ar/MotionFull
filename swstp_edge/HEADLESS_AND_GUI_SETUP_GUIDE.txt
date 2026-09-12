@@ -1,0 +1,136 @@
+SWSTP EDGE — DUAL MODE (HEADLESS BOOT SERVICE & INTERACTIVE GUI) SETUP GUIDE
+================================================================================
+
+This guide explains how to configure your Raspberry Pi so that:
+  1. On boot, the program runs HEADLESSLY in the background via systemd.
+  2. When you want to set the Area of Interest (ROI) or test with video display,
+     you can run it INTERACTIVELY with full desktop GUI.
+
+
+STEP 1: INSTALL FULL OPENCV (WITH GUI SUPPORT)
+----------------------------------------------
+Run these commands inside your project directory on the Raspberry Pi:
+
+cd ~/MotionFull/swstp_edge
+
+# Remove headless opencv (if previously installed) and install full GUI build:
+./venv/bin/python -m pip uninstall opencv-python-headless -y
+./venv/bin/python -m pip install opencv-python
+
+
+STEP 2: CONFIGURE THE SYSTEMD SERVICE (STEP B)
+----------------------------------------------
+The systemd service allows the application to start automatically on every boot.
+Because the service runs without a desktop monitor attached, it needs
+'QT_QPA_PLATFORM=offscreen' and '--headless' so OpenCV does not crash.
+
+1. Open or create the service file with root privileges:
+   sudo nano /etc/systemd/system/swstp-edge.service
+
+2. Ensure the file contains the following configuration:
+
+[Unit]
+Description=SWSTP Edge Application
+After=network.target
+
+[Service]
+Type=simple
+User=solidwaste-1
+WorkingDirectory=/home/solidwaste-1/MotionFull/swstp_edge
+ExecStart=/home/solidwaste-1/MotionFull/swstp_edge/venv/bin/python /home/solidwaste-1/MotionFull/swstp_edge/main.py --headless
+Environment=PYTHONUNBUFFERED=1
+Environment=QT_QPA_PLATFORM=offscreen
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+
+3. Save and exit nano:
+   Press Ctrl+O, then Enter to save.
+   Press Ctrl+X to exit.
+
+4. Reload systemd to apply the changes:
+   sudo systemctl daemon-reload
+
+5. Enable the service to run on boot:
+   sudo systemctl enable swstp-edge.service
+
+
+================================================================================
+HOW TO USE THE TWO MODES
+================================================================================
+
+MODE 1: INTERACTIVE DESKTOP GUI (TO VIEW LIVE VIDEO & SET ROI)
+--------------------------------------------------------------
+Use this mode when a screen is connected (HDMI monitor or VNC desktop).
+
+CRITICAL CAMERA NOTE:
+Linux allows only ONE process to access the USB camera (/dev/video0) at a time.
+Before launching the manual GUI, you MUST stop the background service so the
+camera is freed!
+
+1. Stop the background service:
+   sudo systemctl stop swstp-edge.service
+
+2. Launch the application interactively with GUI:
+   cd ~/MotionFull/swstp_edge
+   ./venv/bin/python main.py
+
+3. Setting the Area of Interest (ROI) on screen:
+   - The desktop window "SWSTP Motion & Telemetry Gateway (Pi)" will appear.
+   - Press 'r' on your keyboard to enter polygon plotting mode.
+   - Left-click on the video with your mouse to place ROI corner points (P1, P2, P3, P4).
+   - Press 'r' again when done. The points will connect and save automatically
+     to 'roi_polygon.json'.
+   - (Optional) Press 't' to toggle camera feed on/off.
+   - (Optional) Press 'c' to clear temporary points if you made a mistake.
+
+4. Exit the GUI:
+   Press 'q' on your keyboard.
+
+5. Restart the background service:
+   sudo systemctl start swstp-edge.service
+
+   The background service will automatically load your newly saved
+   'roi_polygon.json' and continue running headlessly!
+
+
+--------------------------------------------------------------------------------
+MODE 2: HEADLESS SERVICE ON BOOT (NORMAL DEPLOYMENT)
+--------------------------------------------------------------------------------
+This is the default operating mode in the vehicle:
+- Whenever the Raspberry Pi powers on, systemd starts 'swstp-edge.service' in
+  the background.
+- It runs with '--headless' and 'QT_QPA_PLATFORM=offscreen' so it never tries to
+  open a window and will never crash due to a missing screen.
+- It automatically loads the saved 'roi_polygon.json'.
+- It auto-detects NavCast GPS tethering (no manual IP/port required).
+- It syncs with the DS3231 RTC and reads MPU-6500 IMU.
+- It uploads motion evidence when vehicle speed < 5 km/h.
+
+Managing the service:
+- Check service status:
+  sudo systemctl status swstp-edge.service
+
+- View live application logs:
+  sudo journalctl -u swstp-edge.service -f
+
+- Stop the service:
+  sudo systemctl stop swstp-edge.service
+
+- Start the service:
+  sudo systemctl start swstp-edge.service
+
+- Restart the service:
+  sudo systemctl restart swstp-edge.service
+
+
+================================================================================
+LED INDICATOR REFERENCE
+================================================================================
+RTC Green  (BCM 17): Solid ON when RTC synchronized | OFF on error
+IMU Green  (BCM 27): Solid ON when IMU active       | OFF on error
+GNSS Green (BCM 22): Solid ON when GPS fix locked   | BLINKING when searching for fix | OFF when disconnected
+Yellow     (BCM 23): Solid ON when system ready     | BLINKS 3× on motion snap        | OFF on any error
+Red        (BCM 24): BLINKING on any module/system error | OFF when all OK

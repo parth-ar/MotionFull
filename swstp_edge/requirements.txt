@@ -1,0 +1,28 @@
+# SWSTP Unified Edge — Raspberry Pi 4B requirements
+# Install with:  pip3 install -r requirements.txt
+# On Pi, use:   pip3 install -r requirements.txt --break-system-packages
+
+# ── Core vision & compute ────────────────────────────────────────────────────
+opencv-python>=4.8.0
+numpy>=1.24.0
+imutils>=0.5.4
+
+# ── Litter detection ONNX inference (zero PyTorch / no Ultralytics) ──────────
+# Primary inference backend: ONNX Runtime (CPU, 4-thread, Pi 4B optimised)
+onnxruntime>=1.18.0
+
+# ── Timezone support (required by zoneinfo fallback on older Pythons) ─────────
+tzdata>=2024.1
+
+# ── Backend / HTTP ────────────────────────────────────────────────────────────
+requests>=2.31.0
+
+# ── Pi-native sensor drivers ──────────────────────────────────────────────────
+# MPU-6500 I2C register access
+smbus2>=0.4.3
+
+# NEO-6M GNSS via gpsd (optional fallback if NavCast TCP is not used)
+gpsdclient>=1.0.0
+
+# Status LED GPIO control (hardware pin factory provided via apt: python3-lgpio)
+gpiozero>=2.0

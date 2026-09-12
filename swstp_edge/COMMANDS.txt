@@ -1,0 +1,194 @@
+
+SWSTP UNIFIED — QUICK COMMAND REFERENCE
+========================================
+All commands assume the project is installed at: /home/pi/swstp_unified
+Run on the Raspberry Pi 4B terminal (SSH or local).
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. RUNNING THE PROGRAM MANUALLY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+# Headless (no screen — same as service):
+python3 /home/pi/swstp_unified/main.py --headless
+
+# Full GUI (desktop environment — shows camera window, ROI setup screen):
+python3 /home/pi/swstp_unified/main.py
+
+# Headless with a specific camera port:
+python3 /home/pi/swstp_unified/main.py --headless --source 0
+
+# Headless, disable litter detection (motion-only):
+python3 /home/pi/swstp_unified/main.py --headless --no-litter
+
+# Full GUI with custom litter trigger distance (20 m instead of 10 m):
+python3 /home/pi/swstp_unified/main.py --litter-distance 20
+
+# Full GUI, disable power monitor (useful for bench testing):
+python3 /home/pi/swstp_unified/main.py --no-power-monitor
+
+# Headless, point to different ONNX weights:
+python3 /home/pi/swstp_unified/main.py --headless --litter-weights /home/pi/swstp_unified/weights/best.onnx
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+2. GUI KEYBOARD CONTROLS (desktop mode only)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  [r]          Start drawing a new ROI/AoD polygon on the live feed
+               Left-click: add point | Right-click: undo | [r] again: confirm
+  [c]          Clear currently-drawn temporary points (while drawing)
+  [t]          Toggle camera feed on/off (pauses video without stopping program)
+  [q]          Quit the application cleanly
+
+  AT STARTUP SETUP SCREEN (GUI mode only):
+  Left-click   Add a polygon vertex
+  Right-click  Remove the last placed vertex
+  Enter/Space  Confirm: save new polygon (needs ≥3 points),
+               OR keep the currently saved polygon if nothing was drawn
+  Esc          Skip setup — use saved polygon immediately
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+3. SERVICE MANAGEMENT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Start the service:
+    sudo systemctl start swstp-unified
+
+  Stop the service:
+    sudo systemctl stop swstp-unified
+
+  Restart the service (after a config change or update):
+    sudo systemctl restart swstp-unified
+
+  Check service status (running / stopped / last error):
+    sudo systemctl status swstp-unified
+
+  Enable auto-start on boot:
+    sudo systemctl enable swstp-unified
+
+  Disable auto-start on boot:
+    sudo systemctl disable swstp-unified
+
+  Reload systemd after editing the .service file:
+    sudo systemctl daemon-reload
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+4. VIEWING LOGS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Live log stream (follow in real time, Ctrl+C to exit):
+    sudo journalctl -u swstp-unified -f
+
+  Last 100 lines of log:
+    sudo journalctl -u swstp-unified -n 100
+
+  Logs since last boot only:
+    sudo journalctl -u swstp-unified -b
+
+  Logs with timestamps in IST (adjust TZ= as needed):
+    sudo TZ="Asia/Kolkata" journalctl -u swstp-unified -f
+
+  All logs since a specific date:
+    sudo journalctl -u swstp-unified --since "2026-09-10 00:00:00"
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+5. CAPTURES & STORAGE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Motion detection captures (JPEGs + JSON sidecars):
+    ls -lh /home/pi/swstp_unified/captures/motion/
+
+  Litter detection captures (annotated JPEGs + JSON sidecars):
+    ls -lh /home/pi/swstp_unified/captures/litter/
+
+  Count motion captures:
+    ls /home/pi/swstp_unified/captures/motion/*.jpg 2>/dev/null | wc -l
+
+  Count litter events:
+    ls /home/pi/swstp_unified/captures/litter/*.jpg 2>/dev/null | wc -l
+
+  Check remaining SD card space:
+    df -h /
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+6. ROI / AoD POLYGON
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  View the currently saved polygon:
+    cat /home/pi/swstp_unified/roi_polygon.json
+
+  Reset to default polygon (rectangular centre of frame):
+    python3 -c "
+import json
+default = [[0.35,0.10],[0.65,0.10],[0.65,0.50],[0.35,0.50]]
+with open('/home/pi/swstp_unified/roi_polygon.json','w') as f:
+    json.dump(default, f, indent=2)
+print('Reset to default polygon.')
+"
+
+  To redraw the polygon with a live view:
+    — Stop the service: sudo systemctl stop swstp-unified
+    — Plug in a monitor and run: python3 /home/pi/swstp_unified/main.py
+    — Use the startup setup screen to draw and confirm the new polygon
+    — Press Enter/Space to save, then [q] to quit
+    — Restart the service: sudo systemctl start swstp-unified
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+7. SENSOR & HARDWARE DIAGNOSTICS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  List detected V4L2 camera devices:
+    v4l2-ctl --list-devices
+
+  Test camera capture:
+    python3 -c "import cv2; c=cv2.VideoCapture(0); print('Opened:',c.isOpened()); c.release()"
+
+  Check I2C bus for RTC (DS3231 at 0x68) and IMU (MPU-6500 at 0x69):
+    sudo i2cdetect -y 1
+
+  Check GNSS / gpsd status:
+    sudo systemctl status gpsd
+    gpsmon       # live GNSS satellite view (Ctrl+C to exit)
+    cgps -s      # simple GNSS position display
+
+  GPIO LED pin assignments (BCM numbers):
+    BCM 17 → RTC Green   (Pin 11) — Solid ON when RTC synced
+    BCM 27 → IMU Green   (Pin 13) — Solid ON when IMU online
+    BCM 22 → GNSS Green  (Pin 15) — Solid ON when fix valid; 1 Hz blink while searching
+    BCM 23 → Yellow      (Pin 16) — System status:
+                                    • Solid ON: system healthy & running
+                                    • Triple blink: Motion capture saved (vehicle stopped)
+                                    • Double blink: Frame captured for litter inference (10 m / 30 s)
+                                    • Repeating triple blink: Scanning for USB camera
+    BCM 24 → Red         (Pin 18) — Fault & litter alert:
+                                    • Alternating Red-Yellow: Litter DETECTED!
+                                    • Continuous blink: Sensor or system fault
+    BCM 25 → Low Batt    (Pin 22) — input from UPS BMS
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+8. PYTHON ENVIRONMENT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Install / update all Python dependencies:
+    cd /home/pi/swstp_unified
+    pip3 install -r requirements.txt --break-system-packages
+
+  Check which ONNX Runtime is installed:
+    python3 -c "import onnxruntime; print(onnxruntime.__version__)"
+
+  Check OpenCV version:
+    python3 -c "import cv2; print(cv2.__version__)"
+
+  Verify the ONNX weights can be loaded:
+    python3 -c "
+from detector import YOLO
+m = YOLO('/home/pi/swstp_unified/weights/best_int8.onnx')
+print('Model classes:', list(m.names.values()))
+"

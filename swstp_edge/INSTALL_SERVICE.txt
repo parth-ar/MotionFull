@@ -1,0 +1,194 @@
+
+SWSTP UNIFIED — SERVICE INSTALLATION GUIDE
+===========================================
+Sets up swstp_unified to run automatically on boot (headlessly, as a system service).
+The program starts when the Pi boots and restarts automatically if it ever crashes.
+
+Prerequisites: Raspberry Pi 4B running Raspberry Pi OS (Bookworm or Bullseye).
+Logged in as the 'pi' user (or equivalent with sudo access).
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 1 — COPY THE PROJECT TO THE PI
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+From your Windows machine (PowerShell), copy the project to the Pi over SSH:
+
+    scp -r "d:\Solid Waste\swstp_unified" pi@<PI_IP_ADDRESS>:/home/pi/
+
+Replace <PI_IP_ADDRESS> with your Pi's IP address (e.g. 192.168.1.50).
+
+Or use WinSCP / FileZilla to drag and drop the folder if you prefer a GUI.
+
+After copying, SSH into the Pi:
+
+    ssh pi@<PI_IP_ADDRESS>
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 2 — INSTALL PYTHON DEPENDENCIES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+On the Pi terminal:
+
+    cd /home/pi/swstp_unified
+    pip3 install -r requirements.txt --break-system-packages
+
+Also install the system-level GPIO and I2C library if not already present:
+
+    sudo apt update
+    sudo apt install -y python3-lgpio i2c-tools v4l-utils gpsd gpsd-clients
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 3 — ADD USER TO REQUIRED GROUPS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+The program needs access to GPIO (LEDs), I2C (RTC & IMU), and video (camera):
+
+    sudo usermod -aG gpio,i2c,video pi
+
+Log out and back in (or reboot) for group membership to take effect:
+
+    sudo reboot
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 4 — DO A QUICK TEST RUN FIRST
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Before installing as a service, confirm the program runs without errors:
+
+    cd /home/pi/swstp_unified
+    python3 main.py --headless --no-power-monitor
+
+Watch the output for 30-60 seconds. You should see:
+  • Sensor init messages (RTC, IMU, GNSS)
+  • "[CAMERA] Active: Port 0 ..."
+  • "[LITTER] YOLO model loaded and ready."
+  • "[LITTER TRIGGER] GNSS distance mode anchored at ..."
+
+Press Ctrl+C to stop the test run when satisfied.
+
+If you see errors about the camera, run:
+    v4l2-ctl --list-devices
+    python3 -c "import cv2; c=cv2.VideoCapture(0,cv2.CAP_V4L2); print(c.isOpened()); c.release()"
+
+If you see "No module named onnxruntime", re-run step 2.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 5 — INSTALL THE SYSTEMD SERVICE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Copy the provided service file into systemd:
+
+    sudo cp /home/pi/swstp_unified/swstp-unified.service /etc/systemd/system/
+
+Open it to verify the paths are correct (should already be /home/pi/swstp_unified):
+
+    sudo nano /etc/systemd/system/swstp-unified.service
+
+Check that these two lines match your setup:
+    WorkingDirectory=/home/pi/swstp_unified
+    ExecStart=/usr/bin/python3 /home/pi/swstp_unified/main.py --headless
+
+Save and close (Ctrl+O, Enter, Ctrl+X in nano).
+
+Reload systemd to register the new service:
+
+    sudo systemctl daemon-reload
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 6 — ENABLE AND START THE SERVICE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Enable auto-start on every boot:
+
+    sudo systemctl enable swstp-unified
+
+Start the service right now (without rebooting):
+
+    sudo systemctl start swstp-unified
+
+Confirm it is running:
+
+    sudo systemctl status swstp-unified
+
+You should see "Active: active (running)" in green.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 7 — VERIFY AFTER A REBOOT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Reboot the Pi:
+
+    sudo reboot
+
+After it comes back up, check the service started automatically:
+
+    sudo systemctl status swstp-unified
+
+Then watch the live logs to confirm both motion and litter subsystems are running:
+
+    sudo journalctl -u swstp-unified -f
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SERVICE CONTROL — QUICK REFERENCE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  START       sudo systemctl start swstp-unified
+  STOP        sudo systemctl stop swstp-unified
+  RESTART     sudo systemctl restart swstp-unified
+  STATUS      sudo systemctl status swstp-unified
+  ENABLE      sudo systemctl enable swstp-unified   (run on boot)
+  DISABLE     sudo systemctl disable swstp-unified  (don't run on boot)
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+LOG VIEWING — QUICK REFERENCE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Live (follow):          sudo journalctl -u swstp-unified -f
+  Last 100 lines:         sudo journalctl -u swstp-unified -n 100
+  Since this boot:        sudo journalctl -u swstp-unified -b
+  Since a date:           sudo journalctl -u swstp-unified --since "2026-09-10"
+  With IST timestamps:    sudo TZ="Asia/Kolkata" journalctl -u swstp-unified -f
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SETTING THE ROI / AoD POLYGON IN HEADLESS OPERATION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+The service runs headlessly and uses the last saved polygon automatically.
+To update the polygon, you need a monitor and keyboard (or VNC):
+
+    1. Stop the service:
+           sudo systemctl stop swstp-unified
+
+    2. Connect a monitor (HDMI) and run with GUI:
+           DISPLAY=:0 python3 /home/pi/swstp_unified/main.py
+
+       OR over VNC: open a VNC session and run:
+           python3 /home/pi/swstp_unified/main.py
+
+    3. The SETUP screen will appear showing the saved polygon.
+       Left-click to place new points, Enter/Space to confirm.
+       The new polygon is saved to roi_polygon.json immediately.
+
+    4. Press [q] to quit, then restart the service:
+           sudo systemctl start swstp-unified
+
+    The service will now use your newly drawn polygon on every boot.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+UNINSTALLING THE SERVICE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    sudo systemctl stop swstp-unified
+    sudo systemctl disable swstp-unified
+    sudo rm /etc/systemd/system/swstp-unified.service
+    sudo systemctl daemon-reload
