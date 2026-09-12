@@ -566,6 +566,13 @@ def _upload_and_cleanup_evidence(session: requests.Session,
                 if (near_h and h_dist <= 25.0)
                 else "Road Corridor (Auto-allocated)"
             )
+            # ── Gate: mark house green ONLY on confirmed backend receipt ────────
+            if near_h and h_dist <= 25.0:
+                h_id = near_h["id"]
+                geofence.field_state["marked_houses"].add(h_id)
+                print(f"[FIELD LOG] 🏠 HOUSE MARKED AS COLLECTED (EVIDENCE CONFIRMED by backend)")
+                print(f"            House: {h_id} - {near_h['name']} (@ {h_dist:.1f}m)")
+                print(f"            Total collected: {len(geofence.field_state['marked_houses'])} / {len(geofence.dynamic_houses)}")
 
         raw_lat_val = latest_sensor.get("raw_gps_lat") or lat
         raw_lon_val = latest_sensor.get("raw_gps_lon") or lon
@@ -735,6 +742,11 @@ def evidence_upload_worker(backend_url: str, device_id: str, ulb_id: str,
     _last_backlog_chk = 0.0
     _BACKLOG_INTERVAL = 10.0   # seconds between offline backlog scans
 
+    # Network back-off state (exponential, resets on any successful upload)
+    _net_fail_count  = 0
+    _backoff_until   = 0.0
+    _MAX_BACKOFF_SEC = 30.0
+
     while not stop_event.is_set():
         active_sid = dynamic_session_info.get("sessionId", 0)
         is_auth    = dynamic_session_info.get("authenticated", False)
@@ -749,6 +761,12 @@ def evidence_upload_worker(backend_url: str, device_id: str, ulb_id: str,
             continue
 
         # 1. Process live queue items
+        # Honour back-off window before attempting any upload
+        now_t = time.time()
+        if now_t < _backoff_until:
+            stop_event.wait(min(1.0, _backoff_until - now_t))
+            continue
+
         try:
             item = upload_queue.get(timeout=1.0)
         except queue.Empty:
@@ -762,7 +780,7 @@ def evidence_upload_worker(backend_url: str, device_id: str, ulb_id: str,
                     _in_flight_evidence_files.add(abs_path)
 
             try:
-                _upload_and_cleanup_evidence(
+                success = _upload_and_cleanup_evidence(
                     session=session,
                     url=url,
                     backend_url=backend_url,
@@ -771,6 +789,25 @@ def evidence_upload_worker(backend_url: str, device_id: str, ulb_id: str,
                     active_sid=active_sid,
                     item=item,
                 )
+                if success:
+                    # Reset back-off on confirmed upload
+                    _net_fail_count = 0
+                    _backoff_until  = 0.0
+                else:
+                    # Upload failed (network or server error) — apply back-off
+                    _net_fail_count += 1
+                    backoff = min(_MAX_BACKOFF_SEC, 0.5 * (2 ** min(_net_fail_count - 1, 6)))
+                    _backoff_until = time.time() + backoff
+                    print(f"[EVIDENCE UPLOAD] Back-off #{_net_fail_count}: waiting {backoff:.0f}s before retry.")
+                    # Rebuild session to clear stale connections
+                    try:
+                        session.close()
+                    except Exception:
+                        pass
+                    session = requests.Session()
+                    adapter = requests.adapters.HTTPAdapter(pool_connections=5, pool_maxsize=10, max_retries=1)
+                    session.mount("http://", adapter)
+                    session.mount("https://", adapter)
             except Exception as e:
                 print(f"[EVIDENCE UPLOAD ERROR] {e}")
             finally:

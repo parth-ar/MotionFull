@@ -147,7 +147,8 @@ MOTION_DEBOUNCE_SEC        = 0.6    # Sustained seconds of motion to confirm sto
 LITTER_DISTANCE_INTERVAL_M   = 10.0
 
 # Grace period (seconds) on GNSS loss before falling back to clock-based trigger
-LITTER_GNSS_LOST_TIMEOUT_SEC = 15.0
+# Kept short so the clock fallback engages quickly and no litter frames are missed
+LITTER_GNSS_LOST_TIMEOUT_SEC = 5.0
 
 # Clock fallback interval (seconds) when no GNSS fix available
 LITTER_TIME_FALLBACK_SEC     = 30.0

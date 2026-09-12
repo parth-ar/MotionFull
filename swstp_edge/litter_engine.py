@@ -251,16 +251,25 @@ class LitterEngine:
     # -------------------------------------------------------------------------
     # GNSS distance tracking
     # -------------------------------------------------------------------------
-    def update_gnss(self, lat, lon) -> bool:
+    def update_gnss(self, lat, lon, gnss_hardware_fix: bool = True) -> bool:
         """
         Call once per main loop iteration with current GNSS coordinates.
 
-        Returns True when the 10 m distance threshold is crossed (trigger condition).
-        Handles GNSS loss / recovery and clock fallback automatically.
+        Args:
+            lat, lon:          Current coordinates (may be last-known if GNSS is out).
+            gnss_hardware_fix: Pass the actual hardware fix flag from latest_sensor
+                               (gps_valid AND location_source == 'gnss').  When False
+                               the engine treats the fix as lost even if lat/lon have
+                               valid-looking values (e.g. held from location_fallback).
+
+        Returns True when the 10 m distance threshold is crossed OR the clock fallback
+        timer fires.  Handles GNSS loss / recovery and TIME_FALLBACK automatically.
         """
         now = time.monotonic()
-        has_fix = (lat is not None and lon is not None
-                   and not (abs(lat) < 0.001 and abs(lon) < 0.001))
+        # has_fix requires BOTH valid coordinates AND confirmed hardware fix flag
+        coord_valid = (lat is not None and lon is not None
+                       and not (abs(lat) < 0.001 and abs(lon) < 0.001))
+        has_fix = coord_valid and gnss_hardware_fix
 
         # ── GNSS mode transitions ─────────────────────────────────────────
         if has_fix:
@@ -271,31 +280,40 @@ class LitterEngine:
                 self._op_mode = "GNSS_DISTANCE"
                 self._gnss_initialized = True
                 self._gnss_loss_start  = None
-                print(f"[LITTER TRIGGER] GNSS distance mode anchored at "
+                print(f"[LITTER TRIGGER] ✅ GNSS distance mode anchored at "
                       f"({lat:.8f}, {lon:.8f}). Trigger every {self.distance_interval_m:.1f}m.")
             elif self._op_mode == "TIME_FALLBACK":
-                # Regained fix — re-anchor
+                # Regained fix — re-anchor at current position
                 self._last_trigger_lat = lat
                 self._last_trigger_lon = lon
                 self._op_mode          = "GNSS_DISTANCE"
                 self._gnss_loss_start  = None
-                print(f"[LITTER TRIGGER] GNSS fix regained @ ({lat:.8f}, {lon:.8f}). "
-                      f"Re-anchoring to {self.distance_interval_m:.1f}m distance mode.")
+                print(f"[LITTER TRIGGER] ✅ GNSS fix REGAINED @ ({lat:.8f}, {lon:.8f}). "
+                      f"Re-anchoring — resuming {self.distance_interval_m:.1f}m distance mode.")
             elif self._gnss_loss_start is not None:
-                # Recovered within grace period
+                # Recovered within grace period — cancel the countdown
+                elapsed = now - self._gnss_loss_start
                 self._gnss_loss_start = None
+                print(f"[LITTER TRIGGER] ✅ GNSS fix recovered within grace period ({elapsed:.1f}s). "
+                      f"Continuing distance mode.")
         else:
-            # No fix
+            # No hardware fix
             if self._op_mode == "GNSS_DISTANCE":
                 if self._gnss_loss_start is None:
                     self._gnss_loss_start = now
-                    print(f"[LITTER TRIGGER] GNSS lost. Grace period: {self.gnss_lost_timeout_sec:.0f}s ...")
+                    print(f"[LITTER TRIGGER] ⚠️  GNSS hardware fix lost. "
+                          f"Grace period: {self.gnss_lost_timeout_sec:.0f}s before clock fallback ...")
                 elif (now - self._gnss_loss_start) >= self.gnss_lost_timeout_sec:
-                    self._op_mode          = "TIME_FALLBACK"
-                    self._last_fallback_time = now
-                    self._gnss_loss_start  = None
-                    print(f"[LITTER TRIGGER] GNSS lost >{self.gnss_lost_timeout_sec:.0f}s. "
-                          f"Switching to clock fallback (every {self.time_fallback_sec:.0f}s).")
+                    # Grace expired — switch to TIME_FALLBACK
+                    # Set _last_fallback_time so the FIRST fallback trigger fires in ~5s
+                    # (not after a full 30s wait), minimising missed litter frames.
+                    _FIRST_FIRE_DELAY_SEC = 5.0
+                    self._op_mode           = "TIME_FALLBACK"
+                    self._last_fallback_time = now - (self.time_fallback_sec - _FIRST_FIRE_DELAY_SEC)
+                    self._gnss_loss_start   = None
+                    print(f"[LITTER TRIGGER] ⏱  GNSS lost >{self.gnss_lost_timeout_sec:.0f}s. "
+                          f"Switching to clock fallback (every {self.time_fallback_sec:.0f}s). "
+                          f"First trigger in ~{_FIRST_FIRE_DELAY_SEC:.0f}s.")
 
         # ── Evaluate trigger condition ─────────────────────────────────────
         trigger = False
@@ -311,12 +329,22 @@ class LitterEngine:
                 self._last_trigger_lon   = lon
                 self._distance_since_trig = 0.0
                 trigger = True
+                print(f"[LITTER TRIGGER] 🔴 Distance: {dist:.2f}m >= {self.distance_interval_m:.1f}m "
+                      f"— queuing inference #{self._trigger_count + 1} "
+                      f"@ ({lat:.8f}, {lon:.8f})")
 
         elif self._op_mode == "TIME_FALLBACK":
             elapsed = now - self._last_fallback_time
+            remaining = max(0.0, self.time_fallback_sec - elapsed)
             if elapsed >= self.time_fallback_sec:
                 self._last_fallback_time = now
                 trigger = True
+                print(f"[LITTER TRIGGER] ⏱  TIME FALLBACK — queuing inference #{self._trigger_count + 1} "
+                      f"(no GNSS, clock-based every {self.time_fallback_sec:.0f}s)")
+            else:
+                # Periodic status log every ~10s so operators can see the fallback is alive
+                if int(elapsed) % 10 == 0 and elapsed > 0.5:
+                    print(f"[LITTER TRIGGER] ⏱  TIME FALLBACK active — next trigger in {remaining:.0f}s")
 
         return trigger
 

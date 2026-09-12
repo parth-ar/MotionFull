@@ -98,17 +98,42 @@ def gps_fallback_worker(stop_event: threading.Event,
 
             if gnss_stale:
                 now = time.monotonic()
-                need_refresh = (
-                    latest_sensor.get("location_source") != "fallback"
-                    or (now - last_fallback_fetch) >= refresh_sec
-                )
-                if need_refresh:
+
+                # ── Priority 1: Hold last-known GNSS position ─────────────────
+                # This is always preferred over IP geolocation which can be wildly
+                # inaccurate (ISP NAT / city-level resolution).
+                last_known_lat = latest_sensor.get("last_known_valid_lat")
+                last_known_lon = latest_sensor.get("last_known_valid_lon")
+
+                if last_known_lat is not None and last_known_lon is not None:
+                    # Re-check: GNSS may have recovered while we evaluated
+                    last_fix_now = latest_sensor.get("last_gnss_fix_time")
+                    still_stale  = (last_fix_now is None) or (time.monotonic() - last_fix_now > timeout_sec)
+
+                    if still_stale:
+                        if latest_sensor.get("location_source") != "last_known":
+                            latest_sensor["lat"]             = last_known_lat
+                            latest_sensor["lon"]             = last_known_lon
+                            latest_sensor["heading"]         = latest_sensor.get("last_known_valid_heading")
+                            latest_sensor["gps_valid"]       = True
+                            latest_sensor["location_source"] = "last_known"
+                            age_s = time.time() - (latest_sensor.get("last_known_valid_timestamp") or time.time())
+                            print("\n" + "=" * 65)
+                            print(" [GPS HOLD] GNSS fix lost — holding last known position")
+                            print(f"            Last known: ({last_known_lat:.8f}, {last_known_lon:.8f})")
+                            print(f"            Fix age:    {age_s:.0f}s ago")
+                            print("            IP geolocation suppressed — will resume on GNSS recovery.")
+                            print("=" * 65 + "\n")
+
+                # ── Priority 2: IP geolocation — only if NO history exists ────
+                # Only reached when device has never seen a GNSS fix at all.
+                elif latest_sensor.get("location_source") != "fallback" or \
+                        (now - last_fallback_fetch) >= refresh_sec:
                     lat, lon, city, ip = get_laptop_location()
                     last_fallback_fetch = now
 
-                    # Re-check staleness — GNSS may have recovered while we fetched
-                    last_fix_now  = latest_sensor.get("last_gnss_fix_time")
-                    still_stale   = (last_fix_now is None) or (time.monotonic() - last_fix_now > timeout_sec)
+                    last_fix_now = latest_sensor.get("last_gnss_fix_time")
+                    still_stale  = (last_fix_now is None) or (time.monotonic() - last_fix_now > timeout_sec)
 
                     if lat is not None and lon is not None and still_stale:
                         raw_lat, raw_lon = lat, lon
@@ -117,8 +142,8 @@ def gps_fallback_worker(stop_event: threading.Event,
 
                         snapped_lat, snapped_lon, in_sz, is_snapped, road_bearing = \
                             snap_coordinates_to_road(raw_lat, raw_lon)
-                        lat, lon    = snapped_lat, snapped_lon
-                        dist_drift  = haversine_dist_meters(raw_lat, raw_lon, snapped_lat, snapped_lon)
+                        lat, lon   = snapped_lat, snapped_lon
+                        dist_drift = haversine_dist_meters(raw_lat, raw_lon, snapped_lat, snapped_lon)
 
                         latest_sensor["is_inside_safe_zone"] = in_sz
                         latest_sensor["is_snapped"]          = is_snapped
@@ -141,22 +166,14 @@ def gps_fallback_worker(stop_event: threading.Event,
                             _log_fallback(raw_lat, raw_lon, snapped_lat, snapped_lon,
                                           dist_drift, in_sz, city, ip)
 
-                    elif still_stale and latest_sensor.get("last_known_valid_lat") is not None:
-                        # Signal lost — hold last known position
-                        latest_sensor["lat"]     = latest_sensor["last_known_valid_lat"]
-                        latest_sensor["lon"]     = latest_sensor["last_known_valid_lon"]
-                        latest_sensor["heading"] = latest_sensor["last_known_valid_heading"]
-                        latest_sensor["gps_valid"]       = True
-                        latest_sensor["location_source"] = "last_known"
-
             else:
                 # NavCast recovered — disengage fallback
                 if latest_sensor.get("location_source") in ("fallback", "last_known"):
-                    latest_sensor["location_source"] = "navcast"
+                    latest_sensor["location_source"] = "gnss"
                     hardware_state["gps"]["logged_fallback"] = False
                     print("\n" + "=" * 65)
                     print(" [HARDWARE] GPS FALLBACK -> NAVCAST RECOVERED")
-                    print("            NavCast GNSS fix restored — IP fallback disengaged.")
+                    print("            NavCast GNSS fix restored — position hold disengaged.")
                     print("=" * 65 + "\n")
 
         stop_event.wait(5.0)

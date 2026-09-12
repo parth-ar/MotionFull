@@ -779,7 +779,12 @@ def main() -> None:
             # try_trigger() only posts to queue when 10 m threshold is crossed.
             if litter_engine is not None:
                 try:
-                    if litter_engine.update_gnss(cap_lat, cap_lon):
+                    # gnss_hardware_fix is True only for a real NavCast hardware fix.
+                    # location_source "last_known" or "fallback" means coordinates are
+                    # held/estimated — litter engine must not count those as valid GNSS.
+                    _loc_src = latest_sensor.get("location_source")
+                    _gnss_hw_fix = bool(gps_valid and _loc_src == "gnss")
+                    if litter_engine.update_gnss(cap_lat, cap_lon, gnss_hardware_fix=_gnss_hw_fix):
                         # Grab a clean copy of the original (unprocessed) frame
                         litter_frame = raw_frame.copy()
                         litter_engine.try_trigger(

@@ -320,10 +320,6 @@ class VehicleStopDetector:
                 self._rest_candidate_start = None
 
         elif self.state == "STOPPED":
-            # Update live duration
-            if self.active_stop is not None:
-                self.active_stop.duration_sec = max(0.0, now_mono - self.active_stop.start_mono)
-
             # Check for vehicle resuming motion (Speed > 5.0 km/h via GNSS and IMU)
             if is_motion_cand:
                 if self._motion_candidate_start is None:
@@ -357,7 +353,9 @@ class VehicleStopDetector:
             else:
                 self._motion_candidate_start = None
 
-        current_duration = self.active_stop.duration_sec if self.active_stop else 0.0
+        # Use the single authoritative monotonic counter for the returned duration.
+        # active_stop.duration_sec is only written at stop-end (for the summary report).
+        current_duration = self.get_stop_duration(now_mono)
         current_capture_count = len(self.active_stop.captures) if self.active_stop else 0
         current_stop_id = self.active_stop.stop_id if self.active_stop else (self._current_stop_id if self.state == "STOPPED" else 0)
 
