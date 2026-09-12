@@ -291,7 +291,7 @@ def live_frame_streamer(backend_url: str, device_id: str, fps: float,
                     stream_url,
                     data=frame_bytes,
                     headers={"Content-Type": "image/jpeg", "Connection": "keep-alive"},
-                    timeout=1.5,
+                    timeout=3.5,
                 )
                 if resp.status_code == 200:
                     hardware_state["backend"]["connected"]  = True
@@ -440,7 +440,7 @@ def telemetry_streamer(backend_url: str, session_id_arg: int, ulb_id: str,
                 "packets":   packets,
             }
             try:
-                resp = session.post(url, json=batch, timeout=2.0)
+                resp = session.post(url, json=batch, timeout=4.0)
                 if resp.status_code == 200:
                     hardware_state["backend"]["connected"]        = True
                     hardware_state["backend"]["telemetry_count"] += len(packets)
