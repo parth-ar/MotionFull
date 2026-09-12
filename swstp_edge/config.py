@@ -131,14 +131,17 @@ SAVE_COOLDOWN_SEC = 5.0        # 5-second buffer between motion captures
 FRAME_SIZE        = (320, 180) # Downsampled resolution for motion processing
 
 # ---------------------------------------------------------------------------
-# Vehicle Stop & Motion Detection Parameters (Dual GNSS + IMU)
+# Vehicle Stop Detection Parameters
 # ---------------------------------------------------------------------------
-STOP_SPEED_GATE            = 5.0    # km/h threshold: speed > 5.0 km/h ends stop event
-REST_SPEED_THRESHOLD_KMH   = 3.0    # km/h: speed < 3.0 km/h indicates candidate rest
-IMU_REST_ACCEL_TOLERANCE   = 0.45   # m/s² max dynamic acceleration deviation
-IMU_REST_GYRO_TOLERANCE    = 4.0    # deg/s max angular velocity magnitude for rest
-REST_DEBOUNCE_SEC          = 1.0    # Sustained seconds of rest required to confirm stop
-MOTION_DEBOUNCE_SEC        = 0.6    # Sustained seconds of motion to confirm stop end
+# Single symmetric threshold: < 5 km/h = STOPPED, > 5 km/h = MOVING.
+# Both STOP_SPEED_GATE and REST_SPEED_THRESHOLD_KMH are set to 5.0 so there
+# is no hysteresis gap where the vehicle state is ambiguous.
+STOP_SPEED_GATE            = 5.0    # km/h: speed > 5.0 km/h ends a stop event
+REST_SPEED_THRESHOLD_KMH   = 5.0    # km/h: speed < 5.0 km/h starts a stop event
+IMU_REST_ACCEL_TOLERANCE   = 0.45   # m/s² — logged in metrics, not a gate condition
+IMU_REST_GYRO_TOLERANCE    = 4.0    # deg/s — logged in metrics, not a gate condition
+REST_DEBOUNCE_SEC          = 1.0    # seconds of sustained < 5 km/h to confirm stop
+MOTION_DEBOUNCE_SEC        = 0.6    # seconds of sustained > 5 km/h to confirm motion
 
 # ---------------------------------------------------------------------------
 # Litter Detection Parameters
