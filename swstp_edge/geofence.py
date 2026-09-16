@@ -224,13 +224,12 @@ def track_field_events(lat, lon, speed, heading) -> None:
         field_state["is_stopped"] = is_stopped
         if is_stopped:
             if near_house and house_dist <= 15.0:
-                h_id = near_house["id"]
-                field_state["marked_houses"].add(h_id)
+                # Log proximity — do NOT mark green yet; that gate is in uploader.py
+                # after a camera evidence frame is confirmed by the backend (HTTP 200/201).
                 print("\n" + "=" * 65)
-                print(f"[FIELD LOG] 🛑 VEHICLE STOP AT HOUSE: {h_id} - {near_house['name']}")
+                print(f"[FIELD LOG] 🛑 VEHICLE STOP NEAR HOUSE: {near_house['id']} - {near_house['name']}")
                 print(f"            Proximity Dist: {house_dist:.1f}m (Threshold <= 15m) | Speed: {speed:.1f} km/h")
-                print(f"            🏠 HOUSE MARKED AS COLLECTED (GIS Map Status -> SOLID GREEN)")
-                print(f"            Total Houses Collected: {len(field_state['marked_houses'])} / {len(dynamic_houses)}")
+                print(f"            📷 Awaiting camera frame — house status unchanged until evidence confirmed.")
                 print(f"            Active Session: #{active_sid}")
                 print("=" * 65 + "\n")
             else:

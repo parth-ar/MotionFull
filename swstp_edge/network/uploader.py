@@ -15,6 +15,8 @@ Also contains:
 No changes to payload shapes, endpoint paths, or HTTP behavior.
 """
 
+from __future__ import annotations
+
 import datetime
 import json
 import os
@@ -70,7 +72,7 @@ def auto_detect_backend_url(candidate: str | None = None) -> str:
     ])
     for u in candidates:
         try:
-            r = requests.get(f"{u.rstrip('/')}/api/gis/roads?ulbId={DEFAULT_ULB_ID}", timeout=3.0)
+            r = requests.get(f"{u.rstrip('/')}/api/gis/roads?ulbId={DEFAULT_ULB_ID}", timeout=5.0)
             if r.status_code in (200, 401, 403, 404):
                 return u
         except Exception:
@@ -142,11 +144,12 @@ def sync_backend_metadata(backend_url: str, ulb_id: str) -> None:
     # Never hijack arbitrary sessions from other devices.
 
 
-def ensure_hardware_session(backend_url: str, device_code: str) -> int:
+def ensure_hardware_session(backend_url: str, device_code: str, retries: int = 3, timeout: float = 10.0) -> int:
     """Dynamically activates or binds the hardware session in the DB for the identified device.
     
     Device ID is the primary source of authentication. If registration fails or the device
     code is invalid, session creation is blocked and no telemetry/evidence is uploaded.
+    Includes a retry loop and extended timeout to withstand cellular handovers and modem boot latency.
     """
     if not device_code or device_code in ("AUTO", "UNASSIGNED", "DISCONNECTED", "UNPROVISIONED"):
         log_hardware("AUTH REJECTED", "BLOCKED", f"Invalid or unprovisioned device ID: '{device_code}'. All portal uploads disabled.")
@@ -155,45 +158,55 @@ def ensure_hardware_session(backend_url: str, device_code: str) -> int:
         return 0
 
     base = backend_url.rstrip('/')
-    try:
-        r = requests.post(
-            f"{base}/api/sessions/start-hardware-session",
-            json={"deviceCode": device_code, "mode": "REAL_HARDWARE"},
-            timeout=3.0,
-        )
-        if r.status_code == 200:
-            sess = r.json()
-            sid  = sess.get("sessionId") or 0
-            if sid > 0:
-                from telemetry import latest_sensor, hardware_state
-                dynamic_session_info["sessionId"]     = sid
-                dynamic_session_info["vehicleReg"]    = (
-                    sess.get("vehicleRegistrationNumber") or
-                    (sess.get("vehicle") or {}).get("registrationNumber") or
-                    dynamic_session_info["vehicleReg"]
-                )
-                dynamic_session_info["ulbId"]         = sess.get("ulbId") or (sess.get("ulb") or {}).get("ulbId") or dynamic_session_info["ulbId"]
-                dynamic_session_info["deviceId"]      = device_code
-                dynamic_session_info["authenticated"] = True
-                latest_sensor["active_session_id"]             = sid
-                hardware_state["backend"]["active_session_id"] = sid
+    last_err = None
+    max_attempts = max(1, retries)
+    for attempt in range(max_attempts):
+        try:
+            r = requests.post(
+                f"{base}/api/sessions/start-hardware-session",
+                json={"deviceCode": device_code, "mode": "REAL_HARDWARE"},
+                timeout=timeout,
+            )
+            if r.status_code == 200:
+                sess = r.json()
+                sid  = sess.get("sessionId") or 0
+                if sid > 0:
+                    from telemetry import latest_sensor, hardware_state
+                    dynamic_session_info["sessionId"]     = sid
+                    dynamic_session_info["vehicleReg"]    = (
+                        sess.get("vehicleRegistrationNumber") or
+                        (sess.get("vehicle") or {}).get("registrationNumber") or
+                        dynamic_session_info["vehicleReg"]
+                    )
+                    dynamic_session_info["ulbId"]         = sess.get("ulbId") or (sess.get("ulb") or {}).get("ulbId") or dynamic_session_info["ulbId"]
+                    dynamic_session_info["deviceId"]      = device_code
+                    dynamic_session_info["authenticated"] = True
+                    latest_sensor["active_session_id"]             = sid
+                    hardware_state["backend"]["active_session_id"] = sid
 
-                last_seq = sess.get("lastSequenceNumber") or sess.get("maxSequenceNumber") or 0
-                if last_seq > latest_sensor.get("sequence", 0):
-                    latest_sensor["sequence"] = int(last_seq)
+                    last_seq = sess.get("lastSequenceNumber") or sess.get("maxSequenceNumber") or 0
+                    if last_seq > latest_sensor.get("sequence", 0):
+                        latest_sensor["sequence"] = int(last_seq)
 
-                print(f"[SESSION BIND] Telemetry Session #{sid} AUTHENTICATED for Vehicle '{dynamic_session_info['vehicleReg']}' (Device: {device_code})")
-                return sid
-        else:
-            log_hardware("AUTH FAILED", "REJECTED", f"Backend rejected device '{device_code}': HTTP {r.status_code} - {r.text}")
-            dynamic_session_info["sessionId"]     = 0
-            dynamic_session_info["authenticated"] = False
-            return 0
-    except Exception as ex:
-        log_hardware("AUTH ERROR", "EXCEPTION", f"Failed to authenticate device '{device_code}': {ex}")
-        dynamic_session_info["sessionId"]     = 0
-        dynamic_session_info["authenticated"] = False
-        return 0
+                    print(f"[SESSION BIND] Telemetry Session #{sid} AUTHENTICATED for Vehicle '{dynamic_session_info['vehicleReg']}' (Device: {device_code})")
+                    return sid
+            elif r.status_code >= 500 and attempt < max_attempts - 1:
+                time.sleep(1.5)
+                continue
+            else:
+                log_hardware("AUTH FAILED", "REJECTED", f"Backend rejected device '{device_code}': HTTP {r.status_code} - {r.text}")
+                dynamic_session_info["sessionId"]     = 0
+                dynamic_session_info["authenticated"] = False
+                return 0
+        except Exception as ex:
+            last_err = ex
+            if attempt < max_attempts - 1:
+                time.sleep(1.5)
+                continue
+
+    log_hardware("AUTH ERROR", "EXCEPTION", f"Failed to authenticate device '{device_code}': {last_err}")
+    dynamic_session_info["sessionId"]     = 0
+    dynamic_session_info["authenticated"] = False
     return 0
 
 
@@ -278,7 +291,7 @@ def live_frame_streamer(backend_url: str, device_id: str, fps: float,
                     stream_url,
                     data=frame_bytes,
                     headers={"Content-Type": "image/jpeg", "Connection": "keep-alive"},
-                    timeout=1.5,
+                    timeout=3.5,
                 )
                 if resp.status_code == 200:
                     hardware_state["backend"]["connected"]  = True
@@ -427,7 +440,7 @@ def telemetry_streamer(backend_url: str, session_id_arg: int, ulb_id: str,
                 "packets":   packets,
             }
             try:
-                resp = session.post(url, json=batch, timeout=2.0)
+                resp = session.post(url, json=batch, timeout=4.0)
                 if resp.status_code == 200:
                     hardware_state["backend"]["connected"]        = True
                     hardware_state["backend"]["telemetry_count"] += len(packets)
@@ -512,6 +525,18 @@ def _upload_and_cleanup_evidence(session: requests.Session,
         "ulbId":              ulb_id,
     }
 
+    # ── Optional enrichment fields (litter / stop duration) ───────────────
+    stop_duration_sec    = item.get("stop_duration_sec", item.get("stop_offset_sec"))
+    detection_type       = item.get("detection_type") or item.get("detectionType")
+    detection_confidence = item.get("detection_confidence") or item.get("detectionConfidence")
+
+    if stop_duration_sec is not None:
+        data["stopDurationSec"] = round(float(stop_duration_sec), 2)
+    if detection_type:
+        data["detectionType"] = detection_type
+    if detection_confidence is not None:
+        data["detectionConfidence"] = round(float(detection_confidence), 4)
+
     file_display_name = os.path.basename(local_path) if local_path else f"evidence_{idempotency_key[:8]}.jpg"
     resp = None
     for attempt in range(2):
@@ -545,12 +570,22 @@ def _upload_and_cleanup_evidence(session: requests.Session,
         img_id  = res_json.get("evidenceImageId") or res_json.get("id") or "N/A"
         img_url = res_json.get("imageUrl") or f"{backend_url.rstrip('/')}/api/evidence/images/{img_id}"
 
-        near_h, h_dist = geofence.get_nearest_house(lat, lon)
-        house_tag = (
-            f"{near_h['id']} - {near_h['name']} (@ {h_dist:.1f}m)"
-            if (near_h and h_dist <= 25.0)
-            else "Road Corridor (Auto-allocated)"
-        )
+        if detection_type == "LITTER":
+            house_tag = f"🟡 Road Litter Marker @ ({lat:.8f}, {lon:.8f})"
+        else:
+            near_h, h_dist = geofence.get_nearest_house(lat, lon)
+            house_tag = (
+                f"{near_h['id']} - {near_h['name']} (@ {h_dist:.1f}m)"
+                if (near_h and h_dist <= 25.0)
+                else "Road Corridor (Auto-allocated)"
+            )
+            # ── Gate: mark house green ONLY on confirmed backend receipt ────────
+            if near_h and h_dist <= 25.0:
+                h_id = near_h["id"]
+                geofence.field_state["marked_houses"].add(h_id)
+                print(f"[FIELD LOG] 🏠 HOUSE MARKED AS COLLECTED (EVIDENCE CONFIRMED by backend)")
+                print(f"            House: {h_id} - {near_h['name']} (@ {h_dist:.1f}m)")
+                print(f"            Total collected: {len(geofence.field_state['marked_houses'])} / {len(geofence.dynamic_houses)}")
 
         raw_lat_val = latest_sensor.get("raw_gps_lat") or lat
         raw_lon_val = latest_sensor.get("raw_gps_lon") or lon
@@ -717,23 +752,55 @@ def evidence_upload_worker(backend_url: str, device_id: str, ulb_id: str,
     session.mount("https://", adapter)
 
     _last_auth_warn   = 0.0
+    _last_auth_retry  = 0.0
     _last_backlog_chk = 0.0
     _BACKLOG_INTERVAL = 10.0   # seconds between offline backlog scans
+
+    # Network back-off state (exponential, resets on any successful upload)
+    _net_fail_count  = 0
+    _backoff_until   = 0.0
+    _MAX_BACKOFF_SEC = 30.0
 
     while not stop_event.is_set():
         active_sid = dynamic_session_info.get("sessionId", 0)
         is_auth    = dynamic_session_info.get("authenticated", False)
 
-        # If not authenticated, do not consume items from upload_queue; let them stay in queue & disk
+        # If not authenticated, automatically retry authentication in the background
         if not is_auth or active_sid <= 0:
             now_t = time.time()
-            if now_t - _last_auth_warn > 10.0:
-                _last_auth_warn = now_t
-                print(f"[AUTH HOLD] Evidence upload waiting: Device '{device_id}' is not authenticated in backend. Captures remain safely in local backup.")
-            stop_event.wait(2.0)
-            continue
+            if now_t - _last_auth_retry >= 10.0:
+                _last_auth_retry = now_t
+                try:
+                    sid = ensure_hardware_session(backend_url, device_id, retries=1, timeout=8.0)
+                    if sid > 0:
+                        active_sid = sid
+                        is_auth = True
+                        print(f"[AUTH RECOVERED] Device '{device_id}' session #{sid} bound. Resuming evidence backlog uploads.")
+                        # Reset backlog check timestamp so offline captures flush immediately
+                        _last_backlog_chk = 0.0
+                        # Also synchronize dynamic metadata if it was missed during boot
+                        if not geofence.dynamic_houses or not geofence.dynamic_roads:
+                            try:
+                                sync_backend_metadata(backend_url, ulb_id)
+                            except Exception:
+                                pass
+                except Exception as auth_err:
+                    print(f"[AUTH RETRY] Failed: {auth_err}")
+
+            if not is_auth or active_sid <= 0:
+                if now_t - _last_auth_warn > 10.0:
+                    _last_auth_warn = now_t
+                    print(f"[AUTH HOLD] Evidence upload waiting: Device '{device_id}' is not authenticated in backend. Captures remain safely in local backup.")
+                stop_event.wait(2.0)
+                continue
 
         # 1. Process live queue items
+        # Honour back-off window before attempting any upload
+        now_t = time.time()
+        if now_t < _backoff_until:
+            stop_event.wait(min(1.0, _backoff_until - now_t))
+            continue
+
         try:
             item = upload_queue.get(timeout=1.0)
         except queue.Empty:
@@ -747,7 +814,7 @@ def evidence_upload_worker(backend_url: str, device_id: str, ulb_id: str,
                     _in_flight_evidence_files.add(abs_path)
 
             try:
-                _upload_and_cleanup_evidence(
+                success = _upload_and_cleanup_evidence(
                     session=session,
                     url=url,
                     backend_url=backend_url,
@@ -756,6 +823,25 @@ def evidence_upload_worker(backend_url: str, device_id: str, ulb_id: str,
                     active_sid=active_sid,
                     item=item,
                 )
+                if success:
+                    # Reset back-off on confirmed upload
+                    _net_fail_count = 0
+                    _backoff_until  = 0.0
+                else:
+                    # Upload failed (network or server error) — apply back-off
+                    _net_fail_count += 1
+                    backoff = min(_MAX_BACKOFF_SEC, 0.5 * (2 ** min(_net_fail_count - 1, 6)))
+                    _backoff_until = time.time() + backoff
+                    print(f"[EVIDENCE UPLOAD] Back-off #{_net_fail_count}: waiting {backoff:.0f}s before retry.")
+                    # Rebuild session to clear stale connections
+                    try:
+                        session.close()
+                    except Exception:
+                        pass
+                    session = requests.Session()
+                    adapter = requests.adapters.HTTPAdapter(pool_connections=5, pool_maxsize=10, max_retries=1)
+                    session.mount("http://", adapter)
+                    session.mount("https://", adapter)
             except Exception as e:
                 print(f"[EVIDENCE UPLOAD ERROR] {e}")
             finally:
@@ -779,6 +865,21 @@ def evidence_upload_worker(backend_url: str, device_id: str, ulb_id: str,
                 )
             except Exception as b_err:
                 print(f"[BACKLOG SYNC ERROR] {b_err}")
+
+            # Also sync offline litter captures backlog
+            try:
+                from config import LITTER_CAPTURES_DIR
+                if os.path.exists(LITTER_CAPTURES_DIR):
+                    sync_offline_captures_backlog(
+                        backend_url=backend_url,
+                        device_id=device_id,
+                        ulb_id=ulb_id,
+                        active_sid=active_sid,
+                        session=session,
+                        save_dir=LITTER_CAPTURES_DIR,
+                    )
+            except Exception as lb_err:
+                print(f"[LITTER BACKLOG SYNC ERROR] {lb_err}")
 
     session.close()
 

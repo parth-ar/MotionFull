@@ -110,7 +110,7 @@ latest_stream_frame: tuple | None = None
 RE_CLEAN_FILENAME = re.compile(r"[^\w]")
 
 
-def draw_area_of_interest_overlay(frame, roi_pts, motion_detected: bool = False) -> None:
+def draw_area_of_interest_overlay(frame, roi_pts, motion_detected: bool = False, on_hold: bool = False) -> None:
     """Draw Area of Interest polygon and pointers matching original visual appearance."""
     if not roi_pts or len(roi_pts) < 3:
         return
@@ -122,13 +122,22 @@ def draw_area_of_interest_overlay(frame, roi_pts, motion_detected: bool = False)
         disp_pts.append([px, py])
 
     if len(disp_pts) >= 3 and not _motion.is_drawing_polygon:
-        poly_color = (0, 0, 255) if motion_detected else (0, 255, 200)
+        if motion_detected:
+            poly_color = (0, 0, 255)
+            status_tag = "MOTION DETECTED"
+        elif on_hold:
+            poly_color = (160, 160, 160)
+            status_tag = "ON HOLD (VEHICLE MOVING)"
+        else:
+            poly_color = (0, 255, 200)
+            status_tag = "ACTIVE (MONITORING)"
+
         cv2.polylines(frame, [np.array(disp_pts, dtype=np.int32)],
                       isClosed=True, color=poly_color, thickness=2)
         for pt in disp_pts:
             cv2.circle(frame, tuple(pt), 4, (0, 255, 255), -1)
         cv2.putText(frame,
-                    f"AREA OF INTEREST ({len(disp_pts)} pts, press 'r' to re-plot)",
+                    f"AREA OF INTEREST [{status_tag}] ({len(disp_pts)} pts, press 'r' to re-plot)",
                     (disp_pts[0][0] + 5, max(20, disp_pts[0][1] - 8)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.42, poly_color, 1, cv2.LINE_AA)
 
@@ -493,6 +502,8 @@ def main() -> None:
     LOOP_VIDEO  = True
     bg_model    = None
     frame_count = 0
+    stop_warmup_cnt   = 0
+    total_frames_seen = 0
     last_save_time = 0.0
     saved_count    = 0
     last_known_frame = None
@@ -531,8 +542,9 @@ def main() -> None:
                     cam_w, cam_h, fps = new_w, new_h, new_fps
                     delay  = max(1, int(1000 / (fps if (fps and 0 < fps < 120) else 30)))
                     is_file = isinstance(source, str) and not source.isdigit() and not str(source).startswith("/dev/video")
-                    bg_model    = None
-                    frame_count = 0
+                    bg_model          = None
+                    frame_count       = 0
+                    stop_warmup_cnt   = 0
                     if hasattr(_motion, "reset_tracking"):
                         try:
                             _motion.reset_tracking()
@@ -617,6 +629,7 @@ def main() -> None:
                     bg_model                  = None
                     frame_count               = 0
                     consecutive_motion_frames = 0
+                    stop_warmup_cnt           = 0
                     continue
                 elif is_file:
                     print(f"[CAMERA] End of video file '{source}'.")
@@ -632,6 +645,7 @@ def main() -> None:
                     bg_model                  = None
                     frame_count               = 0
                     consecutive_motion_frames = 0
+                    stop_warmup_cnt           = 0
                     if hasattr(_motion, "reset_tracking"):
                         try:
                             _motion.reset_tracking()
@@ -648,7 +662,41 @@ def main() -> None:
             last_known_frame = orig_frame.copy()
             orig_h, orig_w   = orig_frame.shape[:2]
 
-            # ── 4. Downsample for motion processing ───────────────────────
+            # ── 4. Vehicle Stop & State Evaluation (GNSS + IMU Fusion) ────
+            now_mono      = time.monotonic()
+            vehicle_speed = float(latest_sensor.get("speed") or 0.0)
+            imu_data      = latest_sensor.get("imu")
+            cap_lat       = latest_sensor.get("lat")
+            cap_lon       = latest_sensor.get("lon")
+            gps_valid     = bool(latest_sensor.get("gps_valid"))
+            rtc_ts        = get_rtc_timestamp()
+
+            stop_status = stop_detector.update(
+                vehicle_speed=vehicle_speed,
+                imu_data=imu_data,
+                latitude=cap_lat,
+                longitude=cap_lon,
+                rtc_timestamp=rtc_ts,
+                gps_valid=gps_valid,
+                now_mono=now_mono,
+            )
+
+            is_vehicle_stopped     = stop_status["is_stopped"]
+            current_event_duration = stop_status["duration_sec"]
+            current_stop_id        = stop_status["stop_event_id"]
+            current_capture_count  = stop_status["capture_count"]
+
+            latest_sensor["is_vehicle_stopped"]   = is_vehicle_stopped
+            latest_sensor["vehicle_motion_state"] = stop_status["state"]
+            latest_sensor["stop_duration_sec"]    = current_event_duration
+            latest_sensor["stop_event_id"]        = current_stop_id
+            latest_sensor["stop_capture_count"]   = current_capture_count
+
+            # Gating condition: Motion detection is ACTIVE only when vehicle is confirmed STOPPED (< 5.0 km/h).
+            # When moving (speed >= 5.0 km/h or vehicle not at stop), motion detection is on hold.
+            motion_gate_active = is_vehicle_stopped and (vehicle_speed < 5.0)
+
+            # ── 5. Downsample for motion processing ───────────────────────
             if FRAME_SIZE is not None:
                 proc_w, proc_h = FRAME_SIZE
                 proc_frame = cv2.resize(frame, (proc_w, proc_h))
@@ -662,102 +710,95 @@ def main() -> None:
             gray_frame = cv2.cvtColor(proc_frame, cv2.COLOR_BGR2GRAY)
             gray_blur  = cv2.GaussianBlur(gray_frame, (9, 9), 0)
 
-            if bg_model is None:
-                bg_model    = gray_blur.astype(np.float32)
-                frame_count = 1
-                continue
-
-            cv2.accumulateWeighted(gray_blur, bg_model, BG_ALPHA)
-            frame_count += 1
-
             roi_pts = _motion.active_polygon_roi or load_roi_polygon()
 
-            # ── 5. Warm-up ────────────────────────────────────────────────
-            if frame_count <= WARMUP_FRAMES:
-                draw_area_of_interest_overlay(orig_frame, roi_pts, motion_detected=False)
-                display_frame = overlay_metadata(orig_frame.copy(), litter_engine)
-                with latest_frame_lock:
-                    latest_stream_frame = (display_frame, time.monotonic())
-                if not args.headless:
-                    cv2.imshow(WIN_TITLE, display_frame)
-                    k = cv2.waitKey(delay) & 0xFF
-                    if k == ord('q'):
-                        break
-                    elif k == ord('t'):
-                        _motion.camera_feed_active = not _motion.camera_feed_active
-                        print(f"\n[CAMERA] Camera feed {'ACTIVATED / ON' if _motion.camera_feed_active else 'PAUSED / OFF'}.")
-                continue
+            motion_detected = False
+            total_frames_seen += 1
 
-            # ── 6. Background subtraction & robust motion filtering ──────
-            bg_uint8 = cv2.convertScaleAbs(bg_model)
-            diff     = cv2.absdiff(bg_uint8, gray_blur)
-            _, thresh = cv2.threshold(diff, DIFF_THRESHOLD, 255, cv2.THRESH_BINARY)
-
-            # Apply Area of Interest (ROI) mask
-            thresh = apply_polygon_roi_mask(thresh, roi_pts, proc_w, proc_h)
-
-            # Morphological opening (3x3) removes isolated noise, single-pixel glints,
-            # and specular reflection specks before dilation can expand them
-            kernel_open = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-            opened = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel_open)
-
-            # Calculate active ROI area for lighting change evaluation
-            if roi_pts and len(roi_pts) >= 3:
-                pts_roi = [
-                    [int(p[0] * proc_w) if p[0] <= 1.0 else int(p[0]),
-                     int(p[1] * proc_h) if p[1] <= 1.0 else int(p[1])]
-                    for p in roi_pts
-                ]
-                roi_area = max(100.0, float(cv2.contourArea(np.array(pts_roi, dtype=np.int32))))
-            else:
-                roi_area = float(proc_w * proc_h)
-
-            # Global illumination / sudden lighting shock check (e.g. headlights, sunburst, auto-exposure):
-            # If changed pixels cover > MAX_MOTION_AREA_RATIO of the ROI, reject as ambient lighting shock
-            motion_pixels = cv2.countNonZero(opened)
-            is_lighting_shock = (motion_pixels / roi_area) > MAX_MOTION_AREA_RATIO
-
-            box_thickness = max(2, int(min(scale_x, scale_y)))
-
-            if is_lighting_shock:
-                # Rapidly re-adapt the background model to the new illumination level
-                cv2.accumulateWeighted(gray_blur, bg_model, FAST_BG_ALPHA)
+            if not motion_gate_active:
+                # Vehicle is in motion (>= 5.0 km/h) — motion detection ON HOLD
+                bg_model                  = None   # Clear background model while moving so road scenery never contaminates it
+                stop_warmup_cnt           = 0
                 consecutive_motion_frames = 0
-                motion_detected = False
-                text_scale = max(0.5, (orig_h / 480.0) * 0.5)
-                cv2.putText(orig_frame, "LIGHTING ADAPTING",
-                            (10, int(55 * text_scale)),
-                            cv2.FONT_HERSHEY_SIMPLEX, text_scale,
-                            (0, 215, 255), max(1, int(orig_h / 360)), cv2.LINE_AA)
             else:
-                # Dilation (iterations=2) bridges adjacent contours within physical moving bodies
-                dilated = cv2.dilate(opened, None, iterations=2)
-                cnts = cv2.findContours(dilated.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                cnts = imutils.grab_contours(cnts)
-
-                candidate_motion = False
-                for c in cnts:
-                    if cv2.contourArea(c) < MIN_CONTOUR_AREA:
-                        continue
-                    candidate_motion = True
-                    (x, y, w, h) = cv2.boundingRect(c)
-                    orig_x, orig_y   = int(x * scale_x), int(y * scale_y)
-                    orig_bw, orig_bh = int(w * scale_x), int(h * scale_y)
-                    cv2.rectangle(orig_frame,
-                                  (orig_x, orig_y),
-                                  (orig_x + orig_bw, orig_y + orig_bh),
-                                  (0, 255, 0), box_thickness)
-
-                if candidate_motion:
-                    consecutive_motion_frames += 1
+                # Vehicle is STOPPED (< 5.0 km/h confirmed by GNSS & IMU) — Motion detection ACTIVE
+                if bg_model is None:
+                    bg_model        = gray_blur.astype(np.float32)
+                    stop_warmup_cnt = 1
                 else:
-                    consecutive_motion_frames = 0
+                    cv2.accumulateWeighted(gray_blur, bg_model, BG_ALPHA)
+                    stop_warmup_cnt += 1
 
-                # Require sustained motion across consecutive frames to reject 1-frame glints/reflections
-                motion_detected = (consecutive_motion_frames >= MOTION_CONSECUTIVE_FRAMES)
+                # Allow a short settling period (4 frames ~ 0.15s) after vehicle halts,
+                # and ensure initial startup warmup has elapsed.
+                if stop_warmup_cnt >= 4 and total_frames_seen > WARMUP_FRAMES:
+                    bg_uint8 = cv2.convertScaleAbs(bg_model)
+                    diff     = cv2.absdiff(bg_uint8, gray_blur)
+                    _, thresh = cv2.threshold(diff, DIFF_THRESHOLD, 255, cv2.THRESH_BINARY)
+                    thresh  = apply_polygon_roi_mask(thresh, roi_pts, proc_w, proc_h)
 
-            # ── 7. Draw Area of Interest polygon overlay ──────────────────
-            draw_area_of_interest_overlay(orig_frame, roi_pts, motion_detected=motion_detected)
+                    # Morphological opening (3x3) removes isolated noise, single-pixel glints,
+                    # and specular reflection specks before dilation can expand them
+                    kernel_open = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+                    opened = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel_open)
+
+                    # Calculate active ROI area for lighting change evaluation
+                    if roi_pts and len(roi_pts) >= 3:
+                        pts_roi = [
+                            [int(p[0] * proc_w) if p[0] <= 1.0 else int(p[0]),
+                             int(p[1] * proc_h) if p[1] <= 1.0 else int(p[1])]
+                            for p in roi_pts
+                        ]
+                        roi_area = max(100.0, float(cv2.contourArea(np.array(pts_roi, dtype=np.int32))))
+                    else:
+                        roi_area = float(proc_w * proc_h)
+
+                    # Global illumination / sudden lighting shock check (e.g. headlights, sunburst, auto-exposure):
+                    # If changed pixels cover > MAX_MOTION_AREA_RATIO of the ROI, reject as ambient lighting shock
+                    motion_pixels = cv2.countNonZero(opened)
+                    is_lighting_shock = (motion_pixels / roi_area) > MAX_MOTION_AREA_RATIO
+
+                    box_thickness = max(2, int(min(scale_x, scale_y)))
+
+                    if is_lighting_shock:
+                        # Rapidly re-adapt the background model to the new illumination level
+                        cv2.accumulateWeighted(gray_blur, bg_model, FAST_BG_ALPHA)
+                        consecutive_motion_frames = 0
+                        motion_detected = False
+                        text_scale = max(0.5, (orig_h / 480.0) * 0.5)
+                        cv2.putText(orig_frame, "LIGHTING ADAPTING",
+                                    (10, int(55 * text_scale)),
+                                    cv2.FONT_HERSHEY_SIMPLEX, text_scale,
+                                    (0, 215, 255), max(1, int(orig_h / 360)), cv2.LINE_AA)
+                    else:
+                        # Dilation (iterations=2) bridges adjacent contours within physical moving bodies
+                        dilated = cv2.dilate(opened, None, iterations=2)
+                        cnts = cv2.findContours(dilated.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                        cnts = imutils.grab_contours(cnts)
+
+                        candidate_motion = False
+                        for c in cnts:
+                            if cv2.contourArea(c) < MIN_CONTOUR_AREA:
+                                continue
+                            candidate_motion = True
+                            (x, y, w, h) = cv2.boundingRect(c)
+                            orig_x, orig_y   = int(x * scale_x), int(y * scale_y)
+                            orig_bw, orig_bh = int(w * scale_x), int(h * scale_y)
+                            cv2.rectangle(orig_frame,
+                                          (orig_x, orig_y),
+                                          (orig_x + orig_bw, orig_y + orig_bh),
+                                          (0, 255, 0), box_thickness)
+
+                        if candidate_motion:
+                            consecutive_motion_frames += 1
+                        else:
+                            consecutive_motion_frames = 0
+
+                        # Require sustained motion across consecutive frames to reject 1-frame glints/reflections
+                        motion_detected = (consecutive_motion_frames >= MOTION_CONSECUTIVE_FRAMES)
+
+            # ── 6. Draw Area of Interest polygon overlay ──────────────────
+            draw_area_of_interest_overlay(orig_frame, roi_pts, motion_detected=motion_detected, on_hold=(not motion_gate_active))
 
             # ── In-progress polygon drawing overlay ───────────────────────
             if _motion.is_drawing_polygon:
@@ -785,52 +826,23 @@ def main() -> None:
                             f"PLOTTING AREA OF INTEREST: Click to place pointers ({len(prog_pts)} set) | Press 'r' again when done to connect & save",
                             (10, 48), cv2.FONT_HERSHEY_SIMPLEX, 0.44, (0, 255, 255), 1, cv2.LINE_AA)
 
-            # ── 8. Vehicle Stop & Motion Detection ────────────────────────
-            now_mono      = time.monotonic()
-            vehicle_speed = float(latest_sensor.get("speed") or 0.0)
-            imu_data      = latest_sensor.get("imu")
-            cap_lat       = latest_sensor.get("lat")
-            cap_lon       = latest_sensor.get("lon")
-            gps_valid     = bool(latest_sensor.get("gps_valid"))
-            rtc_ts        = get_rtc_timestamp()
-
-            stop_status = stop_detector.update(
-                vehicle_speed=vehicle_speed,
-                imu_data=imu_data,
-                latitude=cap_lat,
-                longitude=cap_lon,
-                rtc_timestamp=rtc_ts,
-                gps_valid=gps_valid,
-                now_mono=now_mono,
-            )
-
-            is_vehicle_stopped    = stop_status["is_stopped"]
-            current_event_duration = stop_status["duration_sec"]
-            current_stop_id       = stop_status["stop_event_id"]
-            current_capture_count = stop_status["capture_count"]
-
-            latest_sensor["is_vehicle_stopped"]   = is_vehicle_stopped
-            latest_sensor["vehicle_motion_state"] = stop_status["state"]
-            latest_sensor["stop_duration_sec"]    = current_event_duration
-            latest_sensor["stop_event_id"]        = current_stop_id
-            latest_sensor["stop_capture_count"]   = current_capture_count
-            # Pending-confirm state: non-zero only while vehicle is being observed at rest
-            # but has not yet met the REST_CONFIRM_SEC threshold. Used by overlay to display
-            # "CONFIRMING STOP..." progress in the bottom metadata strip.
-            latest_sensor["pending_rest_sec"]     = stop_status.get("pending_rest_sec", 0.0)
-            latest_sensor["rest_confirm_sec"]     = stop_status.get("rest_confirm_sec", 3.0)
-
+            # ── 7. Metadata Overlay & Live Stream Buffer ──────────────────
             display_frame = overlay_metadata(orig_frame.copy(), litter_engine)
 
             with latest_frame_lock:
                 latest_stream_frame = (display_frame, time.monotonic())
 
-            # ── 9. Litter Detection — 10 m GNSS trigger ──────────────────
+            # ── 8. Litter Detection — 10 m GNSS trigger ──────────────────
             # Note: update_gnss() is called every frame (lightweight haversine check).
             # try_trigger() only posts to queue when 10 m threshold is crossed.
             if litter_engine is not None:
                 try:
-                    if litter_engine.update_gnss(cap_lat, cap_lon):
+                    # gnss_hardware_fix is True only for a real NavCast hardware fix.
+                    # location_source "last_known" or "fallback" means coordinates are
+                    # held/estimated — litter engine must not count those as valid GNSS.
+                    _loc_src = latest_sensor.get("location_source")
+                    _gnss_hw_fix = bool(gps_valid and _loc_src == "gnss")
+                    if litter_engine.update_gnss(cap_lat, cap_lon, gnss_hardware_fix=_gnss_hw_fix):
                         # Grab a clean copy of the original (unprocessed) frame
                         litter_frame = raw_frame.copy()
                         litter_engine.try_trigger(

@@ -1,19 +1,27 @@
 """
-stop_detector.py — Vehicle stop and motion detection via dual GNSS and IMU fusion.
+stop_detector.py — Vehicle stop detection via GNSS + IMU complementary fusion.
 
 This module owns:
-  1. StopCaptureItem — metadata tracker for motion frames captured during an active stop.
-  2. StopEventRecord — container for a vehicle stop session, recording start/end
-     timestamps, GPS coordinates, elapsed stop duration, and all motion captures.
-  3. VehicleStopDetector — state machine managing MOVING vs STOPPED states:
-     - Detects rest using GNSS speed (< 3.0 km/h) AND IMU dynamics (accel & gyro tolerances).
-     - Rest must be sustained for REST_CONFIRM_SEC (default 3 s) before a stop is registered.
-       The stop start time is BACKDATED to when rest first began, so the confirm window is
-       included in the final stop duration for accurate reporting.
-     - Tracks all motion frames captured during the stop without any idle timeout.
-     - Concludes the stop when vehicle resumes motion (speed > 5.0 km/h via GNSS & IMU),
-       sustained for MOTION_DEBOUNCE_SEC (default 2 s).
-     - Emits a comprehensive historical summary report of the stop event upon completion.
+  1. StopCaptureItem — metadata for a motion frame captured during an active stop.
+  2. StopEventRecord — full record of a vehicle stop session.
+  3. VehicleStopDetector — MOVING / STOPPED state machine:
+
+     Fusion strategy
+     ---------------
+     GNSS speed is the authoritative gate:
+       - speed < 5.0 km/h  →  stop candidate
+       - speed > 5.0 km/h  →  motion candidate
+
+     IMU momentum dynamics modulate confidence via adaptive debounce:
+       - GNSS + IMU both agree  →  short debounce (fast detection)
+       - GNSS says stop, IMU still active (e.g. engine vibration)
+                                →  extended debounce (tolerant, still detects)
+       - IMU unavailable        →  normal debounce (GNSS-only)
+       - GNSS unavailable       →  IMU-only mode (tunnels / GNSS loss)
+
+     House collection status is NOT updated here — that gate lives in
+     uploader.py and fires only after a confirmed backend upload (HTTP 200/201).
+     A stop near a house with no frames captured does NOT change house status.
 """
 
 from __future__ import annotations
@@ -30,16 +38,21 @@ try:
         REST_SPEED_THRESHOLD_KMH,
         IMU_REST_ACCEL_TOLERANCE,
         IMU_REST_GYRO_TOLERANCE,
-        REST_CONFIRM_SEC,
+        REST_DEBOUNCE_SEC,
         MOTION_DEBOUNCE_SEC,
     )
+    try:
+        from config import REST_CONFIRM_SEC
+    except ImportError:
+        REST_CONFIRM_SEC = REST_DEBOUNCE_SEC
 except ImportError:
     STOP_SPEED_GATE          = 5.0
-    REST_SPEED_THRESHOLD_KMH = 3.0
+    REST_SPEED_THRESHOLD_KMH = 5.0
     IMU_REST_ACCEL_TOLERANCE = 0.45
     IMU_REST_GYRO_TOLERANCE  = 4.0
-    REST_CONFIRM_SEC         = 3.0
-    MOTION_DEBOUNCE_SEC      = 2.0
+    REST_DEBOUNCE_SEC        = 1.0
+    REST_CONFIRM_SEC         = 1.0
+    MOTION_DEBOUNCE_SEC      = 0.6
 
 
 # ---------------------------------------------------------------------------
@@ -134,19 +147,18 @@ class StopEventRecord:
 # ---------------------------------------------------------------------------
 class VehicleStopDetector:
     """
-    Monitors vehicle rest/motion states using fused GNSS and IMU sensors.
+    MOVING / STOPPED state machine using GNSS + IMU complementary fusion.
 
     Logic:
-      1. REST: GNSS speed < 3.0 km/h AND IMU stationary (dyn_accel < tolerance, gyro < tolerance).
-         Must be sustained for REST_CONFIRM_SEC (default 3 s) continuously before the stop is
-         registered. The stop start time is backdated to when rest first began, so the confirm
-         window is counted in the final stop duration. Any break in the rest condition resets
-         the timer, preventing phantom stops from brief speed dips.
-      2. STOPPED: Stop timer runs continuously. Camera motion idle timeout is REMOVED.
-         Captures during stop are registered and kept in history.
-      3. MOTION: Vehicle speed > 5.0 km/h confirmed by GNSS and IMU.
-         Sustained for MOTION_DEBOUNCE_SEC (default 2 s) -> enters MOVING state, concludes
-         stop, and outputs full summary report containing all previous logs.
+      GNSS speed is the required gate:
+        < 5.0 km/h sustained → STOPPED (timer starts, house status unchanged)
+        > 5.0 km/h sustained → MOVING  (stop concludes, summary printed)
+
+      IMU momentum dynamics modulate debounce:
+        Both agree    → 0.6× rest debounce  / 0.5× motion debounce  (fast)
+        GNSS ok, IMU active (vibration) → 1.5× rest / 1.2× motion (tolerant)
+        IMU unavailable → standard debounce (GNSS-only)
+        GNSS unavailable → IMU-only mode
     """
 
     def __init__(
@@ -155,15 +167,17 @@ class VehicleStopDetector:
         rest_speed_threshold: float = REST_SPEED_THRESHOLD_KMH,
         imu_accel_tolerance: float = IMU_REST_ACCEL_TOLERANCE,
         imu_gyro_tolerance: float = IMU_REST_GYRO_TOLERANCE,
-        rest_confirm_sec: float = REST_CONFIRM_SEC,
+        rest_debounce_sec: float = REST_DEBOUNCE_SEC,
         motion_debounce_sec: float = MOTION_DEBOUNCE_SEC,
+        rest_confirm_sec: Optional[float] = None,
     ):
-        self.stop_speed_gate = stop_speed_gate
-        self.rest_speed_threshold = rest_speed_threshold
-        self.imu_accel_tolerance = imu_accel_tolerance
-        self.imu_gyro_tolerance = imu_gyro_tolerance
-        self.rest_confirm_sec = rest_confirm_sec
-        self.motion_debounce_sec = motion_debounce_sec
+        self.stop_speed_gate = float(stop_speed_gate)
+        self.rest_speed_threshold = float(rest_speed_threshold)
+        self.imu_accel_tolerance = float(imu_accel_tolerance)
+        self.imu_gyro_tolerance = float(imu_gyro_tolerance)
+        self.rest_debounce_sec = float(rest_confirm_sec if rest_confirm_sec is not None else rest_debounce_sec)
+        self.rest_confirm_sec = self.rest_debounce_sec
+        self.motion_debounce_sec = float(motion_debounce_sec)
 
         self.state: str = "MOVING"  # "MOVING" | "STOPPED"
         self._current_stop_id: int = 0
@@ -199,68 +213,86 @@ class VehicleStopDetector:
         gps_valid: bool = True,
     ) -> tuple[bool, bool, Dict[str, Any]]:
         """
-        Evaluate instantaneous sensor state for candidate rest and candidate motion.
+        Evaluate instantaneous sensor state using GNSS + IMU complementary fusion.
+
+        GNSS speed is the required gate:
+          speed < rest_speed_threshold (5.0 km/h) → rest candidate
+          speed > stop_speed_gate      (5.0 km/h) → motion candidate
+
+        IMU agreement flags (imu_rest_agreement, imu_motion_agreement) are
+        returned in metrics and used by update() to compute adaptive debounce.
 
         Returns:
           (is_rest_candidate, is_motion_candidate, metrics_dict)
         """
         speed = float(speed_kmh or 0.0)
-        gnss_at_rest = speed < self.rest_speed_threshold
-        gnss_in_motion = speed > self.stop_speed_gate
 
-        # IMU evaluation
-        imu_valid = bool(imu_data and imu_data.get("valid"))
-        dyn_accel = 0.0
-        gyro_mag = 0.0
-        imu_at_rest = False
+        # ── IMU momentum dynamics ──────────────────────────────────────────
+        # Computed from raw sensor regardless of GNSS state.
+        # dyn_accel = deviation of |accel| from gravitational rest (9.80665 m/s²).
+        # gyro_mag  = total angular rate |ω| = sqrt(gx² + gy² + gz²) in °/s.
+        imu_valid     = bool(imu_data and imu_data.get("valid"))
+        dyn_accel     = 0.0
+        gyro_mag      = 0.0
+        imu_at_rest   = False
         imu_in_motion = False
 
         if imu_valid:
-            # 1. Accelerometer dynamic acceleration (|a| - 9.80665 m/s²)
             accel_mag = float(imu_data.get("accel_magnitude_ms2") or 9.80665)
             dyn_accel = abs(accel_mag - 9.80665)
-
-            # 2. Gyroscope total angular rate sqrt(gx² + gy² + gz²) in °/s
-            gyro = imu_data.get("gyro_dps") or {}
+            gyro      = imu_data.get("gyro_dps") or {}
             gx = float(gyro.get("x") or 0.0)
             gy = float(gyro.get("y") or 0.0)
             gz = float(gyro.get("z") or 0.0)
-            gyro_mag = math.sqrt(gx * gx + gy * gy + gz * gz)
+            gyro_mag      = math.sqrt(gx * gx + gy * gy + gz * gz)
+            imu_at_rest   = (dyn_accel < self.imu_accel_tolerance) and \
+                            (gyro_mag  < self.imu_gyro_tolerance)
+            imu_in_motion = (dyn_accel >= self.imu_accel_tolerance * 1.2) or \
+                            (gyro_mag  >= self.imu_gyro_tolerance  * 1.1)
 
-            imu_at_rest = (dyn_accel < self.imu_accel_tolerance) and (gyro_mag < self.imu_gyro_tolerance)
-            imu_in_motion = (dyn_accel >= self.imu_accel_tolerance * 1.2) or (gyro_mag >= self.imu_gyro_tolerance * 1.1)
-
-        # Fused decision
-        if gps_valid and imu_valid:
-            # Both sensors active: cross-validate
-            is_rest_candidate = gnss_at_rest and imu_at_rest
-            # Motion: speed > 5 km/h with IMU activity or clear GPS driving speed > 6.5 km/h
-            is_motion_candidate = (gnss_in_motion and imu_in_motion) or (speed > (self.stop_speed_gate + 1.5))
-        elif gps_valid and not imu_valid:
-            # Fallback: GNSS only
-            is_rest_candidate = gnss_at_rest
+        # ── Fusion decision ──────────────────────────────────────────────────
+        # GNSS is the gate; IMU agreement/disagreement is surfaced in metrics
+        # so update() can apply an adaptive debounce.
+        if gps_valid:
+            gnss_at_rest    = speed < self.rest_speed_threshold   # < 5.0
+            gnss_in_motion  = speed > self.stop_speed_gate        # > 5.0
+            is_rest_candidate   = gnss_at_rest
             is_motion_candidate = gnss_in_motion
-        elif not gps_valid and imu_valid:
-            # Fallback: Inertial only (tunnels, dense cover)
-            is_rest_candidate = imu_at_rest
-            is_motion_candidate = imu_in_motion
+            # imu_rest_agreement:   True  = IMU also at rest   (fast debounce)
+            #                       False = IMU shows activity (tolerant debounce)
+            #                       None  = IMU unavailable   (normal debounce)
+            imu_rest_agreement   = imu_at_rest   if imu_valid else None
+            imu_motion_agreement = imu_in_motion if imu_valid else None
+
+        elif imu_valid:
+            # GNSS unavailable — IMU-only mode (tunnel / GNSS outage)
+            is_rest_candidate    = imu_at_rest
+            is_motion_candidate  = imu_in_motion
+            imu_rest_agreement   = imu_at_rest
+            imu_motion_agreement = imu_in_motion
+            gnss_at_rest = gnss_in_motion = False
+
         else:
-            # Neither valid
-            is_rest_candidate = False
-            is_motion_candidate = False
+            # Neither sensor valid (bench testing or sensor initialization phase)
+            is_rest_candidate   = (speed < self.rest_speed_threshold)
+            is_motion_candidate = (speed > self.stop_speed_gate)
+            imu_rest_agreement = imu_motion_agreement = None
+            gnss_at_rest = gnss_in_motion = False
 
         metrics = {
-            "speed_kmh": speed,
-            "gps_valid": gps_valid,
-            "imu_valid": imu_valid,
-            "dyn_accel": round(dyn_accel, 4),
-            "gyro_mag": round(gyro_mag, 4),
-            "gnss_at_rest": gnss_at_rest,
-            "gnss_in_motion": gnss_in_motion,
-            "imu_at_rest": imu_at_rest,
-            "imu_in_motion": imu_in_motion,
-            "is_rest_candidate": is_rest_candidate,
-            "is_motion_candidate": is_motion_candidate,
+            "speed_kmh":            speed,
+            "gps_valid":            gps_valid,
+            "imu_valid":            imu_valid,
+            "dyn_accel":            round(dyn_accel, 4),
+            "gyro_mag":             round(gyro_mag, 4),
+            "gnss_at_rest":         gnss_at_rest,
+            "gnss_in_motion":       gnss_in_motion,
+            "imu_at_rest":          imu_at_rest,
+            "imu_in_motion":        imu_in_motion,
+            "imu_rest_agreement":   imu_rest_agreement,
+            "imu_motion_agreement": imu_motion_agreement,
+            "is_rest_candidate":    is_rest_candidate,
+            "is_motion_candidate":  is_motion_candidate,
         }
         return is_rest_candidate, is_motion_candidate, metrics
 
@@ -298,72 +330,95 @@ class VehicleStopDetector:
                 if self._rest_candidate_start is None:
                     # First frame where vehicle is at rest — record when it started
                     self._rest_candidate_start = now_mono
-                elif (now_mono - self._rest_candidate_start) >= self.rest_confirm_sec:
-                    # Vehicle has been continuously at rest for rest_confirm_sec —
-                    # register the stop. Backdate start_mono to when rest FIRST began
-                    # so the confirmation window is included in the final stop duration.
-                    rest_began_at = self._rest_candidate_start
+                # Adaptive debounce based on IMU momentum agreement:
+                #   Both GNSS + IMU confirm rest  → short   (0.6× base = 0.6 s)
+                #   GNSS stop, IMU still active   → tolerant (1.5× base = 1.5 s)
+                #   IMU unavailable               → normal  (1.0× base = 1.0 s)
+                imu_agree = metrics.get("imu_rest_agreement")
+                if imu_agree is True:
+                    eff_debounce = self.rest_debounce_sec * 0.6
+                    agree_label  = "GNSS+IMU agree → fast confirm"
+                elif imu_agree is False:
+                    eff_debounce = self.rest_debounce_sec * 1.5
+                    agree_label  = "GNSS stop, IMU active → extended confirm"
+                else:
+                    eff_debounce = self.rest_debounce_sec
+                    agree_label  = "GNSS-only (IMU unavailable)"
 
+                if (now_mono - self._rest_candidate_start) >= eff_debounce:
+                    confirm_elapsed = round(now_mono - self._rest_candidate_start, 1)
+                    # Vehicle confirmed at rest → start stop event
                     self.state = "STOPPED"
-                    self._rest_candidate_start = None
+                    self._rest_candidate_start  = None
                     self._motion_candidate_start = None
                     self._current_stop_id += 1
 
                     self.active_stop = StopEventRecord(
                         stop_id=self._current_stop_id,
-                        start_mono=rest_began_at,          # backdated to first rest frame
+                        start_mono=now_mono,
                         start_rtc=rtc_str,
                         start_lat=latitude,
                         start_lon=longitude,
                     )
                     event_just_started = True
 
-                    confirm_elapsed = round(now_mono - rest_began_at, 1)
                     print("=" * 70)
-                    print(f"[VEHICLE REST CONFIRMED] Stop #{self._current_stop_id} Started")
+                    print(f"[VEHICLE STOP DETECTED] Stop #{self._current_stop_id} Started")
                     print("-" * 70)
                     print(f"  Timestamp (RTC):  {rtc_str}")
                     if latitude is not None and longitude is not None:
                         print(f"  Location:         ({latitude:.8f}, {longitude:.8f})")
-                    print(f"  GNSS Speed:       {metrics['speed_kmh']:.1f} km/h (Rest threshold: < {self.rest_speed_threshold:.1f} km/h)")
+                    print(f"  GNSS Speed:       {metrics['speed_kmh']:.1f} km/h (< {self.rest_speed_threshold:.1f} km/h)")
                     if metrics["imu_valid"]:
-                        print(f"  IMU Dynamics:     dyn_accel: {metrics['dyn_accel']:.3f} m/s2 | gyro_mag: {metrics['gyro_mag']:.2f} deg/s (Stationary: [OK])")
-                    print(f"  Confirm Duration: {confirm_elapsed:.1f}s sustained rest (threshold: {self.rest_confirm_sec:.1f}s)")
-                    print(f"  Stop Timer:       Backdated to rest onset — timer already at +{confirm_elapsed:.1f}s")
-                    print("  Status:           Stop timer running. Monitoring for camera motion captures...")
+                        print(f"  IMU Dynamics:     dyn_accel: {metrics['dyn_accel']:.3f} m/s² | "
+                              f"gyro_mag: {metrics['gyro_mag']:.2f} °/s | {'at rest' if metrics['imu_at_rest'] else 'active'}")
+                    print(f"  Sensor Fusion:    {agree_label} (debounce: {eff_debounce:.1f}s, confirmed in {confirm_elapsed:.1f}s)")
+                    print(f"  Status:           Stop timer started. House status unchanged until camera frame confirmed.")
                     print("=" * 70)
             else:
                 # Rest condition broken — reset the timer entirely
                 self._rest_candidate_start = None
 
         elif self.state == "STOPPED":
-            # Update live duration
-            if self.active_stop is not None:
-                self.active_stop.duration_sec = max(0.0, now_mono - self.active_stop.start_mono)
-
-            # Check for vehicle resuming motion (Speed > 5.0 km/h via GNSS and IMU)
+            # Check for vehicle resuming motion
             if is_motion_cand:
                 if self._motion_candidate_start is None:
                     self._motion_candidate_start = now_mono
-                elif (now_mono - self._motion_candidate_start) >= self.motion_debounce_sec:
-                    # Vehicle confirmed back in motion -> end stop event
+
+                # Adaptive debounce for motion detection:
+                #   Both GNSS + IMU confirm motion → short   (0.5× = 0.3 s)
+                #   GNSS motion, IMU still quiet   → tolerant (1.2× = 0.72 s)
+                #   IMU unavailable               → normal  (1.0× = 0.6 s)
+                imu_agree_m = metrics.get("imu_motion_agreement")
+                if imu_agree_m is True:
+                    eff_motion_debounce = self.motion_debounce_sec * 0.5
+                    m_agree_label       = "GNSS+IMU agree → fast confirm"
+                elif imu_agree_m is False:
+                    eff_motion_debounce = self.motion_debounce_sec * 1.2
+                    m_agree_label       = "GNSS motion, IMU quiet → extended confirm"
+                else:
+                    eff_motion_debounce = self.motion_debounce_sec
+                    m_agree_label       = "GNSS-only (IMU unavailable)"
+
+                if (now_mono - self._motion_candidate_start) >= eff_motion_debounce:
+                    # Vehicle confirmed back in motion → end stop event
                     self.state = "MOVING"
                     self._motion_candidate_start = None
-                    self._rest_candidate_start = None
+                    self._rest_candidate_start   = None
 
                     if self.active_stop is not None:
-                        self.active_stop.end_mono = now_mono
-                        self.active_stop.end_rtc = rtc_str
-                        self.active_stop.end_lat = latitude
-                        self.active_stop.end_lon = longitude
-                        self.active_stop.duration_sec = max(0.0, now_mono - self.active_stop.start_mono)
+                        self.active_stop.end_mono         = now_mono
+                        self.active_stop.end_rtc          = rtc_str
+                        self.active_stop.end_lat          = latitude
+                        self.active_stop.end_lon          = longitude
+                        self.active_stop.duration_sec     = max(0.0, now_mono - self.active_stop.start_mono)
                         self.active_stop.trigger_speed_kmh = metrics["speed_kmh"]
                         self.active_stop.end_reason = (
-                            f"Vehicle back in motion (Speed: {metrics['speed_kmh']:.1f} km/h > {self.stop_speed_gate:.1f} km/h "
-                            f"| GNSS & IMU confirmed [dyn_accel: {metrics['dyn_accel']:.2f} m/s2, gyro: {metrics['gyro_mag']:.1f} deg/s])"
+                            f"Vehicle back in motion: Speed rose above {self.stop_speed_gate:.1f} km/h "
+                            f"(current: {metrics['speed_kmh']:.1f} km/h) | {m_agree_label} | "
+                            f"{'No frames captured — house status unchanged' if not self.active_stop.captures else f'{len(self.active_stop.captures)} frame(s) captured'}"
                         )
 
-                        # Output comprehensive summary report detailing all previous logs & captures
                         summary_report = self.active_stop.format_summary()
                         print("\n" + summary_report + "\n")
 
@@ -374,7 +429,9 @@ class VehicleStopDetector:
             else:
                 self._motion_candidate_start = None
 
-        current_duration = self.active_stop.duration_sec if self.active_stop else 0.0
+        # Use the single authoritative monotonic counter for the returned duration.
+        # active_stop.duration_sec is only written at stop-end (for the summary report).
+        current_duration = self.get_stop_duration(now_mono)
         current_capture_count = len(self.active_stop.captures) if self.active_stop else 0
         current_stop_id = self.active_stop.stop_id if self.active_stop else (self._current_stop_id if self.state == "STOPPED" else 0)
 
