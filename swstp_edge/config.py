@@ -121,14 +121,17 @@ GNSS_FALLBACK_TIMEOUT_SEC  = 20
 GNSS_FALLBACK_REFRESH_SEC  = 300
 
 # ---------------------------------------------------------------------------
-# Motion detection parameters
+# Motion detection parameters (Robust against shadows, lighting & reflections)
 # ---------------------------------------------------------------------------
-DIFF_THRESHOLD    = 22
-MIN_CONTOUR_AREA  = 350
-BG_ALPHA          = 0.04
-WARMUP_FRAMES     = 30
-SAVE_COOLDOWN_SEC = 5.0        # 5-second buffer between motion captures
-FRAME_SIZE        = (320, 180) # Downsampled resolution for motion processing
+DIFF_THRESHOLD             = 30     # Pixel difference threshold (higher = filters soft shadows/ambient drift)
+MIN_CONTOUR_AREA           = 700    # Min contour pixel area at downsampled FRAME_SIZE (filters small reflection glints)
+MAX_MOTION_AREA_RATIO      = 0.55   # If motion covers > 55% of ROI, treat as global lighting shock (headlights/sun/auto-exposure)
+BG_ALPHA                   = 0.05   # Background model learning rate under normal steady state
+FAST_BG_ALPHA              = 0.25   # Accelerated adaptation rate when global lighting shock is detected
+MOTION_CONSECUTIVE_FRAMES  = 2      # Consecutive frames of confirmed motion required before capture (rejects 1-frame flashes)
+WARMUP_FRAMES              = 30
+SAVE_COOLDOWN_SEC          = 5.0    # 5-second buffer between motion captures
+FRAME_SIZE                 = (320, 180) # Downsampled resolution for motion processing
 
 # ---------------------------------------------------------------------------
 # Vehicle Stop & Motion Detection Parameters (Dual GNSS + IMU)
@@ -137,8 +140,9 @@ STOP_SPEED_GATE            = 5.0    # km/h threshold: speed > 5.0 km/h ends stop
 REST_SPEED_THRESHOLD_KMH   = 3.0    # km/h: speed < 3.0 km/h indicates candidate rest
 IMU_REST_ACCEL_TOLERANCE   = 0.45   # m/s² max dynamic acceleration deviation
 IMU_REST_GYRO_TOLERANCE    = 4.0    # deg/s max angular velocity magnitude for rest
-REST_DEBOUNCE_SEC          = 1.0    # Sustained seconds of rest required to confirm stop
-MOTION_DEBOUNCE_SEC        = 0.6    # Sustained seconds of motion to confirm stop end
+REST_CONFIRM_SEC           = 3.0    # Sustained seconds vehicle must be at rest before stop is registered
+                                     # Start time is BACKDATED to when rest first began so full duration counts
+MOTION_DEBOUNCE_SEC        = 2.0    # Sustained seconds of motion required to confirm stop has ended
 
 # ---------------------------------------------------------------------------
 # Litter Detection Parameters

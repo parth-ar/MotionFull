@@ -66,6 +66,7 @@ from config import (
     DEFAULT_BACKEND_URL, DEFAULT_ULB_ID, DEFAULT_STREAM_FPS,
     ENABLE_GPS_FALLBACK, GNSS_FALLBACK_TIMEOUT_SEC,
     LITTER_WEIGHTS, LITTER_DISTANCE_INTERVAL_M,
+    MAX_MOTION_AREA_RATIO, FAST_BG_ALPHA, MOTION_CONSECUTIVE_FRAMES,
 )
 
 import sensors.rtc  as rtc_sensor
@@ -495,6 +496,7 @@ def main() -> None:
     last_save_time = 0.0
     saved_count    = 0
     last_known_frame = None
+    consecutive_motion_frames = 0
 
     stop_detector = VehicleStopDetector()
 
@@ -612,8 +614,9 @@ def main() -> None:
             if not success:
                 if is_file and LOOP_VIDEO:
                     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                    bg_model    = None
-                    frame_count = 0
+                    bg_model                  = None
+                    frame_count               = 0
+                    consecutive_motion_frames = 0
                     continue
                 elif is_file:
                     print(f"[CAMERA] End of video file '{source}'.")
@@ -626,8 +629,9 @@ def main() -> None:
                         pass
                     cap = None
                     hardware_state["camera"] = {"detected": False, "source": None, "resolution": "N/A", "fps": 0}
-                    bg_model    = None
-                    frame_count = 0
+                    bg_model                  = None
+                    frame_count               = 0
+                    consecutive_motion_frames = 0
                     if hasattr(_motion, "reset_tracking"):
                         try:
                             _motion.reset_tracking()
@@ -684,31 +688,73 @@ def main() -> None:
                         print(f"\n[CAMERA] Camera feed {'ACTIVATED / ON' if _motion.camera_feed_active else 'PAUSED / OFF'}.")
                 continue
 
-            # ── 6. Background subtraction ─────────────────────────────────
+            # ── 6. Background subtraction & robust motion filtering ──────
             bg_uint8 = cv2.convertScaleAbs(bg_model)
             diff     = cv2.absdiff(bg_uint8, gray_blur)
             _, thresh = cv2.threshold(diff, DIFF_THRESHOLD, 255, cv2.THRESH_BINARY)
 
-            thresh  = apply_polygon_roi_mask(thresh, roi_pts, FRAME_SIZE[0], FRAME_SIZE[1])
-            dilated = cv2.dilate(thresh, None, iterations=1)
+            # Apply Area of Interest (ROI) mask
+            thresh = apply_polygon_roi_mask(thresh, roi_pts, proc_w, proc_h)
 
-            cnts = cv2.findContours(dilated.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            cnts = imutils.grab_contours(cnts)
+            # Morphological opening (3x3) removes isolated noise, single-pixel glints,
+            # and specular reflection specks before dilation can expand them
+            kernel_open = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+            opened = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel_open)
 
-            motion_detected = False
-            box_thickness   = max(2, int(min(scale_x, scale_y)))
+            # Calculate active ROI area for lighting change evaluation
+            if roi_pts and len(roi_pts) >= 3:
+                pts_roi = [
+                    [int(p[0] * proc_w) if p[0] <= 1.0 else int(p[0]),
+                     int(p[1] * proc_h) if p[1] <= 1.0 else int(p[1])]
+                    for p in roi_pts
+                ]
+                roi_area = max(100.0, float(cv2.contourArea(np.array(pts_roi, dtype=np.int32))))
+            else:
+                roi_area = float(proc_w * proc_h)
 
-            for c in cnts:
-                if cv2.contourArea(c) < MIN_CONTOUR_AREA:
-                    continue
-                motion_detected = True
-                (x, y, w, h) = cv2.boundingRect(c)
-                orig_x, orig_y   = int(x * scale_x), int(y * scale_y)
-                orig_bw, orig_bh = int(w * scale_x), int(h * scale_y)
-                cv2.rectangle(orig_frame,
-                              (orig_x, orig_y),
-                              (orig_x + orig_bw, orig_y + orig_bh),
-                              (0, 255, 0), box_thickness)
+            # Global illumination / sudden lighting shock check (e.g. headlights, sunburst, auto-exposure):
+            # If changed pixels cover > MAX_MOTION_AREA_RATIO of the ROI, reject as ambient lighting shock
+            motion_pixels = cv2.countNonZero(opened)
+            is_lighting_shock = (motion_pixels / roi_area) > MAX_MOTION_AREA_RATIO
+
+            box_thickness = max(2, int(min(scale_x, scale_y)))
+
+            if is_lighting_shock:
+                # Rapidly re-adapt the background model to the new illumination level
+                cv2.accumulateWeighted(gray_blur, bg_model, FAST_BG_ALPHA)
+                consecutive_motion_frames = 0
+                motion_detected = False
+                text_scale = max(0.5, (orig_h / 480.0) * 0.5)
+                cv2.putText(orig_frame, "LIGHTING ADAPTING",
+                            (10, int(55 * text_scale)),
+                            cv2.FONT_HERSHEY_SIMPLEX, text_scale,
+                            (0, 215, 255), max(1, int(orig_h / 360)), cv2.LINE_AA)
+            else:
+                # Dilation (iterations=2) bridges adjacent contours within physical moving bodies
+                dilated = cv2.dilate(opened, None, iterations=2)
+                cnts = cv2.findContours(dilated.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                cnts = imutils.grab_contours(cnts)
+
+                candidate_motion = False
+                for c in cnts:
+                    if cv2.contourArea(c) < MIN_CONTOUR_AREA:
+                        continue
+                    candidate_motion = True
+                    (x, y, w, h) = cv2.boundingRect(c)
+                    orig_x, orig_y   = int(x * scale_x), int(y * scale_y)
+                    orig_bw, orig_bh = int(w * scale_x), int(h * scale_y)
+                    cv2.rectangle(orig_frame,
+                                  (orig_x, orig_y),
+                                  (orig_x + orig_bw, orig_y + orig_bh),
+                                  (0, 255, 0), box_thickness)
+
+                if candidate_motion:
+                    consecutive_motion_frames += 1
+                else:
+                    consecutive_motion_frames = 0
+
+                # Require sustained motion across consecutive frames to reject 1-frame glints/reflections
+                motion_detected = (consecutive_motion_frames >= MOTION_CONSECUTIVE_FRAMES)
 
             # ── 7. Draw Area of Interest polygon overlay ──────────────────
             draw_area_of_interest_overlay(orig_frame, roi_pts, motion_detected=motion_detected)
@@ -768,6 +814,11 @@ def main() -> None:
             latest_sensor["stop_duration_sec"]    = current_event_duration
             latest_sensor["stop_event_id"]        = current_stop_id
             latest_sensor["stop_capture_count"]   = current_capture_count
+            # Pending-confirm state: non-zero only while vehicle is being observed at rest
+            # but has not yet met the REST_CONFIRM_SEC threshold. Used by overlay to display
+            # "CONFIRMING STOP..." progress in the bottom metadata strip.
+            latest_sensor["pending_rest_sec"]     = stop_status.get("pending_rest_sec", 0.0)
+            latest_sensor["rest_confirm_sec"]     = stop_status.get("rest_confirm_sec", 3.0)
 
             display_frame = overlay_metadata(orig_frame.copy(), litter_engine)
 

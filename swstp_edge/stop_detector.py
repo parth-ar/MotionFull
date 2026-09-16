@@ -7,9 +7,12 @@ This module owns:
      timestamps, GPS coordinates, elapsed stop duration, and all motion captures.
   3. VehicleStopDetector — state machine managing MOVING vs STOPPED states:
      - Detects rest using GNSS speed (< 3.0 km/h) AND IMU dynamics (accel & gyro tolerances).
-     - Starts stop timer when rest is confirmed.
+     - Rest must be sustained for REST_CONFIRM_SEC (default 3 s) before a stop is registered.
+       The stop start time is BACKDATED to when rest first began, so the confirm window is
+       included in the final stop duration for accurate reporting.
      - Tracks all motion frames captured during the stop without any idle timeout.
-     - Concludes the stop when vehicle resumes motion (speed > 5.0 km/h via GNSS & IMU).
+     - Concludes the stop when vehicle resumes motion (speed > 5.0 km/h via GNSS & IMU),
+       sustained for MOTION_DEBOUNCE_SEC (default 2 s).
      - Emits a comprehensive historical summary report of the stop event upon completion.
 """
 
@@ -27,7 +30,7 @@ try:
         REST_SPEED_THRESHOLD_KMH,
         IMU_REST_ACCEL_TOLERANCE,
         IMU_REST_GYRO_TOLERANCE,
-        REST_DEBOUNCE_SEC,
+        REST_CONFIRM_SEC,
         MOTION_DEBOUNCE_SEC,
     )
 except ImportError:
@@ -35,8 +38,8 @@ except ImportError:
     REST_SPEED_THRESHOLD_KMH = 3.0
     IMU_REST_ACCEL_TOLERANCE = 0.45
     IMU_REST_GYRO_TOLERANCE  = 4.0
-    REST_DEBOUNCE_SEC        = 1.0
-    MOTION_DEBOUNCE_SEC      = 0.6
+    REST_CONFIRM_SEC         = 3.0
+    MOTION_DEBOUNCE_SEC      = 2.0
 
 
 # ---------------------------------------------------------------------------
@@ -135,12 +138,15 @@ class VehicleStopDetector:
 
     Logic:
       1. REST: GNSS speed < 3.0 km/h AND IMU stationary (dyn_accel < tolerance, gyro < tolerance).
-         Debounced for REST_DEBOUNCE_SEC -> enters STOPPED state, begins stop timer.
+         Must be sustained for REST_CONFIRM_SEC (default 3 s) continuously before the stop is
+         registered. The stop start time is backdated to when rest first began, so the confirm
+         window is counted in the final stop duration. Any break in the rest condition resets
+         the timer, preventing phantom stops from brief speed dips.
       2. STOPPED: Stop timer runs continuously. Camera motion idle timeout is REMOVED.
          Captures during stop are registered and kept in history.
       3. MOTION: Vehicle speed > 5.0 km/h confirmed by GNSS and IMU.
-         Debounced for MOTION_DEBOUNCE_SEC -> enters MOVING state, concludes stop,
-         and outputs full summary report containing all previous logs.
+         Sustained for MOTION_DEBOUNCE_SEC (default 2 s) -> enters MOVING state, concludes
+         stop, and outputs full summary report containing all previous logs.
     """
 
     def __init__(
@@ -149,14 +155,14 @@ class VehicleStopDetector:
         rest_speed_threshold: float = REST_SPEED_THRESHOLD_KMH,
         imu_accel_tolerance: float = IMU_REST_ACCEL_TOLERANCE,
         imu_gyro_tolerance: float = IMU_REST_GYRO_TOLERANCE,
-        rest_debounce_sec: float = REST_DEBOUNCE_SEC,
+        rest_confirm_sec: float = REST_CONFIRM_SEC,
         motion_debounce_sec: float = MOTION_DEBOUNCE_SEC,
     ):
         self.stop_speed_gate = stop_speed_gate
         self.rest_speed_threshold = rest_speed_threshold
         self.imu_accel_tolerance = imu_accel_tolerance
         self.imu_gyro_tolerance = imu_gyro_tolerance
-        self.rest_debounce_sec = rest_debounce_sec
+        self.rest_confirm_sec = rest_confirm_sec
         self.motion_debounce_sec = motion_debounce_sec
 
         self.state: str = "MOVING"  # "MOVING" | "STOPPED"
@@ -164,7 +170,9 @@ class VehicleStopDetector:
         self.active_stop: Optional[StopEventRecord] = None
         self.history: List[StopEventRecord] = []
 
-        # Debouncing state
+        # Candidate timing state
+        # _rest_candidate_start: monotonic time when the vehicle FIRST became a rest candidate.
+        # The stop start is backdated to this timestamp so the confirm window counts in duration.
         self._rest_candidate_start: Optional[float] = None
         self._motion_candidate_start: Optional[float] = None
         self._last_completed_event: Optional[StopEventRecord] = None
@@ -288,9 +296,14 @@ class VehicleStopDetector:
         if self.state == "MOVING":
             if is_rest_cand:
                 if self._rest_candidate_start is None:
+                    # First frame where vehicle is at rest — record when it started
                     self._rest_candidate_start = now_mono
-                elif (now_mono - self._rest_candidate_start) >= self.rest_debounce_sec:
-                    # Vehicle confirmed at rest -> start stop event
+                elif (now_mono - self._rest_candidate_start) >= self.rest_confirm_sec:
+                    # Vehicle has been continuously at rest for rest_confirm_sec —
+                    # register the stop. Backdate start_mono to when rest FIRST began
+                    # so the confirmation window is included in the final stop duration.
+                    rest_began_at = self._rest_candidate_start
+
                     self.state = "STOPPED"
                     self._rest_candidate_start = None
                     self._motion_candidate_start = None
@@ -298,25 +311,29 @@ class VehicleStopDetector:
 
                     self.active_stop = StopEventRecord(
                         stop_id=self._current_stop_id,
-                        start_mono=now_mono,
+                        start_mono=rest_began_at,          # backdated to first rest frame
                         start_rtc=rtc_str,
                         start_lat=latitude,
                         start_lon=longitude,
                     )
                     event_just_started = True
 
+                    confirm_elapsed = round(now_mono - rest_began_at, 1)
                     print("=" * 70)
-                    print(f"[VEHICLE REST DETECTED] Stop #{self._current_stop_id} Started")
+                    print(f"[VEHICLE REST CONFIRMED] Stop #{self._current_stop_id} Started")
                     print("-" * 70)
-                    print(f"  Timestamp (RTC): {rtc_str}")
+                    print(f"  Timestamp (RTC):  {rtc_str}")
                     if latitude is not None and longitude is not None:
-                        print(f"  Location:        ({latitude:.8f}, {longitude:.8f})")
-                    print(f"  GNSS Speed:      {metrics['speed_kmh']:.1f} km/h (Rest threshold: < {self.rest_speed_threshold:.1f} km/h)")
+                        print(f"  Location:         ({latitude:.8f}, {longitude:.8f})")
+                    print(f"  GNSS Speed:       {metrics['speed_kmh']:.1f} km/h (Rest threshold: < {self.rest_speed_threshold:.1f} km/h)")
                     if metrics["imu_valid"]:
-                        print(f"  IMU Dynamics:    dyn_accel: {metrics['dyn_accel']:.3f} m/s2 | gyro_mag: {metrics['gyro_mag']:.2f} deg/s (Stationary: [OK])")
-                    print("  Status:          Stop timer started. Monitoring for camera motion captures...")
+                        print(f"  IMU Dynamics:     dyn_accel: {metrics['dyn_accel']:.3f} m/s2 | gyro_mag: {metrics['gyro_mag']:.2f} deg/s (Stationary: [OK])")
+                    print(f"  Confirm Duration: {confirm_elapsed:.1f}s sustained rest (threshold: {self.rest_confirm_sec:.1f}s)")
+                    print(f"  Stop Timer:       Backdated to rest onset — timer already at +{confirm_elapsed:.1f}s")
+                    print("  Status:           Stop timer running. Monitoring for camera motion captures...")
                     print("=" * 70)
             else:
+                # Rest condition broken — reset the timer entirely
                 self._rest_candidate_start = None
 
         elif self.state == "STOPPED":
@@ -361,6 +378,13 @@ class VehicleStopDetector:
         current_capture_count = len(self.active_stop.captures) if self.active_stop else 0
         current_stop_id = self.active_stop.stop_id if self.active_stop else (self._current_stop_id if self.state == "STOPPED" else 0)
 
+        # Pending-rest seconds: how long the vehicle has been in the rest-candidate window
+        # before the stop is officially confirmed. 0.0 when already STOPPED or MOVING normally.
+        if self.state == "MOVING" and self._rest_candidate_start is not None:
+            pending_rest_sec = max(0.0, now_mono - self._rest_candidate_start)
+        else:
+            pending_rest_sec = 0.0
+
         return {
             "state": self.state,
             "is_stopped": self.is_stopped,
@@ -372,6 +396,8 @@ class VehicleStopDetector:
             "last_completed_event": self._last_completed_event,
             "active_stop": self.active_stop,
             "metrics": metrics,
+            "pending_rest_sec": pending_rest_sec,      # 0.0 unless actively confirming a rest
+            "rest_confirm_sec": self.rest_confirm_sec,  # threshold for overlay progress display
         }
 
     def record_capture(self, meta: Dict[str, Any], now_mono: Optional[float] = None) -> Optional[StopCaptureItem]:

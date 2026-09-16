@@ -390,14 +390,19 @@ def overlay_metadata(frame, litter_engine=None):
     except Exception:
         pwr_badge = "PWR:OK"
 
-    is_veh_stopped = bool(latest_sensor.get("is_vehicle_stopped"))
-    stop_sec = int(latest_sensor.get("stop_duration_sec") or 0)
-    stop_caps = int(latest_sensor.get("stop_capture_count") or 0)
+    is_veh_stopped   = bool(latest_sensor.get("is_vehicle_stopped"))
+    stop_sec         = int(latest_sensor.get("stop_duration_sec") or 0)
+    stop_caps        = int(latest_sensor.get("stop_capture_count") or 0)
+    pending_rest_sec = float(latest_sensor.get("pending_rest_sec") or 0.0)
+    rest_confirm_sec = float(latest_sensor.get("rest_confirm_sec") or 3.0)
+    curr_spd         = float(latest_sensor.get("speed") or 0.0)
     mins, s = divmod(stop_sec, 60)
     if is_veh_stopped:
         veh_badge = f"VEH:STOP({mins:02d}:{s:02d}|{stop_caps}c)"
+    elif pending_rest_sec > 0.0:
+        # Actively confirming a rest — show progress toward confirm threshold
+        veh_badge = f"VEH:CONFIRMING({pending_rest_sec:.1f}/{rest_confirm_sec:.0f}s)"
     else:
-        curr_spd = float(latest_sensor.get("speed") or 0.0)
         veh_badge = f"VEH:MOV({curr_spd:.1f}kph)"
 
     hud_text = f"[SWSTP-PI] {cam_badge} | {rtc_badge} | {imu_badge} | {gps_badge} | {veh_badge} | {pwr_badge} | {net_badge}"
@@ -410,8 +415,22 @@ def overlay_metadata(frame, litter_engine=None):
     if is_veh_stopped:
         stop_info_text = f" | [STOP #{latest_sensor.get('stop_event_id', 1)}: {mins:02d}m {s:02d}s | Caps: {stop_caps}]"
         full_ts_text = f"{ts_text}{stop_info_text}"
+    elif pending_rest_sec > 0.0:
+        # Vehicle is in the rest-confirmation window — show countdown progress
+        bar_filled = int((pending_rest_sec / rest_confirm_sec) * 10)
+        bar_filled = min(bar_filled, 10)
+        bar = "█" * bar_filled + "░" * (10 - bar_filled)
+        full_ts_text = (
+            f"{ts_text}  |  "
+            f"[CONFIRMING STOP... {pending_rest_sec:.1f}s / {rest_confirm_sec:.0f}s  "
+            f"{bar}  spd: {curr_spd:.1f} km/h]"
+        )
     else:
-        full_ts_text = ts_text
+        # Vehicle is moving normally
+        full_ts_text = (
+            f"{ts_text}  |  "
+            f"[MOVING — {curr_spd:.1f} km/h  ↥ motion capture paused]"
+        )
 
     y_pos = h - strip_height + line_spacing
     cv2.putText(frame, full_ts_text, (12, y_pos), cv2.FONT_HERSHEY_SIMPLEX, font_scale, ts_color, thickness, cv2.LINE_AA)
