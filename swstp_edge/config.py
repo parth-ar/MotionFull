@@ -151,7 +151,7 @@ MOTION_DEBOUNCE_SEC        = 0.6    # seconds of sustained > 5 km/h to confirm m
 # Litter Detection Parameters
 # ---------------------------------------------------------------------------
 # Distance interval — trigger litter inference every N meters of GNSS travel
-LITTER_DISTANCE_INTERVAL_M   = 10.0
+LITTER_DISTANCE_INTERVAL_M   = 5.0
 
 # Grace period (seconds) on GNSS loss before falling back to clock-based trigger
 # Kept short so the clock fallback engages quickly and no litter frames are missed
