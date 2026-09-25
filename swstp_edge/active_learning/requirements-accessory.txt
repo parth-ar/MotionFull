@@ -1,0 +1,22 @@
+# =============================================================================
+# Active-Learning & Model Retraining Accessory Requirements
+# =============================================================================
+# NOTE: This accessory suite is designed for offline/workstation model tuning
+# and dataset curation. It is NOT required for running the main edge service
+# (swstp-unified.service / swstp_edge/main.py on the Pi 4B).
+#
+# Install with:
+#   pip install -r requirements-accessory.txt
+# =============================================================================
+
+# ── Core dependencies (review_app.py - runs on desktop or edge) ──────────────
+opencv-python>=4.8.0
+numpy>=1.24.0
+pyyaml>=6.0
+
+# ── Retraining & ONNX Export (retrain.py & export_onnx.py - workstation/GPU) ──
+# Required for model.train() and model.export(format="onnx")
+ultralytics>=8.0.0
+torch>=2.0.0
+torchvision>=0.15.0
+onnx>=1.14.0

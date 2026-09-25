@@ -3,7 +3,7 @@ main.py — SWSTP Unified Edge Gateway for Raspberry Pi 4B.
 
 Single executable entry point that runs BOTH:
   1. Motion Detection  — background-subtraction based, captures at vehicle stops.
-  2. Litter Detection  — YOLO inference triggered every 10 m of GNSS travel.
+  2. Litter Detection  — YOLO inference triggered every 5 m of GNSS travel.
 
 Camera access: ONE VideoCapture object opened here; the litter engine receives
                frame copies directly — no second camera handle is ever opened.
@@ -689,8 +689,13 @@ def main() -> None:
             latest_sensor["is_vehicle_stopped"]   = is_vehicle_stopped
             latest_sensor["vehicle_motion_state"] = stop_status["state"]
             latest_sensor["stop_duration_sec"]    = current_event_duration
+            latest_sensor["duration_formatted"]   = stop_status.get("duration_formatted", "")
             latest_sensor["stop_event_id"]        = current_stop_id
             latest_sensor["stop_capture_count"]   = current_capture_count
+            latest_sensor["drift_from_origin_m"]  = stop_status.get("drift_from_origin_m", 0.0)
+            latest_sensor["max_drift_m"]          = stop_status.get("max_drift_m", 0.0)
+            latest_sensor["pending_rest_sec"]     = stop_status.get("pending_rest_sec", 0.0)
+            latest_sensor["rest_confirm_sec"]     = stop_status.get("rest_confirm_sec", 1.0)
 
             # Gating condition: Motion detection is ACTIVE only when vehicle is confirmed STOPPED (< 5.0 km/h).
             # When moving (speed >= 5.0 km/h or vehicle not at stop), motion detection is on hold.
@@ -832,9 +837,9 @@ def main() -> None:
             with latest_frame_lock:
                 latest_stream_frame = (display_frame, time.monotonic())
 
-            # ── 8. Litter Detection — 10 m GNSS trigger ──────────────────
+            # ── 8. Litter Detection — 5 m GNSS trigger ──────────────────
             # Note: update_gnss() is called every frame (lightweight haversine check).
-            # try_trigger() only posts to queue when 10 m threshold is crossed.
+            # try_trigger() only posts to queue when 5 m threshold is crossed.
             if litter_engine is not None:
                 try:
                     # gnss_hardware_fix is True only for a real NavCast hardware fix.
@@ -905,6 +910,8 @@ def main() -> None:
                         "speed_kph":           round(float(vehicle_speed), 2),
                         "vehicle_speed_kmh":   round(float(vehicle_speed), 2),
                         "stop_duration_sec":   round(float(current_event_duration), 2),
+                        "drift_from_origin_m": round(float(stop_status.get("drift_from_origin_m", 0.0)), 2),
+                        "max_drift_m":          round(float(stop_status.get("max_drift_m", 0.0)), 2),
                         "motion_confidence":   0.95,
                         "saved_count":         saved_count,
                         "local_path":          local_path,

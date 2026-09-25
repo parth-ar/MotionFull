@@ -26,6 +26,7 @@ This module owns:
 
 from __future__ import annotations
 
+import collections
 import dataclasses
 import datetime
 import math
@@ -53,6 +54,34 @@ except ImportError:
     REST_DEBOUNCE_SEC        = 1.0
     REST_CONFIRM_SEC         = 1.0
     MOTION_DEBOUNCE_SEC      = 0.6
+
+
+# ---------------------------------------------------------------------------
+# Geodesy & Formatting Helpers (Self-Contained)
+# ---------------------------------------------------------------------------
+def haversine_distance_m(
+    lat1: Optional[float], lon1: Optional[float],
+    lat2: Optional[float], lon2: Optional[float]
+) -> float:
+    """Calculate great-circle distance between two GPS coordinates in meters."""
+    if lat1 is None or lon1 is None or lat2 is None or lon2 is None:
+        return 0.0
+    r = 6371000.0  # Earth radius in meters
+    p1, p2 = math.radians(float(lat1)), math.radians(float(lat2))
+    dp = math.radians(float(lat2) - float(lat1))
+    dl = math.radians(float(lon2) - float(lon1))
+    a = math.sin(dp / 2.0) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2.0) ** 2
+    return r * 2.0 * math.atan2(math.sqrt(a), math.sqrt(max(0.0, 1.0 - a)))
+
+
+def format_duration(duration_sec: float) -> str:
+    """Formats seconds into readable mm:ss or hh:mm:ss string."""
+    sec = int(max(0.0, duration_sec))
+    mins, s = divmod(sec, 60)
+    hrs, mins = divmod(mins, 60)
+    if hrs > 0:
+        return f"{hrs:02d}h {mins:02d}m {s:02d}s ({duration_sec:.1f}s)"
+    return f"{mins:02d}m {s:02d}s ({duration_sec:.1f}s)"
 
 
 # ---------------------------------------------------------------------------
@@ -100,6 +129,7 @@ class StopEventRecord:
     end_reason: str = ""
     trigger_speed_kmh: Optional[float] = None
     trigger_imu_summary: str = ""
+    max_drift_m: float = 0.0
 
     def get_duration_formatted(self) -> str:
         """Returns mm:ss or hh:mm:ss formatted string of duration."""
@@ -122,6 +152,7 @@ class StopEventRecord:
             f"  Total Stopped Duration: {self.get_duration_formatted()}",
             f"  Start Coordinates:      ({self.start_lat:.8f}, {self.start_lon:.8f})" if (self.start_lat is not None and self.start_lon is not None) else "  Start Coordinates:      N/A",
             f"  End Coordinates:        ({self.end_lat:.8f}, {self.end_lon:.8f})" if (self.end_lat is not None and self.end_lon is not None) else "  End Coordinates:        N/A",
+            f"  Stationary GNSS Drift:  Max displacement {self.max_drift_m:.2f} m from stop origin",
             f"  Conclusion Trigger:     {self.end_reason}",
             f"  Motion Frames Captured: {len(self.captures)} frame(s)",
         ]
@@ -170,6 +201,8 @@ class VehicleStopDetector:
         rest_debounce_sec: float = REST_DEBOUNCE_SEC,
         motion_debounce_sec: float = MOTION_DEBOUNCE_SEC,
         rest_confirm_sec: Optional[float] = None,
+        speed_smoothing_window: int = 1,
+        require_gps_fix: bool = False,
     ):
         self.stop_speed_gate = float(stop_speed_gate)
         self.rest_speed_threshold = float(rest_speed_threshold)
@@ -178,6 +211,8 @@ class VehicleStopDetector:
         self.rest_debounce_sec = float(rest_confirm_sec if rest_confirm_sec is not None else rest_debounce_sec)
         self.rest_confirm_sec = self.rest_debounce_sec
         self.motion_debounce_sec = float(motion_debounce_sec)
+        self.speed_smoothing_window = max(1, int(speed_smoothing_window))
+        self.require_gps_fix = bool(require_gps_fix)
 
         self.state: str = "MOVING"  # "MOVING" | "STOPPED"
         self._current_stop_id: int = 0
@@ -188,8 +223,16 @@ class VehicleStopDetector:
         # _rest_candidate_start: monotonic time when the vehicle FIRST became a rest candidate.
         # The stop start is backdated to this timestamp so the confirm window counts in duration.
         self._rest_candidate_start: Optional[float] = None
+        self._rest_candidate_rtc: Optional[str] = None
+        self._rest_candidate_lat: Optional[float] = None
+        self._rest_candidate_lon: Optional[float] = None
         self._motion_candidate_start: Optional[float] = None
         self._last_completed_event: Optional[StopEventRecord] = None
+
+        # Speed smoothing rolling buffer
+        self._speed_buffer: collections.deque[float] = collections.deque(
+            maxlen=self.speed_smoothing_window
+        )
 
     @property
     def is_stopped(self) -> bool:
@@ -205,6 +248,11 @@ class VehicleStopDetector:
     @property
     def current_stop_duration(self) -> float:
         return self.get_stop_duration()
+
+    def get_smoothed_speed(self, raw_speed: float) -> float:
+        """Applies rolling average to speed readings if smoothing window > 1."""
+        self._speed_buffer.append(raw_speed)
+        return sum(self._speed_buffer) / len(self._speed_buffer)
 
     def evaluate_sensors(
         self,
@@ -225,7 +273,8 @@ class VehicleStopDetector:
         Returns:
           (is_rest_candidate, is_motion_candidate, metrics_dict)
         """
-        speed = float(speed_kmh or 0.0)
+        raw_speed = float(speed_kmh or 0.0)
+        eff_speed = self.get_smoothed_speed(raw_speed)
 
         # ── IMU momentum dynamics ──────────────────────────────────────────
         # Computed from raw sensor regardless of GNSS state.
@@ -253,9 +302,11 @@ class VehicleStopDetector:
         # ── Fusion decision ──────────────────────────────────────────────────
         # GNSS is the gate; IMU agreement/disagreement is surfaced in metrics
         # so update() can apply an adaptive debounce.
-        if gps_valid:
-            gnss_at_rest    = speed < self.rest_speed_threshold   # < 5.0
-            gnss_in_motion  = speed > self.stop_speed_gate        # > 5.0
+        effective_gps_valid = gps_valid if self.require_gps_fix else (gps_valid or eff_speed > 0.0)
+
+        if effective_gps_valid:
+            gnss_at_rest    = eff_speed < self.rest_speed_threshold   # < 5.0
+            gnss_in_motion  = eff_speed > self.stop_speed_gate        # > 5.0
             is_rest_candidate   = gnss_at_rest
             is_motion_candidate = gnss_in_motion
             # imu_rest_agreement:   True  = IMU also at rest   (fast debounce)
@@ -274,13 +325,16 @@ class VehicleStopDetector:
 
         else:
             # Neither sensor valid (bench testing or sensor initialization phase)
-            is_rest_candidate   = (speed < self.rest_speed_threshold)
-            is_motion_candidate = (speed > self.stop_speed_gate)
+            gnss_at_rest    = eff_speed < self.rest_speed_threshold
+            gnss_in_motion  = eff_speed > self.stop_speed_gate
+            is_rest_candidate   = gnss_at_rest
+            is_motion_candidate = gnss_in_motion
             imu_rest_agreement = imu_motion_agreement = None
-            gnss_at_rest = gnss_in_motion = False
 
         metrics = {
-            "speed_kmh":            speed,
+            "speed_kmh":            eff_speed,
+            "raw_speed_kmh":        raw_speed,
+            "eff_speed_kmh":        eff_speed,
             "gps_valid":            gps_valid,
             "imu_valid":            imu_valid,
             "dyn_accel":            round(dyn_accel, 4),
@@ -299,7 +353,7 @@ class VehicleStopDetector:
     def update(
         self,
         vehicle_speed: Optional[float],
-        imu_data: Optional[Dict[str, Any]],
+        imu_data: Optional[Dict[str, Any]] = None,
         latitude: Optional[float] = None,
         longitude: Optional[float] = None,
         rtc_timestamp: Optional[str] = None,
@@ -308,7 +362,7 @@ class VehicleStopDetector:
     ) -> Dict[str, Any]:
         """
         Main update method called on every frame / sensor tick.
-        Handles debounced state transitions and timer updates.
+        Handles debounced state transitions, drift tracking, and timer updates.
         """
         if now_mono is None:
             now_mono = time.monotonic()
@@ -324,12 +378,16 @@ class VehicleStopDetector:
         event_just_started = False
         event_just_ended = False
         self._last_completed_event = None
+        drift_from_origin_m = 0.0
 
         if self.state == "MOVING":
             if is_rest_cand:
                 if self._rest_candidate_start is None:
                     # First frame where vehicle is at rest — record when it started
                     self._rest_candidate_start = now_mono
+                    self._rest_candidate_rtc = rtc_str
+                    self._rest_candidate_lat = latitude
+                    self._rest_candidate_lon = longitude
                 # Adaptive debounce based on IMU momentum agreement:
                 #   Both GNSS + IMU confirm rest  → short   (0.6× base = 0.6 s)
                 #   GNSS stop, IMU still active   → tolerant (1.5× base = 1.5 s)
@@ -347,39 +405,82 @@ class VehicleStopDetector:
 
                 if (now_mono - self._rest_candidate_start) >= eff_debounce:
                     confirm_elapsed = round(now_mono - self._rest_candidate_start, 1)
+
+                    # Backdate stop start to when rest condition FIRST started (start of debounce)
+                    cand_start_mono = self._rest_candidate_start
+                    cand_start_rtc  = self._rest_candidate_rtc or rtc_str
+                    cand_start_lat  = self._rest_candidate_lat if self._rest_candidate_lat is not None else latitude
+                    cand_start_lon  = self._rest_candidate_lon if self._rest_candidate_lon is not None else longitude
+
                     # Vehicle confirmed at rest → start stop event
                     self.state = "STOPPED"
                     self._rest_candidate_start  = None
+                    self._rest_candidate_rtc    = None
+                    self._rest_candidate_lat    = None
+                    self._rest_candidate_lon    = None
                     self._motion_candidate_start = None
                     self._current_stop_id += 1
 
+                    initial_duration = max(0.0, now_mono - cand_start_mono)
                     self.active_stop = StopEventRecord(
                         stop_id=self._current_stop_id,
-                        start_mono=now_mono,
-                        start_rtc=rtc_str,
-                        start_lat=latitude,
-                        start_lon=longitude,
+                        start_mono=cand_start_mono,
+                        start_rtc=cand_start_rtc,
+                        start_lat=cand_start_lat,
+                        start_lon=cand_start_lon,
+                        duration_sec=initial_duration,
                     )
                     event_just_started = True
+
+                    # Initial drift calculation from stop origin
+                    if (
+                        latitude is not None and longitude is not None
+                        and cand_start_lat is not None and cand_start_lon is not None
+                    ):
+                        drift_from_origin_m = haversine_distance_m(
+                            cand_start_lat, cand_start_lon,
+                            latitude, longitude
+                        )
+                        self.active_stop.max_drift_m = drift_from_origin_m
 
                     print("=" * 70)
                     print(f"[VEHICLE STOP DETECTED] Stop #{self._current_stop_id} Started")
                     print("-" * 70)
-                    print(f"  Timestamp (RTC):  {rtc_str}")
-                    if latitude is not None and longitude is not None:
-                        print(f"  Location:         ({latitude:.8f}, {longitude:.8f})")
-                    print(f"  GNSS Speed:       {metrics['speed_kmh']:.1f} km/h (< {self.rest_speed_threshold:.1f} km/h)")
+                    print(f"  Start Time (RTC): {cand_start_rtc} (confirmed at {rtc_str})")
+                    if cand_start_lat is not None and cand_start_lon is not None:
+                        print(f"  Location:         ({cand_start_lat:.8f}, {cand_start_lon:.8f})")
+                    print(f"  GNSS Speed:       {metrics['eff_speed_kmh']:.1f} km/h (< {self.rest_speed_threshold:.1f} km/h)")
                     if metrics["imu_valid"]:
                         print(f"  IMU Dynamics:     dyn_accel: {metrics['dyn_accel']:.3f} m/s² | "
                               f"gyro_mag: {metrics['gyro_mag']:.2f} °/s | {'at rest' if metrics['imu_at_rest'] else 'active'}")
                     print(f"  Sensor Fusion:    {agree_label} (debounce: {eff_debounce:.1f}s, confirmed in {confirm_elapsed:.1f}s)")
-                    print(f"  Status:           Stop timer started. House status unchanged until camera frame confirmed.")
+                    print(f"  Status:           Stop timer started ({self.active_stop.get_duration_formatted()} elapsed since rest began). House status unchanged until camera frame confirmed.")
                     print("=" * 70)
             else:
                 # Rest condition broken — reset the timer entirely
                 self._rest_candidate_start = None
+                self._rest_candidate_rtc   = None
+                self._rest_candidate_lat   = None
+                self._rest_candidate_lon   = None
 
         elif self.state == "STOPPED":
+            if self.active_stop is not None:
+                # Update continuous duration
+                self.active_stop.duration_sec = max(0.0, now_mono - self.active_stop.start_mono)
+
+                # Compute drift from stop origin
+                if (
+                    latitude is not None and longitude is not None
+                    and self.active_stop.start_lat is not None
+                    and self.active_stop.start_lon is not None
+                ):
+                    drift_from_origin_m = haversine_distance_m(
+                        self.active_stop.start_lat, self.active_stop.start_lon,
+                        latitude, longitude
+                    )
+                    if drift_from_origin_m > self.active_stop.max_drift_m:
+                        self.active_stop.max_drift_m = drift_from_origin_m
+
             # Check for vehicle resuming motion
             if is_motion_cand:
                 if self._motion_candidate_start is None:
@@ -405,6 +506,9 @@ class VehicleStopDetector:
                     self.state = "MOVING"
                     self._motion_candidate_start = None
                     self._rest_candidate_start   = None
+                    self._rest_candidate_rtc     = None
+                    self._rest_candidate_lat     = None
+                    self._rest_candidate_lon     = None
 
                     if self.active_stop is not None:
                         self.active_stop.end_mono         = now_mono
@@ -412,10 +516,10 @@ class VehicleStopDetector:
                         self.active_stop.end_lat          = latitude
                         self.active_stop.end_lon          = longitude
                         self.active_stop.duration_sec     = max(0.0, now_mono - self.active_stop.start_mono)
-                        self.active_stop.trigger_speed_kmh = metrics["speed_kmh"]
+                        self.active_stop.trigger_speed_kmh = metrics["eff_speed_kmh"]
                         self.active_stop.end_reason = (
                             f"Vehicle back in motion: Speed rose above {self.stop_speed_gate:.1f} km/h "
-                            f"(current: {metrics['speed_kmh']:.1f} km/h) | {m_agree_label} | "
+                            f"(current: {metrics['eff_speed_kmh']:.1f} km/h) | {m_agree_label} | "
                             f"{'No frames captured — house status unchanged' if not self.active_stop.captures else f'{len(self.active_stop.captures)} frame(s) captured'}"
                         )
 
@@ -429,8 +533,20 @@ class VehicleStopDetector:
             else:
                 self._motion_candidate_start = None
 
+        # Debounce progress calculations for status display / overlay HUD
+        rest_debounce_progress = 0.0
+        if self.state == "MOVING" and self._rest_candidate_start is not None:
+            rest_debounce_progress = min(
+                1.0, (now_mono - self._rest_candidate_start) / max(0.001, self.rest_debounce_sec)
+            )
+
+        motion_debounce_progress = 0.0
+        if self.state == "STOPPED" and self._motion_candidate_start is not None:
+            motion_debounce_progress = min(
+                1.0, (now_mono - self._motion_candidate_start) / max(0.001, self.motion_debounce_sec)
+            )
+
         # Use the single authoritative monotonic counter for the returned duration.
-        # active_stop.duration_sec is only written at stop-end (for the summary report).
         current_duration = self.get_stop_duration(now_mono)
         current_capture_count = len(self.active_stop.captures) if self.active_stop else 0
         current_stop_id = self.active_stop.stop_id if self.active_stop else (self._current_stop_id if self.state == "STOPPED" else 0)
@@ -446,8 +562,11 @@ class VehicleStopDetector:
             "state": self.state,
             "is_stopped": self.is_stopped,
             "duration_sec": current_duration,
+            "duration_formatted": self.active_stop.get_duration_formatted() if self.active_stop else format_duration(current_duration),
             "stop_event_id": current_stop_id,
             "capture_count": current_capture_count,
+            "drift_from_origin_m": round(drift_from_origin_m, 2),
+            "max_drift_m": round(self.active_stop.max_drift_m, 2) if self.active_stop else 0.0,
             "event_just_started": event_just_started,
             "event_just_ended": event_just_ended,
             "last_completed_event": self._last_completed_event,
@@ -455,6 +574,8 @@ class VehicleStopDetector:
             "metrics": metrics,
             "pending_rest_sec": pending_rest_sec,      # 0.0 unless actively confirming a rest
             "rest_confirm_sec": self.rest_confirm_sec,  # threshold for overlay progress display
+            "rest_debounce_progress": rest_debounce_progress,
+            "motion_debounce_progress": motion_debounce_progress,
         }
 
     def record_capture(self, meta: Dict[str, Any], now_mono: Optional[float] = None) -> Optional[StopCaptureItem]:
@@ -472,7 +593,7 @@ class VehicleStopDetector:
         item = StopCaptureItem(
             capture_seq=meta.get("saved_count", stop_frame_idx),
             stop_frame_idx=stop_frame_idx,
-            filename=meta.get("image_file", "unknown.jpg"),
+            filename=meta.get("image_file") or meta.get("filename", "unknown.jpg"),
             local_path=meta.get("local_path", ""),
             rtc_timestamp=meta.get("rtc_timestamp") or meta.get("captured_at") or "",
             stop_offset_sec=offset,

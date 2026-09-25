@@ -145,7 +145,7 @@ class TestVehicleStopDetection(unittest.TestCase):
             now_mono=t0 + 25.5,
         )
         self.assertEqual(res["state"], "STOPPED")
-        self.assertAlmostEqual(res["duration_sec"], 25.0, places=1)
+        self.assertAlmostEqual(res["duration_sec"], 25.5, places=1)
 
     # -----------------------------------------------------------------------
     # Condition 2: No timeout — absence of motion does NOT end stop
@@ -164,17 +164,17 @@ class TestVehicleStopDetection(unittest.TestCase):
         res_10s = self.detector.update(0.0, imu_rest, now_mono=t0 + 10.6)
         self.assertTrue(res_10s["is_stopped"])
         self.assertFalse(res_10s["event_just_ended"])
-        self.assertAlmostEqual(res_10s["duration_sec"], 10.0, places=1)
+        self.assertAlmostEqual(res_10s["duration_sec"], 10.6, places=1)
 
         # Simulate 60 seconds of no camera motion
         res_60s = self.detector.update(0.0, imu_rest, now_mono=t0 + 60.6)
         self.assertTrue(res_60s["is_stopped"])
-        self.assertAlmostEqual(res_60s["duration_sec"], 60.0, places=1)
+        self.assertAlmostEqual(res_60s["duration_sec"], 60.6, places=1)
 
         # Simulate 300 seconds of no camera motion
         res_300s = self.detector.update(0.0, imu_rest, now_mono=t0 + 300.6)
         self.assertTrue(res_300s["is_stopped"])
-        self.assertAlmostEqual(res_300s["duration_sec"], 300.0, places=1)
+        self.assertAlmostEqual(res_300s["duration_sec"], 300.6, places=1)
 
     # -----------------------------------------------------------------------
     # Condition 2: Keep logs of motion frames captured during stop
@@ -200,7 +200,7 @@ class TestVehicleStopDetection(unittest.TestCase):
         self.assertIsNotNone(cap1)
         self.assertEqual(cap1.stop_frame_idx, 1)
         self.assertEqual(cap1.filename, "motion_RTC_2026_09_08_0001.jpg")
-        self.assertAlmostEqual(cap1.stop_offset_sec, 10.0, places=1)
+        self.assertAlmostEqual(cap1.stop_offset_sec, 10.5, places=1)
 
         # Capture #2 at +25s
         cap2 = self.detector.record_capture({
@@ -213,7 +213,7 @@ class TestVehicleStopDetection(unittest.TestCase):
         }, now_mono=t0 + 25.5)
         self.assertIsNotNone(cap2)
         self.assertEqual(cap2.stop_frame_idx, 2)
-        self.assertAlmostEqual(cap2.stop_offset_sec, 25.0, places=1)
+        self.assertAlmostEqual(cap2.stop_offset_sec, 25.5, places=1)
 
         # Verify active stop event capture tracking
         active = self.detector.get_active_stop()
@@ -283,7 +283,7 @@ class TestVehicleStopDetection(unittest.TestCase):
 
         completed = res["last_completed_event"]
         self.assertEqual(completed.stop_id, 1)
-        self.assertAlmostEqual(completed.duration_sec, 44.85, delta=0.5)
+        self.assertAlmostEqual(completed.duration_sec, 45.35, delta=0.5)
         self.assertEqual(len(completed.captures), 2)
         self.assertIn("Vehicle back in motion", completed.end_reason)
         self.assertIn("8.2 km/h", completed.end_reason)
@@ -291,7 +291,7 @@ class TestVehicleStopDetection(unittest.TestCase):
         # 4. Verify that all previous logs are mentioned in the summary report
         summary = completed.format_summary()
         self.assertIn("Stop #1 Summary Report", summary)
-        self.assertIn("2026-09-08 14:10:01", summary)
+        self.assertIn("2026-09-08 14:10:00", summary)
         self.assertIn("2026-09-08 14:10:45", summary)
         self.assertIn("motion_RTC_141012_0001.jpg", summary)
         self.assertIn("motion_RTC_141028_0002.jpg", summary)

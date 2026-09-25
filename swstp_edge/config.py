@@ -166,10 +166,26 @@ LITTER_CONF_THRESHOLD        = 0.25
 # Fraction of detection bounding box that must overlap the AoD polygon to be ignored
 LITTER_OVERLAP_THRESHOLD     = 0.50
 
-# ONNX weights resolution — prefer int8 quantised for Pi 4B performance
+# ---------------------------------------------------------------------------
+# ONNX Weights Resolution & Active-Learning Model Replacement
+# ---------------------------------------------------------------------------
+# Note: The live edge node exclusively executes .onnx models (best_int8.onnx, best.onnx)
+# for fast, lightweight inference on Raspberry Pi 4B CPU (via ONNX Runtime / OpenCV DNN).
+# Base PyTorch weights (best.pt) are maintained in weights/ for the active-learning
+# retraining pipeline (swstp_edge/active_learning/).
+#
+# REPLACEMENT POLICY:
+# Newly trained models produced by retrain.py / export_onnx.py are exported to ONNX
+# and configured to REPLACE the old production ONNX files in this weights directory.
+# The edge detector automatically resolves and loads the newly replaced ONNX model.
+WEIGHTS_DIR = os.path.join(_HERE, "weights")
+BASE_PT_WEIGHTS = os.path.join(WEIGHTS_DIR, "best.pt")
+PROD_ONNX_PATH = os.path.join(WEIGHTS_DIR, "best.onnx")
+PROD_INT8_ONNX_PATH = os.path.join(WEIGHTS_DIR, "best_int8.onnx")
+
 _WEIGHT_CANDIDATES = [
-    os.path.join(_HERE, "weights", "best_int8.onnx"),
-    os.path.join(_HERE, "weights", "best.onnx"),
+    PROD_INT8_ONNX_PATH,
+    PROD_ONNX_PATH,
 ]
 LITTER_WEIGHTS = next((p for p in _WEIGHT_CANDIDATES if os.path.isfile(p)), _WEIGHT_CANDIDATES[-1])
 

@@ -193,7 +193,8 @@ def _parse_gga(fields: list) -> None:
             _state["satellites"] = num_sats
             _state["hdop"]       = round(hdop, 2) if hdop is not None else None
             _state["last_fix_time"] = now
-        elif not _state["fix"]:
+        else:
+            _state["fix"]    = False
             _state["status"] = "NO_FIX"
 
 
@@ -211,25 +212,45 @@ def _parse_rmc(fields: list) -> None:
         _state["last_data_time"] = now
 
     active = fields[2].strip().upper() == "A"
-    if not active or len(fields) < 9:
-        return
 
-    lat = _parse_lat(fields[3], fields[4])
-    lon = _parse_lon(fields[5], fields[6])
-    speed_kn = _safe_float(fields[7])
-    course   = _safe_float(fields[8])
+    lat = _parse_lat(fields[3], fields[4]) if len(fields) > 4 else None
+    lon = _parse_lon(fields[5], fields[6]) if len(fields) > 6 else None
+    speed_kn = _safe_float(fields[7]) if len(fields) > 7 else None
+    course   = _safe_float(fields[8]) if len(fields) > 8 else None
 
     speed_kmh = round(speed_kn * 1.852, 2) if speed_kn is not None else None
 
     with _lock:
-        if lat is not None and lon is not None:
+        if speed_kmh is not None:
+            _state["speed_kmh"] = speed_kmh
+        if course is not None:
+            _state["course_deg"] = round(course, 2)
+        if active and lat is not None and lon is not None:
             _state["fix"]        = True
             _state["status"]     = "FIX"
             _state["latitude"]   = lat
             _state["longitude"]  = lon
-            _state["speed_kmh"]  = speed_kmh
-            _state["course_deg"] = round(course, 2) if course is not None else None
             _state["last_fix_time"] = now
+        elif not active:
+            _state["fix"]        = False
+            _state["status"]     = "NO_FIX"
+
+
+def _parse_vtg(fields: list) -> None:
+    """
+    Parse $VTG / $GNVTG / $GPVTG — Course over ground and ground speed.
+    fields: [id, cog_t, T, cog_m, M, sog_knots, N, sog_kmh, K, mode]
+    """
+    if len(fields) < 8:
+        return
+    now = time.monotonic()
+    speed_kmh = _safe_float(fields[7])
+    with _lock:
+        _state["data_received"] = True
+        _state["last_data_time"] = now
+        if speed_kmh is not None:
+            _state["speed_kmh"] = round(speed_kmh, 2)
+
 
 
 def _parse_gsa(fields: list) -> None:
@@ -303,6 +324,9 @@ _PARSERS = {
     "GPRMC":  _parse_rmc,
     "GNRMC":  _parse_rmc,
     "GLRMC":  _parse_rmc,
+    "GPVTG":  _parse_vtg,
+    "GNVTG":  _parse_vtg,
+    "GLVTG":  _parse_vtg,
     "GPGSA":  _parse_gsa,
     "GNGSA":  _parse_gsa,
     "GLGSA":  _parse_gsa,
@@ -330,6 +354,8 @@ def _dispatch(line: str) -> None:
             parser = _parse_gga
         elif sentence_id.endswith("RMC"):
             parser = _parse_rmc
+        elif sentence_id.endswith("VTG"):
+            parser = _parse_vtg
         elif sentence_id.endswith("GSA"):
             parser = _parse_gsa
         elif sentence_id.endswith("GSV"):

@@ -195,6 +195,16 @@ def build_telemetry_packet(device_id: str) -> dict:
 
             track_field_events(snapped_lat, snapped_lon,
                                latest_sensor["speed"], latest_sensor.get("heading") or 0.0)
+    else:
+        with _lock:
+            if latest_sensor.get("location_source") == "gnss":
+                latest_sensor["gps_valid"] = False
+            speed_val = gnss_data.get("speed_kmh")
+            if speed_val is not None:
+                latest_sensor["speed"] = speed_val
+        if hardware_state["gps"]["logged_fix"]:
+            hardware_state["gps"]["fix"] = False
+            hardware_state["gps"]["logged_fix"] = False
 
     # --- 5. Update RTC state in latest_sensor ---
     with _lock:

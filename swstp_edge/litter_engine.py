@@ -5,9 +5,9 @@ Integrates YOLO inference into the motion detection loop WITHOUT opening
 a second camera. Frames are passed in from the already-read main loop frame.
 
 Trigger logic:
-  - Every LITTER_DISTANCE_INTERVAL_M meters (default: 10 m) of GNSS travel,
+  - Every LITTER_DISTANCE_INTERVAL_M meters (default: 5 m) of GNSS travel,
     the current live frame is queued for YOLO inference.
-  - If GNSS is lost for > LITTER_GNSS_LOST_TIMEOUT_SEC (default: 15 s),
+  - If GNSS is lost for > LITTER_GNSS_LOST_TIMEOUT_SEC (default: 5 s),
     falls back to a clock-based trigger every LITTER_TIME_FALLBACK_SEC (default: 30 s).
   - On GNSS recovery, re-anchors to current position and resumes distance mode.
 
@@ -114,7 +114,12 @@ def _save_worker() -> None:
             break
         filename, final_frame, sidecar_filename, sidecar_data = item
         try:
-            cv2.imwrite(filename, final_frame)
+            ok, buf = cv2.imencode(".jpg", final_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+            if ok:
+                with open(filename, "wb") as f:
+                    f.write(buf.tobytes())
+            else:
+                print(f"[LITTER] ERROR: cv2.imencode failed for {filename}")
             with open(sidecar_filename, "w", encoding="utf-8") as sf:
                 json.dump(sidecar_data, sf, indent=2)
             print(f"[LITTER] Saved {filename} ({final_frame.shape[1]}x{final_frame.shape[0]})")
@@ -165,7 +170,7 @@ class LitterEngine:
     Usage:
         engine = LitterEngine(...)          # Load model once at startup
         # In main loop, every frame:
-        if engine.update_gnss(lat, lon):   # Returns True every 10 m
+        if engine.update_gnss(lat, lon):   # Returns True every 5 m
             engine.try_trigger(frame, lat, lon, gnss_data, rtc_ts)
         # On shutdown:
         engine.shutdown()
@@ -262,7 +267,7 @@ class LitterEngine:
                                the engine treats the fix as lost even if lat/lon have
                                valid-looking values (e.g. held from location_fallback).
 
-        Returns True when the 10 m distance threshold is crossed OR the clock fallback
+        Returns True when the distance threshold (default: 5 m) is crossed OR the clock fallback
         timer fires.  Handles GNSS loss / recovery and TIME_FALLBACK automatically.
         """
         now = time.monotonic()
@@ -534,8 +539,9 @@ class LitterEngine:
                     "fix":        has_fix,
                     "latitude":   float(lat) if lat is not None else None,
                     "longitude":  float(lon) if lon is not None else None,
-                    "speed_kmh":  gnss_data.get("speed") if isinstance(gnss_data, dict) else None,
+                    "speed_kmh":  (gnss_data.get("speed_kmh") if isinstance(gnss_data, dict) and gnss_data.get("speed_kmh") is not None else (gnss_data.get("speed") if isinstance(gnss_data, dict) else None)),
                     "satellites": gnss_data.get("satellites") if isinstance(gnss_data, dict) else None,
+                    "hdop":       gnss_data.get("hdop") if isinstance(gnss_data, dict) else None,
                 },
                 "detections":          detected_items,
                 "detection_type":      "LITTER",
