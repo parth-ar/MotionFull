@@ -312,14 +312,15 @@ class IMX708CameraCapture:
                 pass
 
             # ── Colour format ────────────────────────────────────────────
-            # BGR888 byte order is inconsistent across libcamera versions.
-            # RGB888 is unambiguous; we convert explicitly below.
-            #
-            # ── Full-FOV configuration ───────────────────────────────────
-            # raw={"size": (4608, 2592)} forces full-sensor readout → 120° FOV.
+            # picamera2 format names are from OpenCV’s perspective, NOT raw
+            # memory order.  ‘BGR888’ means “deliver bytes as B,G,R so OpenCV
+            # can use the array directly without any conversion”.
+            # DO NOT add cvtColor(COLOR_RGB2BGR) after this — the data is
+            # already in OpenCV-native BGR order and any channel swap will
+            # corrupt colours (reds become blue/purple).
             config = self._picam2.create_video_configuration(
-                main={"format": "RGB888", "size": (self.width, self.height)},
-                raw={"size": (4608, 2592)},
+                main={"format": "BGR888", "size": (self.width, self.height)},
+                raw={"size": (4608, 2592)},   # Force full-sensor readout → 120° FOV
                 controls={"FrameRate": self.fps},
                 queue=False,
             )
@@ -428,15 +429,11 @@ class IMX708CameraCapture:
             if frame is None or frame.size == 0:
                 return False, None
 
-            # Convert RGB888 capture → BGR for OpenCV compatibility.
-            # This also handles 4-channel RGBA output from some libcamera builds.
-            if _HAS_CV2:
-                if frame.ndim == 3 and frame.shape[2] == 4:
-                    # RGBA → BGR
-                    frame = cv2.cvtColor(frame, cv2.COLOR_RGBA2BGR)
-                elif frame.ndim == 3 and frame.shape[2] == 3:
-                    # RGB → BGR (correct channel order for OpenCV)
-                    frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+            # BGR888 delivers B,G,R bytes — already OpenCV-native.
+            # Only handle the rare 4-channel (XBGR/BGRA) output from some
+            # libcamera builds by stripping the alpha channel.
+            if _HAS_CV2 and frame.ndim == 3 and frame.shape[2] == 4:
+                frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
 
             return True, frame
         except Exception:
