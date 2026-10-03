@@ -243,7 +243,7 @@ def run_roi_setup_phase(cap, win_title: str, frame_w: int, frame_h: int) -> list
         else:
             tip1 = ("Showing SAVED polygon  |  Left-click to draw a NEW one  |  "
                     "Enter/Space: keep saved  |  Esc: skip")
-        tip2 = "Left-click: add point   Right-click: undo   C: clear   Enter/Space: confirm   Esc: use saved"
+        tip2 = "Left-click: add point | Right-click: undo | C: clear | V: toggle RB colors | Enter: confirm | Esc: keep saved"
         cv2.putText(display, tip1, (10, h - 42),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.46, (200, 200, 200), 1, cv2.LINE_AA)
         cv2.putText(display, tip2, (10, h - 18),
@@ -291,6 +291,12 @@ def run_roi_setup_phase(cap, win_title: str, frame_w: int, frame_h: int) -> list
         elif key in (ord('c'), ord('C')):
             new_points_px.clear()
             print("[ROI/AoD SETUP] Cleared new points — start drawing fresh.")
+
+        elif key in (ord('v'), ord('V')):
+            if hasattr(cap, "swap_rb"):
+                cap.swap_rb = not cap.swap_rb
+                status_str = "ENABLED (OpenCV BGR)" if cap.swap_rb else "DISABLED (Raw [R,G,B])"
+                print(f"[ROI/AoD SETUP] Camera RB color channel swap: {status_str}")
 
     # Restore window and mouse callback for the runtime detection loop
     try:

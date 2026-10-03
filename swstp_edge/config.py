@@ -97,6 +97,7 @@ CAMERA_AUTOFOCUS         = True        # Continuous PDAF autofocus for IMX708
 CAMERA_AF_MODE           = "continuous"# Options: "continuous", "auto", "manual"
 CAMERA_PREFER_IMX708     = True        # Prioritise IMX708 / Picamera2 over standard V4L2
 CAMERA_IMX708_HDR        = False       # Hardware HDR mode for IMX708 sensor
+CAMERA_SWAP_RB           = True        # Convert Picamera2 [R,G,B] array to OpenCV native [B,G,R]
 
 # ---------------------------------------------------------------------------
 # Telemetry rate

@@ -453,7 +453,7 @@ def main() -> None:
     stop_detector = VehicleStopDetector()
 
     print("[INIT] Unified Edge Gateway running.")
-    print("  Controls: [t] Toggle Camera | [r] Plot ROI/AoD | [c] Clear | [q] Quit\n")
+    print("  Controls: [t] Toggle Camera | [r] Plot ROI/AoD | [v] Toggle Colors | [c] Clear | [q] Quit\n")
 
     if cap is not None:
         try:
@@ -917,6 +917,11 @@ def main() -> None:
                 k = cv2.waitKey(delay) & 0xFF
                 if k == ord('q'):
                     break
+                elif k in (ord('v'), ord('V')):
+                    if cap is not None and hasattr(cap, "swap_rb"):
+                        cap.swap_rb = not cap.swap_rb
+                        status_str = "ENABLED (OpenCV BGR)" if cap.swap_rb else "DISABLED (Raw [R,G,B])"
+                        print(f"\n[CAMERA] Color channel swap: {status_str}")
                 elif k == ord('t'):
                     _motion.camera_feed_active = not _motion.camera_feed_active
                     print(f"\n[CAMERA] Camera feed {'ACTIVATED / ON' if _motion.camera_feed_active else 'PAUSED / OFF'}.")

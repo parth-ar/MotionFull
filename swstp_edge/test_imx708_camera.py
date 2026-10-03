@@ -52,6 +52,10 @@ def parse_args():
     parser.add_argument("--af-mode", default="continuous", choices=["continuous", "auto", "manual"],
                         help="Autofocus mode (default: continuous)")
     parser.add_argument("--hdr", action="store_true", help="Enable hardware HDR mode")
+    parser.add_argument("--swap-rb", dest="swap_rb", action="store_true", default=None,
+                        help="Force RB swap so Picamera2 delivers OpenCV-native BGR (default: True)")
+    parser.add_argument("--no-swap-rb", dest="swap_rb", action="store_false",
+                        help="Disable RB swap (deliver raw array)")
     parser.add_argument("--save-dir", default=os.path.join(_HERE, "captures"),
                         help="Directory to save test capture (default: captures/)")
     return parser.parse_args()
@@ -109,6 +113,7 @@ def main():
             fps=args.fps,
             af_mode=args.af_mode,
             hdr=args.hdr,
+            swap_rb=args.swap_rb,
         )
     except Exception as exc:
         print(f"  ❌ Camera initialization failed: {exc}")
@@ -119,6 +124,7 @@ def main():
     print(f"  ✔ Sensor initialized successfully: {info['model']}")
     print(f"  ✔ Backend: {info['backend']}")
     print(f"  ✔ Autofocus: {info['autofocus']}")
+    print(f"  ✔ Active swap_rb: {cap.swap_rb}")
 
     # ── Step 4: Capture Warm-up & Benchmark Frames ───────────────────────
     print(f"\n[STEP 4] Capturing {args.frames} test frames...")
@@ -152,21 +158,33 @@ def main():
         print(f"  Average Latency:  {avg_latency:.2f} ms")
         print(f"  Sustained FPS:    {avg_fps:.1f} FPS")
 
+        # Pixel colour statistics
+        if sample_frame.ndim == 3 and sample_frame.shape[2] == 3:
+            center_px = sample_frame[h // 2, w // 2].tolist()
+            corner_px = sample_frame[min(10, h - 1), min(10, w - 1)].tolist()
+            print(f"  Center pixel [B, G, R]: {center_px}")
+            print(f"  Corner pixel [B, G, R]: {corner_px}")
+
         # ── Step 5: Save Test Capture ────────────────────────────────────
         print(f"\n[STEP 5] Saving sample test frame...")
         os.makedirs(args.save_dir, exist_ok=True)
         out_path = os.path.join(args.save_dir, "test_imx708_capture.jpg")
+        unswapped_path = os.path.join(args.save_dir, "test_imx708_unswapped.jpg")
 
-        # Try saving with OpenCV if available
+        # Save both normal (OpenCV BGR) and opposite (unswapped) for easy comparison
         try:
             import cv2
             cv2.imwrite(out_path, sample_frame)
             file_size_kb = os.path.getsize(out_path) / 1024.0
             print(f"  ✔ Frame saved to: {out_path} ({file_size_kb:.1f} KB)")
+
+            # Save unswapped version for verification
+            if sample_frame.ndim == 3 and sample_frame.shape[2] == 3:
+                cv2.imwrite(unswapped_path, sample_frame[..., ::-1])
+                print(f"  ✔ Unswapped comparison saved to: {unswapped_path}")
         except Exception:
             try:
                 from PIL import Image
-                # Convert BGR to RGB for PIL
                 rgb = sample_frame[..., ::-1] if sample_frame.ndim == 3 else sample_frame
                 im = Image.fromarray(rgb)
                 im.save(out_path)
