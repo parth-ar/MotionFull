@@ -100,6 +100,14 @@ from network.uploader import (
 )
 from stop_detector import VehicleStopDetector
 from network.location_fallback import gps_fallback_worker
+from camera import (
+    probe_video_source,
+    get_candidate_video_ports,
+    scan_for_camera,
+    detect_imx708_sensor,
+    is_picamera2_available,
+    IMX708CameraCapture,
+)
 
 # ---------------------------------------------------------------------------
 # Shared live stream frame
@@ -151,7 +159,12 @@ def build_parser() -> argparse.ArgumentParser:
                     "Motion Detection + Litter Detection + Telemetry + Live Stream."
     )
     parser.add_argument("--source", "-s", default=None,
-                        help="Video source (0 for default webcam, or path to MP4)")
+                        help="Video source: 'imx708' / 'picam' (Raspberry Pi Camera Module 3), "
+                             "device index (e.g. 0), V4L2 device (/dev/video0), or MP4 path. Default: auto-detect.")
+    parser.add_argument("--af-mode", default="continuous", choices=["continuous", "auto", "manual"],
+                        help="Autofocus mode for Camera Module 3 / IMX708 (default: continuous PDAF)")
+    parser.add_argument("--hdr", action="store_true",
+                        help="Enable hardware HDR mode on Sony IMX708 sensor")
     parser.add_argument("--port", "-p", default="Pi-native",
                         help="[IGNORED on Pi] Legacy serial port flag")
     parser.add_argument("--baud", "-b", type=int, default=115200,
@@ -191,108 +204,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 # ---------------------------------------------------------------------------
-# Camera & Video Port Scanning Helpers  (unchanged from swstp_edge)
+# Camera & Video Port Scanning Helpers (delegated to camera.py)
 # ---------------------------------------------------------------------------
-def is_v4l2_capture_device(dev_idx: int) -> bool:
-    sys_path = f"/sys/class/video4linux/video{dev_idx}"
-    if not os.path.exists(sys_path):
-        return False
-    name_file = os.path.join(sys_path, "name")
-    if os.path.exists(name_file):
-        try:
-            with open(name_file, "r", encoding="utf-8", errors="ignore") as f:
-                name = f.read().strip().lower()
-            if "metadata" in name or "bcm2835-codec" in name or "bcm2835-isp" in name:
-                return False
-        except Exception:
-            pass
-    return True
+# Comprehensive native Sony IMX708 (Camera Module 3) via Picamera2,
+# PDAF continuous autofocus, and V4L2 fallback are implemented in camera.py.
 
-
-def probe_video_source(src):
-    try:
-        if isinstance(src, int) or (isinstance(src, str) and src.isdigit()):
-            dev_idx = int(src)
-            if sys.platform.startswith("linux"):
-                dev_node = f"/dev/video{dev_idx}"
-                if not os.path.exists(dev_node) or not os.access(dev_node, os.R_OK):
-                    return None, 0, 0, 0
-                if not is_v4l2_capture_device(dev_idx):
-                    return None, 0, 0, 0
-                c = cv2.VideoCapture(dev_idx, cv2.CAP_V4L2)
-            else:
-                c = cv2.VideoCapture(dev_idx)
-        elif isinstance(src, str) and src.startswith("/dev/video"):
-            dev_name = os.path.basename(src)
-            idx_str  = dev_name.replace("video", "")
-            if idx_str.isdigit() and sys.platform.startswith("linux"):
-                dev_idx = int(idx_str)
-                if not os.path.exists(src) or not os.access(src, os.R_OK):
-                    return None, 0, 0, 0
-                if not is_v4l2_capture_device(dev_idx):
-                    return None, 0, 0, 0
-                c = cv2.VideoCapture(dev_idx, cv2.CAP_V4L2)
-            else:
-                c = cv2.VideoCapture(src)
-        else:
-            c = cv2.VideoCapture(src)
-
-        if c.isOpened():
-            c.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-            c.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-            try:
-                c.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-            except Exception:
-                pass
-            ret, test_frame = c.read()
-            if ret and test_frame is not None and test_frame.size > 0:
-                w      = int(c.get(cv2.CAP_PROP_FRAME_WIDTH))  or test_frame.shape[1]
-                h      = int(c.get(cv2.CAP_PROP_FRAME_HEIGHT)) or test_frame.shape[0]
-                cam_fps = c.get(cv2.CAP_PROP_FPS) or 30.0
-                if cam_fps <= 0 or cam_fps > 120:
-                    cam_fps = 30.0
-                return c, w, h, cam_fps
-            c.release()
-    except Exception:
-        pass
-    return None, 0, 0, 0
-
-
-def get_candidate_video_ports(preferred_source=None):
-    candidates = []
-    if preferred_source is not None and preferred_source != "":
-        try:
-            candidates.append(int(preferred_source) if str(preferred_source).isdigit() else preferred_source)
-        except Exception:
-            candidates.append(preferred_source)
-    if sys.platform.startswith("linux"):
-        import glob
-        found_devs = []
-        for p in sorted(glob.glob("/dev/video*")):
-            dev_name = os.path.basename(p)
-            idx_str  = dev_name.replace("video", "")
-            if idx_str.isdigit():
-                idx = int(idx_str)
-                if is_v4l2_capture_device(idx):
-                    found_devs.append(idx)
-        for d in found_devs:
-            if d not in candidates:
-                candidates.append(d)
-        if not candidates:
-            candidates = [0, 1]
-    else:
-        for idx in [0, 1, 2]:
-            if idx not in candidates:
-                candidates.append(idx)
-    return candidates
-
-
-def scan_for_camera(candidates):
-    for cand in candidates:
-        c, w, h, cam_fps = probe_video_source(cand)
-        if c is not None:
-            return c, cand, w, h, cam_fps
-    return None, None, 0, 0, 0
 
 
 # ---------------------------------------------------------------------------
@@ -374,28 +290,48 @@ def main() -> None:
     print("========================================================\n")
 
     # ── Camera / video source ─────────────────────────────────────────────
-    VIDEO_SOURCE = 0
-    initial_source = (
-        int(args.source)
-        if (args.source and args.source.isdigit())
-        else (args.source if args.source else VIDEO_SOURCE)
+    initial_source = args.source if args.source is not None else getattr(_cfg, "CAMERA_SOURCE_DEFAULT", "auto")
+    if str(initial_source).isdigit():
+        initial_source = int(initial_source)
+    elif str(initial_source).strip() in ("", "auto", "None"):
+        initial_source = None
+
+    target_cam_w   = getattr(_cfg, "CAMERA_WIDTH", 640)
+    target_cam_h   = getattr(_cfg, "CAMERA_HEIGHT", 480)
+    target_cam_fps = getattr(_cfg, "CAMERA_FPS", 30.0)
+    prefer_imx     = getattr(_cfg, "CAMERA_PREFER_IMX708", True)
+
+    candidate_ports = get_candidate_video_ports(initial_source, prefer_imx708=prefer_imx)
+    cap, source, cam_w, cam_h, fps, cam_info = scan_for_camera(
+        candidate_ports,
+        target_w=target_cam_w,
+        target_h=target_cam_h,
+        target_fps=target_cam_fps,
+        af_mode=args.af_mode,
+        hdr=args.hdr,
     )
-    candidate_ports = get_candidate_video_ports(initial_source)
-    cap, source, cam_w, cam_h, fps = scan_for_camera(candidate_ports)
 
     if cap is not None:
+        is_imx = cam_info.get("is_imx708", False)
+        cam_model = cam_info.get("model", "Sony IMX708 (Camera Module 3)" if is_imx else f"Port {source}")
         hardware_state["camera"] = {
-            "detected": True, "source": source,
-            "resolution": f"{cam_w}x{cam_h}", "fps": fps
+            "detected": True,
+            "source": source,
+            "model": cam_model,
+            "is_imx708": is_imx,
+            "resolution": f"{cam_w}x{cam_h}",
+            "fps": fps,
+            "autofocus": cam_info.get("autofocus", "Continuous PDAF" if is_imx else "N/A"),
         }
-        print(f"[CAMERA] Active: Port {source} ({cam_w}x{cam_h} @ {fps:.1f} FPS)")
+        af_info = f" | Autofocus: {cam_info.get('autofocus')}" if is_imx else ""
+        print(f"[CAMERA] Active: {cam_model} on '{source}' ({cam_w}x{cam_h} @ {fps:.1f} FPS{af_info})")
     else:
-        source = initial_source
-        cam_w, cam_h, fps = 640, 360, 30.0
+        source = initial_source or 0
+        cam_w, cam_h, fps = target_cam_w, target_cam_h, target_cam_fps
         hardware_state["camera"] = {
-            "detected": False, "source": None, "resolution": "N/A", "fps": 0
+            "detected": False, "source": None, "model": "None", "is_imx708": False, "resolution": "N/A", "fps": 0, "autofocus": "N/A"
         }
-        print(f"[CAMERA] No webcam found on {candidate_ports}. Motion on hold. Triple LED blinks...")
+        print(f"[CAMERA] No camera found on {candidate_ports}. Motion on hold. Triple LED blinks...")
         try:
             leds.set_camera_scanning(True)
         except Exception:
@@ -498,7 +434,12 @@ def main() -> None:
         )
 
     delay       = max(1, int(1000 / (fps if (fps and 0 < fps < 120) else 30)))
-    is_file     = isinstance(source, str)
+    is_file     = (
+        isinstance(source, str)
+        and not source.isdigit()
+        and not str(source).startswith("/dev/video")
+        and str(source).lower() not in ("imx708", "imx", "picam", "picamera", "picamera2", "csi", "cam3", "camera3")
+    )
     LOOP_VIDEO  = True
     bg_model    = None
     frame_count = 0
@@ -534,14 +475,26 @@ def main() -> None:
                     leds.set_camera_scanning(True)
                 except Exception:
                     pass
-                candidate_ports = get_candidate_video_ports(initial_source)
-                new_cap, new_src, new_w, new_h, new_fps = scan_for_camera(candidate_ports)
+                candidate_ports = get_candidate_video_ports(initial_source, prefer_imx708=prefer_imx)
+                new_cap, new_src, new_w, new_h, new_fps, new_info = scan_for_camera(
+                    candidate_ports,
+                    target_w=target_cam_w,
+                    target_h=target_cam_h,
+                    target_fps=target_cam_fps,
+                    af_mode=args.af_mode,
+                    hdr=args.hdr,
+                )
                 if new_cap is not None:
                     cap    = new_cap
                     source = new_src
                     cam_w, cam_h, fps = new_w, new_h, new_fps
                     delay  = max(1, int(1000 / (fps if (fps and 0 < fps < 120) else 30)))
-                    is_file = isinstance(source, str) and not source.isdigit() and not str(source).startswith("/dev/video")
+                    is_file = (
+                        isinstance(source, str)
+                        and not source.isdigit()
+                        and not str(source).startswith("/dev/video")
+                        and str(source).lower() not in ("imx708", "imx", "picam", "picamera", "picamera2", "csi", "cam3", "camera3")
+                    )
                     bg_model          = None
                     frame_count       = 0
                     stop_warmup_cnt   = 0
@@ -550,11 +503,19 @@ def main() -> None:
                             _motion.reset_tracking()
                         except Exception:
                             pass
+                    is_imx = new_info.get("is_imx708", False)
+                    cam_model = new_info.get("model", "Sony IMX708 (Camera Module 3)" if is_imx else f"Port {source}")
                     hardware_state["camera"] = {
-                        "detected": True, "source": source,
-                        "resolution": f"{cam_w}x{cam_h}", "fps": fps
+                        "detected": True,
+                        "source": source,
+                        "model": cam_model,
+                        "is_imx708": is_imx,
+                        "resolution": f"{cam_w}x{cam_h}",
+                        "fps": fps,
+                        "autofocus": new_info.get("autofocus", "Continuous PDAF" if is_imx else "N/A"),
                     }
-                    print(f"\n[CAMERA] ✔ Webcam connected on port {source} ({cam_w}x{cam_h} @ {fps:.1f} FPS).")
+                    af_info = f" | Autofocus: {new_info.get('autofocus')}" if is_imx else ""
+                    print(f"\n[CAMERA] ✔ Connected: {cam_model} on '{source}' ({cam_w}x{cam_h} @ {fps:.1f} FPS{af_info}).")
                     try:
                         leds.set_camera_scanning(False)
                         leds.set_system_ready()
@@ -573,10 +534,10 @@ def main() -> None:
                 cv2.rectangle(standby_frame, (0, 0), (sw, sh), (20, 20, 24), -1)
                 banner_y = sh // 2
                 cv2.rectangle(standby_frame, (0, max(0, banner_y - 45)), (sw, min(sh, banner_y + 45)), (0, 165, 255), 2)
-                cv2.putText(standby_frame, "NO WEBCAM DETECTED - SCANNING PORTS...",
+                cv2.putText(standby_frame, "NO CAMERA DETECTED - SCANNING PORTS...",
                             (max(10, sw // 2 - 240), banner_y - 8),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 215, 255), 2, cv2.LINE_AA)
-                cv2.putText(standby_frame, f"Probing {candidate_ports} | Algorithm ON HOLD | Triple LED blinks",
+                cv2.putText(standby_frame, f"Probing {candidate_ports} | IMX708 / V4L2 | Triple LED blinks",
                             (max(10, sw // 2 - 260), banner_y + 22),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.50, (180, 180, 180), 1, cv2.LINE_AA)
                 display_frame = overlay_metadata(standby_frame, litter_engine)
@@ -635,13 +596,15 @@ def main() -> None:
                     print(f"[CAMERA] End of video file '{source}'.")
                     break
                 else:
-                    print(f"\n[CAMERA] Feed dropped on port {source} (device disconnected).")
+                    print(f"\n[CAMERA] Feed dropped on source '{source}' (device disconnected).")
                     try:
                         cap.release()
                     except Exception:
                         pass
                     cap = None
-                    hardware_state["camera"] = {"detected": False, "source": None, "resolution": "N/A", "fps": 0}
+                    hardware_state["camera"] = {
+                        "detected": False, "source": None, "model": "None", "is_imx708": False, "resolution": "N/A", "fps": 0, "autofocus": "N/A"
+                    }
                     bg_model                  = None
                     frame_count               = 0
                     consecutive_motion_frames = 0

@@ -9,13 +9,16 @@ Run on the Raspberry Pi 4B terminal (SSH or local).
 1. RUNNING THE PROGRAM MANUALLY
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-# Headless (no screen — same as service):
+# Headless (no screen — same as service, auto-detects IMX708 / USB):
 python3 /home/pi/swstp_unified/main.py --headless
 
 # Full GUI (desktop environment — shows camera window, ROI setup screen):
 python3 /home/pi/swstp_unified/main.py
 
-# Headless with a specific camera port:
+# Explicitly use Raspberry Pi Camera Module 3 (Sony IMX708) with Continuous Autofocus:
+python3 /home/pi/swstp_unified/main.py --source imx708 --af-mode continuous
+
+# Headless with a specific camera port (e.g. USB webcam):
 python3 /home/pi/swstp_unified/main.py --headless --source 0
 
 # Headless, disable litter detection (motion-only):
@@ -143,11 +146,26 @@ print('Reset to default polygon.')
 7. SENSOR & HARDWARE DIAGNOSTICS
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-  List detected V4L2 camera devices:
-    v4l2-ctl --list-devices
+  Camera Module 3 (Sony IMX708) Diagnostics:
+    # Automated IMX708 benchmark and test capture tool:
+    python3 /home/pi/swstp_unified/test_imx708_camera.py
 
-  Test camera capture:
-    python3 -c "import cv2; c=cv2.VideoCapture(0); print('Opened:',c.isOpened()); c.release()"
+    # Check if IMX708 is detected on the CSI bus by libcamera:
+    rpicam-hello --list-cameras
+    # (or on older OS: libcamera-hello --list-cameras)
+
+    # Test 5-second live camera window:
+    rpicam-hello -t 5000
+
+    # Verify kernel IMX708 I2C driver binding:
+    ls -l /sys/bus/i2c/drivers/imx708/
+
+  USB / V4L2 Webcam Diagnostics:
+    List detected V4L2 camera devices:
+      v4l2-ctl --list-devices
+
+    Test V4L2 camera capture:
+      python3 -c "import cv2; c=cv2.VideoCapture(0); print('Opened:',c.isOpened()); c.release()"
 
   Check I2C bus for RTC (DS3231 at 0x68) and IMU (MPU-6500 at 0x69):
     sudo i2cdetect -y 1

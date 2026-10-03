@@ -33,19 +33,19 @@ On the Pi terminal:
     cd /home/pi/swstp_unified
     pip3 install -r requirements.txt --break-system-packages
 
-Also install the system-level GPIO and I2C library if not already present:
+Also install the system-level GPIO, I2C, and Camera Module 3 (Picamera2) libraries:
 
     sudo apt update
-    sudo apt install -y python3-lgpio i2c-tools v4l-utils gpsd gpsd-clients
+    sudo apt install -y python3-lgpio i2c-tools v4l-utils gpsd gpsd-clients python3-picamera2
 
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 STEP 3 — ADD USER TO REQUIRED GROUPS
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-The program needs access to GPIO (LEDs), I2C (RTC & IMU), and video (camera):
+The program needs access to GPIO (LEDs), I2C (RTC & IMU), and video/camera ISP (video & render):
 
-    sudo usermod -aG gpio,i2c,video pi
+    sudo usermod -aG gpio,i2c,video,render pi
 
 Log out and back in (or reboot) for group membership to take effect:
 
@@ -56,22 +56,28 @@ Log out and back in (or reboot) for group membership to take effect:
 STEP 4 — DO A QUICK TEST RUN FIRST
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-Before installing as a service, confirm the program runs without errors:
+Before installing as a service, test the Camera Module 3 (IMX708) and sensors:
 
     cd /home/pi/swstp_unified
+
+    # 1. Quick diagnostic test of Camera Module 3 (IMX708):
+    python3 test_imx708_camera.py
+
+    # 2. Test run the edge gateway:
     python3 main.py --headless --no-power-monitor
 
 Watch the output for 30-60 seconds. You should see:
   • Sensor init messages (RTC, IMU, GNSS)
-  • "[CAMERA] Active: Port 0 ..."
+  • "[CAMERA] Active: Sony IMX708 (Camera Module 3) on 'imx708' (640x480 @ 30.0 FPS | Autofocus: Continuous PDAF)"
   • "[LITTER] YOLO model loaded and ready."
   • "[LITTER TRIGGER] GNSS distance mode anchored at ..."
 
 Press Ctrl+C to stop the test run when satisfied.
 
 If you see errors about the camera, run:
+    python3 test_imx708_camera.py
+    rpicam-hello --list-cameras
     v4l2-ctl --list-devices
-    python3 -c "import cv2; c=cv2.VideoCapture(0,cv2.CAP_V4L2); print(c.isOpened()); c.release()"
 
 If you see "No module named onnxruntime", re-run step 2.
 

@@ -7,6 +7,11 @@ opencv-python>=4.8.0
 numpy>=1.24.0
 imutils>=0.5.4
 
+# ── Camera Module 3 (Sony IMX708) native CSI driver ───────────────────────────
+# On Raspberry Pi OS (Bookworm / Bullseye), install via apt:
+#   sudo apt install -y python3-picamera2
+# (Or via pip if libcamera dev packages are present: picamera2>=0.3.0)
+
 # ── Litter detection ONNX inference (zero PyTorch / no Ultralytics) ──────────
 # Primary inference backend: ONNX Runtime (CPU, 4-thread, Pi 4B optimised)
 onnxruntime>=1.18.0

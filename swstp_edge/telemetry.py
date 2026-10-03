@@ -105,7 +105,7 @@ latest_sensor: dict = {
 }
 
 hardware_state: dict = {
-    "camera":  {"detected": False, "source": None, "resolution": None, "fps": None},
+    "camera":  {"detected": False, "source": None, "model": "None", "is_imx708": False, "resolution": None, "fps": None, "autofocus": "N/A"},
     "serial":  {"connected": True, "port": "Pi-native", "baud": None, "desc": "Raspberry Pi native sensors"},
     "rtc":     {"detected": False, "module": "DS3231 (I2C 0x68)", "last_ts": None, "logged_online": False, "logged_error": False},
     "gps":     {"detected": False, "module": "NavCast (TCP USB tethering)", "fix": False, "coords": None, "logged_detected": False, "logged_fix": False, "logged_fallback": False},

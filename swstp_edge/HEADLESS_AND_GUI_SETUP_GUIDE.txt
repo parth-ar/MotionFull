@@ -66,7 +66,7 @@ MODE 1: INTERACTIVE DESKTOP GUI (TO VIEW LIVE VIDEO & SET ROI)
 Use this mode when a screen is connected (HDMI monitor or VNC desktop).
 
 CRITICAL CAMERA NOTE:
-Linux allows only ONE process to access the USB camera (/dev/video0) at a time.
+Linux allows only ONE process to access the camera (Camera Module 3 / USB camera) at a time.
 Before launching the manual GUI, you MUST stop the background service so the
 camera is freed!
 

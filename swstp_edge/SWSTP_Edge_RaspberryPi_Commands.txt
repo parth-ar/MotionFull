@@ -308,3 +308,24 @@ cd ~/MotionFull/swstp_edge
 If manual test succeeds:
 sudo systemctl restart swstp-edge.service
 sudo journalctl -u swstp-edge.service -f -o cat
+
+
+18. CAMERA MODULE 3 (SONY IMX708) COMMANDS
+------------------------------------------
+
+Install Picamera2 support:
+sudo apt update && sudo apt install -y python3-picamera2
+
+Add user to video and render groups (required for GPU ISP access):
+sudo usermod -aG video,render $USER
+
+Test Camera Module 3 detection:
+rpicam-hello --list-cameras
+(or: libcamera-hello --list-cameras)
+
+Run automated IMX708 benchmark and test capture:
+./venv/bin/python test_imx708_camera.py
+
+Run edge gateway with explicit IMX708:
+./venv/bin/python main.py --source imx708 --headless
+

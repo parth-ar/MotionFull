@@ -77,6 +77,18 @@ DEFAULT_VEHICLE_ID = "UNASSIGNED"
 DEFAULT_STREAM_FPS = 30.0
 
 # ---------------------------------------------------------------------------
+# Camera Configuration (Raspberry Pi Camera Module 3 / IMX708 & USB Webcams)
+# ---------------------------------------------------------------------------
+CAMERA_SOURCE_DEFAULT    = "auto"      # "auto" scans IMX708 first, then USB
+CAMERA_WIDTH             = 640
+CAMERA_HEIGHT            = 480
+CAMERA_FPS               = 30.0
+CAMERA_AUTOFOCUS         = True        # Continuous PDAF autofocus for IMX708
+CAMERA_AF_MODE           = "continuous"# Options: "continuous", "auto", "manual"
+CAMERA_PREFER_IMX708     = True        # Prioritise IMX708 / Picamera2 over standard V4L2
+CAMERA_IMX708_HDR        = False       # Hardware HDR mode for IMX708 sensor
+
+# ---------------------------------------------------------------------------
 # Telemetry rate
 # ---------------------------------------------------------------------------
 TELEMETRY_RATE_HZ      = 20           # packets per second

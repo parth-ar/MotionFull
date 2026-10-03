@@ -887,13 +887,30 @@ class CameraCapture:
         self._thread = threading.Thread(target=self._run, daemon=True, name="cam")
 
     def start(self):
-        cap = cv2.VideoCapture(self._index, cv2.CAP_DSHOW)
-        if not cap.isOpened(): cap = cv2.VideoCapture(self._index)
-        if cap.isOpened():
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-            self._cap = cap; self._ok = True; self._thread.start(); return True
-        cap.release(); return False
+        # Attempt to open via camera.py (supports Raspberry Pi Camera Module 3 / IMX708 via Picamera2)
+        try:
+            from camera import probe_video_source
+            cap, w, h, fps, info = probe_video_source(self._index, target_w=640, target_h=480)
+            if cap is not None and cap.isOpened():
+                self._cap = cap; self._ok = True; self._thread.start(); return True
+        except Exception:
+            pass
+
+        # Standard OpenCV fallback (DSHOW on Windows, V4L2 on Linux)
+        backend = getattr(cv2, "CAP_DSHOW", 0) if sys.platform.startswith("win") else getattr(cv2, "CAP_V4L2", 0)
+        try:
+            dev_idx = int(self._index) if str(self._index).isdigit() else self._index
+            cap = cv2.VideoCapture(dev_idx, backend) if backend else cv2.VideoCapture(dev_idx)
+            if not cap.isOpened():
+                cap = cv2.VideoCapture(dev_idx)
+            if cap.isOpened():
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+                self._cap = cap; self._ok = True; self._thread.start(); return True
+            cap.release()
+        except Exception:
+            pass
+        return False
 
     def _run(self):
         while not self._stop.is_set():

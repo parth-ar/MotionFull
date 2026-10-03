@@ -365,7 +365,8 @@ def overlay_metadata(frame, litter_engine=None):
     strip_height = line_spacing * 2 + 15
 
     # Top Status HUD
-    cam_badge = "CAM:OK" if hardware_state["camera"]["detected"] else "CAM:OFF"
+    is_imx = bool(hardware_state.get("camera", {}).get("is_imx708"))
+    cam_badge = ("CAM:IMX708" if is_imx else "CAM:OK") if hardware_state["camera"]["detected"] else "CAM:OFF"
     rtc_badge = "RTC:ONLINE" if rtc_ts else "RTC:WAIT"
     gps_badge = (
         "GPS:FALLBACK" if latest_sensor.get("location_source") == "fallback"
