@@ -266,37 +266,41 @@ class IMX708CameraCapture:
                 except Exception as hdr_err:
                     print(f"[IMX708] HDR setting skipped: {hdr_err}")
 
-            # ── Tuning file selection ──────────────────────────────────────────
-            # The IMX708 Wide NoIR has NO infrared-cut filter.  Without the
-            # correct tuning file, libcamera uses the standard imx708.json
-            # colour matrix / AWB tables which are calibrated for the IR-cut
-            # variant.  The result is a strong colour cast (reds → purple,
-            # overall warm-white shift) because IR light is treated as visible.
+            # ── Tuning file — IMX708 Wide NoIR colour correction ──────────────
+            # The NoIR camera has no infrared-cut filter.  Without its specific
+            # tuning file (imx708_wide_noir.json), libcamera applies the standard
+            # imx708.json CCM which is calibrated for the IR-cut variant.
+            # Result: red objects appear purple because the CCM over-corrects.
             #
-            # We probe the model string reported by Picamera2 global_camera_info
-            # before opening the camera, then pass the best-matching tuning file
-            # directly to Picamera2() so libcamera loads it unconditionally.
+            # Strategy — two independent layers, both applied:
+            #   1. LIBCAMERA_RPI_TUNING_FILE env var (libcamera reads this
+            #      before Picamera2 is even created — cannot be ignored).
+            #   2. ColourGains manual override (applied after start) as a
+            #      belt-and-suspenders correction if tuning still drifts.
+
             tuning_path: Optional[str] = None
-            tuning_obj = None
+            _is_noir = False
             try:
                 cam_list = Picamera2.global_camera_info()
                 if cam_list and self.camera_idx < len(cam_list):
                     raw_model = cam_list[self.camera_idx].get("Model", "")
+                    print(f"[IMX708] Detected sensor model: '{raw_model}'")
+                    _is_noir = "noir" in raw_model.lower()
                     tuning_path = self._find_tuning_file(raw_model)
-                    if tuning_path:
-                        tuning_obj = Picamera2.load_tuning_file(tuning_path)
-                        print(f"[IMX708] Tuning file loaded: {tuning_path}")
-                    else:
-                        print(f"[IMX708] WARN: No matching tuning file for model '{raw_model}' "
-                              f"— libcamera will use its built-in default (colours may be off).")
-            except Exception as tune_err:
-                print(f"[IMX708] Tuning file probe skipped: {tune_err}")
+            except Exception as probe_err:
+                print(f"[IMX708] Sensor model probe failed: {probe_err}")
 
-            # Open camera, injecting the tuning object when available
-            if tuning_obj is not None:
-                self._picam2 = Picamera2(self.camera_idx, tuning=tuning_obj)
+            if tuning_path:
+                # Layer 1: set env var BEFORE constructing Picamera2.
+                # libcamera reads this at driver init time — guaranteed to load.
+                os.environ["LIBCAMERA_RPI_TUNING_FILE"] = tuning_path
+                print(f"[IMX708] Tuning file set via env: {tuning_path}")
             else:
-                self._picam2 = Picamera2(self.camera_idx)
+                print("[IMX708] WARN: tuning file not found — colours may be incorrect.")
+                print("[IMX708]       Run: sudo apt install -y rpicam-apps  (ships tuning files)")
+
+            # Construct Picamera2 (libcamera now uses the tuning file from env)
+            self._picam2 = Picamera2(self.camera_idx)
 
             # Query hardware properties
             try:
@@ -308,31 +312,21 @@ class IMX708CameraCapture:
                 pass
 
             # ── Colour format ────────────────────────────────────────────
-            # Request RGB888 explicitly. BGR888 in picamera2 is unreliable
-            # across libcamera versions — on some builds the ISP outputs RGB
-            # even when BGR888 is requested, causing R/B channel swaps
-            # (reds appear purple). We capture as RGB888 and convert below.
+            # BGR888 byte order is inconsistent across libcamera versions.
+            # RGB888 is unambiguous; we convert explicitly below.
             #
             # ── Full-FOV configuration ───────────────────────────────────
-            # The IMX708 Wide NoIR has a ~120° diagonal FOV at full sensor
-            # size (4608×2592). Without a raw stream specified, picamera2
-            # picks the lowest binned sensor mode (1536×864) and centre-
-            # crops it to the requested output size — significantly cutting
-            # the FOV. Adding raw={"size": (4608, 2592)} forces the sensor
-            # into its full-readout mode; the ISP then scales the complete
-            # frame down to the requested output resolution, preserving the
-            # full 120° field of view.
+            # raw={"size": (4608, 2592)} forces full-sensor readout → 120° FOV.
             config = self._picam2.create_video_configuration(
                 main={"format": "RGB888", "size": (self.width, self.height)},
-                raw={"size": (4608, 2592)},   # Force full-sensor readout → full 120° FOV
+                raw={"size": (4608, 2592)},
                 controls={"FrameRate": self.fps},
-                queue=False,                  # Always deliver the latest frame, no buffer lag
+                queue=False,
             )
             self._picam2.configure(config)
             self._picam2.start()
 
-            # Reset ScalerCrop to full pixel array (belt-and-suspenders against
-            # any libcamera default that might still crop the sensor window).
+            # Reset ScalerCrop to full pixel array
             try:
                 pixel_array_size = self._picam2.camera_properties.get(
                     "PixelArraySize", (4608, 2592)
@@ -346,10 +340,36 @@ class IMX708CameraCapture:
             # Configure autofocus (PDAF is supported by IMX708)
             self.set_autofocus(self.af_mode)
 
-            # Warm-up: allow ISP AWB and AEC to converge fully.
-            # Increased from 0.3 s — short warm-ups leave AWB partially
-            # converged which shifts colour balance (especially reds → purple).
+            # Warm-up: allow AWB and AEC to converge before we apply corrections
             time.sleep(1.5)
+
+            # ── Layer 2: ColourGains correction for NoIR ─────────────────────
+            # Applied AFTER AWB converges. If the tuning file loaded correctly
+            # this won't be needed, but it acts as a guaranteed safety net.
+            #
+            # ColourGains = (red_gain, blue_gain).
+            # NoIR cameras absorb IR into red channel → red appears over-boosted
+            # → CCM compensates by pushing red toward blue → purple cast.
+            # Reducing red gain slightly and keeping blue gain corrects this.
+            if _is_noir:
+                try:
+                    # Read what AWB converged to
+                    md = self._picam2.capture_metadata()
+                    awb_r = md.get("ColourGains", (2.0, 1.8))[0]
+                    awb_b = md.get("ColourGains", (2.0, 1.8))[1]
+                    # Apply NoIR correction: reduce red, boost blue slightly
+                    corrected_r = round(awb_r * 0.80, 3)   # -20% red to remove purple
+                    corrected_b = round(awb_b * 1.10, 3)   # +10% blue
+                    self._picam2.set_controls({
+                        "AwbEnable": False,              # Lock gains so AWB doesn't undo fix
+                        "ColourGains": (corrected_r, corrected_b),
+                    })
+                    print(f"[IMX708] NoIR ColourGains correction applied: "
+                          f"R={corrected_r} (was {awb_r:.3f}), "
+                          f"B={corrected_b} (was {awb_b:.3f})")
+                except Exception as gains_err:
+                    print(f"[IMX708] ColourGains correction skipped: {gains_err}")
+
             self._is_opened = True
 
         except Exception as exc:
