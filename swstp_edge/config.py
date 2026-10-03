@@ -206,8 +206,13 @@ LITTER_WEIGHTS = next((p for p in _WEIGHT_CANDIDATES if os.path.isfile(p)), _WEI
 # ---------------------------------------------------------------------------
 POWER_MANAGEMENT_ENABLED = True
 
-# GPIO pin monitored for Low Battery Alert from UPS / secondary battery BMS
-GPIO_LOW_BATT_PIN = 25   # BCM 25 (Pin 22 on 40-pin header). Set to None if not wired.
+# GPIO pin monitored for Low Battery Alert from UPS / secondary battery BMS.
+# Set to None if NO UPS HAT / BMS hardware is physically wired to this pin.
+# WARNING: Leaving a pin number here without wired hardware causes the floating
+# pin to randomly read LOW (especially with NativeFactory GPIO backend), which
+# triggers a false EMERGENCY SHUTDOWN after LOW_BATT_DEBOUNCE_SEC seconds.
+# Re-enable by setting: GPIO_LOW_BATT_PIN = 25  (BCM 25 = physical Pin 22)
+GPIO_LOW_BATT_PIN = None   # Set to 25 when UPS/BMS low-battery wire is connected
 
 # Low battery alert logic level: True = active LOW (0 V = warning), False = active HIGH
 LOW_BATT_ACTIVE_LOW = True
