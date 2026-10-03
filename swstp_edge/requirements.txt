@@ -8,9 +8,12 @@ numpy>=1.24.0
 imutils>=0.5.4
 
 # ── Camera Module 3 (Sony IMX708) native CSI driver ───────────────────────────
-# On Raspberry Pi OS (Bookworm / Bullseye), install via apt:
+# picamera2 links against system libcamera shared libraries that cannot be
+# bundled in a wheel. It MUST be installed via apt, then the venv created
+# with --system-site-packages to expose it:
 #   sudo apt install -y python3-picamera2
-# (Or via pip if libcamera dev packages are present: picamera2>=0.3.0)
+#   python3 -m venv venv --system-site-packages
+# Do NOT add picamera2 here — pip-installed wheels lack libcamera bindings.
 
 # ── Litter detection ONNX inference (zero PyTorch / no Ultralytics) ──────────
 # Primary inference backend: ONNX Runtime (CPU, 4-thread, Pi 4B optimised)
@@ -29,5 +32,11 @@ smbus2>=0.4.3
 # NEO-6M GNSS via gpsd (optional fallback if NavCast TCP is not used)
 gpsdclient>=1.0.0
 
-# Status LED GPIO control (hardware pin factory provided via apt: python3-lgpio)
+# Status LED GPIO control
+# gpiozero selects its pin factory in this priority order:
+#   lgpio → rpi-lgpio → RPi.GPIO → pigpio → NativeFactory (experimental, avoid)
+# lgpio is pip-installable and works on Pi 4B + Pi 5 with Bookworm.
+# rpi-lgpio is the Pi 5 / kernel 6.6+ variant; pip installs whichever builds.
 gpiozero>=2.0
+lgpio>=0.2.2
+# rpi-lgpio>=0.6    # Uncomment if lgpio fails on Pi 5 (kernel ≥ 6.6)
