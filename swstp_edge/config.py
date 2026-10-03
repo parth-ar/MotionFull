@@ -77,11 +77,21 @@ DEFAULT_VEHICLE_ID = "UNASSIGNED"
 DEFAULT_STREAM_FPS = 30.0
 
 # ---------------------------------------------------------------------------
-# Camera Configuration (Raspberry Pi Camera Module 3 / IMX708 & USB Webcams)
+# Camera Configuration (Raspberry Pi Camera Module 3 / IMX708 Wide NoIR)
 # ---------------------------------------------------------------------------
+# IMX708 native sensor: 4608 × 2592 px  →  aspect ratio 16:9 (1.777:1)
+# Operational resolution must be 16:9 to preserve the full 120° diagonal FOV.
+#
+# Resolution options (all 16:9, all achievable at 30 fps on Pi 4B):
+#   High   : 1280 × 720   — sharper captures, heavier motion diff CPU
+#   Default: 960  × 540   — good balance for Pi 4B (motion + YOLO 30 fps)
+#   Light  : 640  × 360   — minimum for very slow hardware
+#
+# DO NOT use 4:3 resolutions (e.g. 640×480) — they crop the sensor width
+# and silently discard the wide-angle edges, reducing effective FOV to ~90°.
 CAMERA_SOURCE_DEFAULT    = "auto"      # "auto" scans IMX708 first, then USB
-CAMERA_WIDTH             = 640
-CAMERA_HEIGHT            = 480
+CAMERA_WIDTH             = 960         # 16:9 — preserves full 120° FOV
+CAMERA_HEIGHT            = 540         # 16:9 — matches IMX708 native aspect
 CAMERA_FPS               = 30.0
 CAMERA_AUTOFOCUS         = True        # Continuous PDAF autofocus for IMX708
 CAMERA_AF_MODE           = "continuous"# Options: "continuous", "auto", "manual"

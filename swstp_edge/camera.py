@@ -211,6 +211,49 @@ class IMX708CameraCapture:
 
         self._init_camera()
 
+    # Known libcamera IPA tuning file search paths (Raspberry Pi OS Bookworm / Bullseye)
+    _TUNING_SEARCH_PATHS = [
+        "/usr/share/libcamera/ipa/rpi/vc4",       # Pi 4 / Bullseye + Bookworm
+        "/usr/share/libcamera/ipa/rpi/pisp",      # Pi 5 (PISP ISP)
+        "/usr/share/rpi-camera-assets",           # Legacy path
+    ]
+
+    # Tuning file names in preference order for IMX708 Wide NoIR
+    _TUNING_CANDIDATES_NOIR_WIDE = [
+        "imx708_wide_noir.json",   # Exact match — Wide + NoIR
+        "imx708_noir.json",        # NoIR without explicit wide label
+        "imx708_wide.json",        # Wide with IR-cut (better than generic)
+        "imx708.json",             # Generic fallback
+    ]
+
+    def _find_tuning_file(self, model_str: str) -> Optional[str]:
+        """
+        Locate the best-matching libcamera IPA tuning JSON for the detected
+        sensor model string.  Returns the full path or None if not found.
+        """
+        model_lower = model_str.lower()
+        is_wide = "wide" in model_lower
+        is_noir = "noir" in model_lower
+
+        if "imx708" in model_lower:
+            if is_wide and is_noir:
+                candidates = self._TUNING_CANDIDATES_NOIR_WIDE
+            elif is_noir:
+                candidates = ["imx708_noir.json", "imx708.json"]
+            elif is_wide:
+                candidates = ["imx708_wide_noir.json", "imx708_wide.json", "imx708.json"]
+            else:
+                candidates = ["imx708.json"]
+        else:
+            return None
+
+        for search_dir in self._TUNING_SEARCH_PATHS:
+            for fname in candidates:
+                full = os.path.join(search_dir, fname)
+                if os.path.isfile(full):
+                    return full
+        return None
+
     def _init_camera(self) -> None:
         try:
             # Enable hardware HDR if requested and supported
@@ -223,7 +266,37 @@ class IMX708CameraCapture:
                 except Exception as hdr_err:
                     print(f"[IMX708] HDR setting skipped: {hdr_err}")
 
-            self._picam2 = Picamera2(self.camera_idx)
+            # ── Tuning file selection ──────────────────────────────────────────
+            # The IMX708 Wide NoIR has NO infrared-cut filter.  Without the
+            # correct tuning file, libcamera uses the standard imx708.json
+            # colour matrix / AWB tables which are calibrated for the IR-cut
+            # variant.  The result is a strong colour cast (reds → purple,
+            # overall warm-white shift) because IR light is treated as visible.
+            #
+            # We probe the model string reported by Picamera2 global_camera_info
+            # before opening the camera, then pass the best-matching tuning file
+            # directly to Picamera2() so libcamera loads it unconditionally.
+            tuning_path: Optional[str] = None
+            tuning_obj = None
+            try:
+                cam_list = Picamera2.global_camera_info()
+                if cam_list and self.camera_idx < len(cam_list):
+                    raw_model = cam_list[self.camera_idx].get("Model", "")
+                    tuning_path = self._find_tuning_file(raw_model)
+                    if tuning_path:
+                        tuning_obj = Picamera2.load_tuning_file(tuning_path)
+                        print(f"[IMX708] Tuning file loaded: {tuning_path}")
+                    else:
+                        print(f"[IMX708] WARN: No matching tuning file for model '{raw_model}' "
+                              f"— libcamera will use its built-in default (colours may be off).")
+            except Exception as tune_err:
+                print(f"[IMX708] Tuning file probe skipped: {tune_err}")
+
+            # Open camera, injecting the tuning object when available
+            if tuning_obj is not None:
+                self._picam2 = Picamera2(self.camera_idx, tuning=tuning_obj)
+            else:
+                self._picam2 = Picamera2(self.camera_idx)
 
             # Query hardware properties
             try:
@@ -234,19 +307,49 @@ class IMX708CameraCapture:
             except Exception:
                 pass
 
-            # Configure video stream with BGR888 format (matches OpenCV frame memory layout)
+            # ── Colour format ────────────────────────────────────────────
+            # Request RGB888 explicitly. BGR888 in picamera2 is unreliable
+            # across libcamera versions — on some builds the ISP outputs RGB
+            # even when BGR888 is requested, causing R/B channel swaps
+            # (reds appear purple). We capture as RGB888 and convert below.
+            #
+            # ── Full-FOV configuration ───────────────────────────────────
+            # The IMX708 Wide NoIR has a ~120° diagonal FOV at full sensor
+            # size (4608×2592). Without a raw stream specified, picamera2
+            # picks the lowest binned sensor mode (1536×864) and centre-
+            # crops it to the requested output size — significantly cutting
+            # the FOV. Adding raw={"size": (4608, 2592)} forces the sensor
+            # into its full-readout mode; the ISP then scales the complete
+            # frame down to the requested output resolution, preserving the
+            # full 120° field of view.
             config = self._picam2.create_video_configuration(
-                main={"format": "BGR888", "size": (self.width, self.height)},
-                controls={"FrameRate": self.fps}
+                main={"format": "RGB888", "size": (self.width, self.height)},
+                raw={"size": (4608, 2592)},   # Force full-sensor readout → full 120° FOV
+                controls={"FrameRate": self.fps},
+                queue=False,                  # Always deliver the latest frame, no buffer lag
             )
             self._picam2.configure(config)
             self._picam2.start()
 
+            # Reset ScalerCrop to full pixel array (belt-and-suspenders against
+            # any libcamera default that might still crop the sensor window).
+            try:
+                pixel_array_size = self._picam2.camera_properties.get(
+                    "PixelArraySize", (4608, 2592)
+                )
+                self._picam2.set_controls({
+                    "ScalerCrop": (0, 0, pixel_array_size[0], pixel_array_size[1])
+                })
+            except Exception as crop_err:
+                print(f"[IMX708] ScalerCrop reset skipped: {crop_err}")
+
             # Configure autofocus (PDAF is supported by IMX708)
             self.set_autofocus(self.af_mode)
 
-            # Warm-up settle delay for ISP auto-exposure & AWB
-            time.sleep(0.3)
+            # Warm-up: allow ISP AWB and AEC to converge fully.
+            # Increased from 0.3 s — short warm-ups leave AWB partially
+            # converged which shifts colour balance (especially reds → purple).
+            time.sleep(1.5)
             self._is_opened = True
 
         except Exception as exc:
@@ -305,9 +408,15 @@ class IMX708CameraCapture:
             if frame is None or frame.size == 0:
                 return False, None
 
-            # Handle 4-channel output if format was negotiated as BGRA/XBGR
-            if _HAS_CV2 and frame.ndim == 3 and frame.shape[2] == 4:
-                frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+            # Convert RGB888 capture → BGR for OpenCV compatibility.
+            # This also handles 4-channel RGBA output from some libcamera builds.
+            if _HAS_CV2:
+                if frame.ndim == 3 and frame.shape[2] == 4:
+                    # RGBA → BGR
+                    frame = cv2.cvtColor(frame, cv2.COLOR_RGBA2BGR)
+                elif frame.ndim == 3 and frame.shape[2] == 3:
+                    # RGB → BGR (correct channel order for OpenCV)
+                    frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
 
             return True, frame
         except Exception:

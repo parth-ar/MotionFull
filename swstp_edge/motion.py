@@ -121,8 +121,23 @@ def run_roi_setup_phase(cap, win_title: str, frame_w: int, frame_h: int) -> list
     """
     global active_polygon_roi
 
-    # Points being drawn in this session (pixel coords during draw, converted to
-    # normalised [0-1] on confirm)
+    # ── Display resolution for the AoI setup phase ────────────────────────
+    # Upscale to 1280×720 so the operator sees the FULL camera FOV (120° on
+    # IMX708 Wide NoIR) even when the operational capture res is lower.
+    # Polygon clicks are captured in display-pixel space and normalised to
+    # [0-1] against display dimensions — saved coords stay correct at runtime.
+    SETUP_DISPLAY_W = 1280
+    SETUP_DISPLAY_H = 720
+
+    cam_aspect = frame_w / max(frame_h, 1)
+    tgt_aspect = SETUP_DISPLAY_W / SETUP_DISPLAY_H
+    if cam_aspect >= tgt_aspect:
+        disp_w = SETUP_DISPLAY_W
+        disp_h = max(1, int(SETUP_DISPLAY_W / cam_aspect))
+    else:
+        disp_h = SETUP_DISPLAY_H
+        disp_w = max(1, int(SETUP_DISPLAY_H * cam_aspect))
+
     new_points_px = []   # list of (x, y) pixel tuples placed this session
     mouse_pos     = [0, 0]
     warn_until    = 0.0
@@ -135,25 +150,28 @@ def run_roi_setup_phase(cap, win_title: str, frame_w: int, frame_h: int) -> list
             new_points_px.pop()
 
     try:
+        # Expand window to wide-FOV display size for the setup phase
+        cv2.resizeWindow(win_title, disp_w, disp_h + 62)  # +62 for bottom strip
         cv2.setMouseCallback(win_title, _mouse_cb)
     except Exception:
         # Window not yet created or headless — skip phase
         return active_polygon_roi
 
     print("\n[ROI/AoD SETUP] Startup polygon configuration:")
+    print(f"  Setup display: {disp_w}\u00d7{disp_h}  (camera capture: {frame_w}\u00d7{frame_h})")
     print("  The same polygon is used as Motion ROI and Litter AoD.")
-    print("  • Left-click  : place a new point")
-    print("  • Right-click : undo last point")
-    print("  • C key       : clear and start fresh")
-    print("  • Enter/Space : confirm new polygon (need ≥3 pts), or keep saved polygon")
-    print("  • Esc         : skip — use current saved polygon as-is\n")
+    print("  \u2022 Left-click  : place a new point")
+    print("  \u2022 Right-click : undo last point")
+    print("  \u2022 C key       : clear and start fresh")
+    print("  \u2022 Enter/Space : confirm new polygon (need \u22653 pts), or keep saved polygon")
+    print("  \u2022 Esc         : skip \u2014 use current saved polygon as-is\n")
 
-    # Build pixel-coord version of the currently saved polygon for display
+    # Build pixel-coord version of the saved polygon mapped to display dimensions
     def _saved_poly_px():
         pts = []
         for p in active_polygon_roi:
-            px = int(p[0] * frame_w) if p[0] <= 1.0 else int(p[0])
-            py = int(p[1] * frame_h) if p[1] <= 1.0 else int(p[1])
+            px = int(p[0] * disp_w) if p[0] <= 1.0 else int(p[0])
+            py = int(p[1] * disp_h) if p[1] <= 1.0 else int(p[1])
             pts.append((px, py))
         return pts
 
@@ -162,7 +180,11 @@ def run_roi_setup_phase(cap, win_title: str, frame_w: int, frame_h: int) -> list
         if not ok:
             continue
 
-        display = frame.copy()
+        # Upscale capture frame to setup display size for full-FOV view
+        if frame.shape[1] != disp_w or frame.shape[0] != disp_h:
+            display = cv2.resize(frame, (disp_w, disp_h), interpolation=cv2.INTER_LINEAR)
+        else:
+            display = frame.copy()
         h, w = display.shape[:2]
         now = time.time()
 
@@ -244,9 +266,11 @@ def run_roi_setup_phase(cap, win_title: str, frame_w: int, frame_h: int) -> list
         if key in (13, 32):  # Enter or Space
             if new_points_px:
                 if len(new_points_px) >= 3:
-                    # Convert pixel coords → normalised [0-1]
+                    # Convert display-pixel coords → normalised [0-1]
+                    # Use disp_w/disp_h (setup display size) since clicks
+                    # were captured against the upscaled frame.
                     normalised = [
-                        [round(px / frame_w, 4), round(py / frame_h, 4)]
+                        [round(px / disp_w, 4), round(py / disp_h, 4)]
                         for px, py in new_points_px
                     ]
                     active_polygon_roi = normalised
@@ -268,8 +292,9 @@ def run_roi_setup_phase(cap, win_title: str, frame_w: int, frame_h: int) -> list
             new_points_px.clear()
             print("[ROI/AoD SETUP] Cleared new points — start drawing fresh.")
 
-    # Restore mouse callback to the runtime ROI handler
+    # Restore window and mouse callback for the runtime detection loop
     try:
+        cv2.resizeWindow(win_title, 960, 540)  # Back to operational display size
         cv2.setMouseCallback(win_title, on_mouse_roi, {"width": frame_w, "height": frame_h})
     except Exception:
         pass
