@@ -1,4 +1,4 @@
-[Unit]
+ [Unit]
 Description=SWSTP Edge Gateway — Motion Detection & Telemetry (Raspberry Pi)
 Documentation=https://github.com/your-org/swstp_edge
 After=network-online.target time-sync.target
@@ -11,8 +11,9 @@ User=pi
 Group=pi
 
 # ── Working directory & interpreter ─────────────────────────────────────────
+# Update paths to match your actual home directory and virtual environment:
 WorkingDirectory=/home/pi/swstp_edge
-ExecStart=/usr/bin/python3 /home/pi/swstp_edge/main.py --headless
+ExecStart=/home/pi/swstp_edge/venv/bin/python /home/pi/swstp_edge/main.py --headless
 
 # ── Environment ──────────────────────────────────────────────────────────────
 # Optional: override the backend URL without editing config.py
@@ -22,7 +23,7 @@ Environment=QT_QPA_PLATFORM=offscreen
 
 # ── Restart policy ───────────────────────────────────────────────────────────
 # Restart automatically 5 seconds after any failure
-Restart=on-failure
+Restart=always
 RestartSec=5s
 
 # Give the program a full minute to start (sensor + network init can be slow)
@@ -40,12 +41,7 @@ StandardError=journal
 SyslogIdentifier=swstp-edge
 
 # ── Capabilities / security ──────────────────────────────────────────────────
-# GPIO access requires the 'gpio' group (or root). If your Pi uses /dev/gpiomem
-# ensure the user is in the 'gpio' supplementary group:
-#   sudo usermod -aG gpio pi
-# If you are using i2c (DS3231 / MPU-6500):
-#   sudo usermod -aG i2c pi
-SupplementaryGroups=gpio i2c video
+SupplementaryGroups=gpio i2c video render
 
 [Install]
 WantedBy=multi-user.target
