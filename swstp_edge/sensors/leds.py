@@ -28,6 +28,7 @@ import time
 
 from config import (
     LED_RTC_GREEN, LED_IMU_GREEN, LED_GNSS_GREEN, LED_YELLOW, LED_RED,
+    LED_LTE_GREEN,
     LED_FAULT_BLINK_INTERVAL,
 )
 
@@ -114,6 +115,7 @@ def init() -> None:
         "gnss_green": _make_led(LED_GNSS_GREEN),
         "yellow":     _make_led(LED_YELLOW),
         "red":        _make_led(LED_RED),
+        "lte_green":  _make_led(LED_LTE_GREEN),
     }
     _boot_splash()
     print("[LEDS] GPIO LED driver initialised.")

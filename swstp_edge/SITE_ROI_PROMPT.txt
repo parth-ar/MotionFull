@@ -1,0 +1,75 @@
+SITE-SIDE PROMPT: ROI (Region of Interest) Remote Configuration
+================================================================
+
+FEATURE OVERVIEW
+----------------
+Allow the site/dashboard to remotely set the ROI polygon for a specific device.
+The ROI is stored in swstp_edge/roi_polygon.json as a JSON array of normalised
+[x, y] coordinate pairs (values 0.0–1.0 relative to frame width/height).
+
+WHAT THE EDGE PROGRAM ALREADY DOES
+------------------------------------
+- Reads roi_polygon.json at startup into _motion.active_polygon_roi
+- Watches for ROI changes during runtime via the 'r' key (GUI) or this API
+- Reloads the polygon via load_roi_polygon() (motion.py)
+- Propagates any new polygon to the litter engine (litter_engine.aod_polygon_norm)
+- Exposes a polling endpoint: the main loop checks for a file called
+  roi_polygon.json on disk; replacing this file is sufficient to change the ROI
+
+BACKEND API REQUIREMENTS
+-------------------------
+1. ENDPOINT: PUT /api/devices/{device_id}/roi
+   Body: { "polygon": [[x1,y1],[x2,y2],[x3,y3],...] }
+   - All coordinates must be normalised floats in range [0.0, 1.0]
+   - Minimum 3 points required
+   - Backend must write this polygon to the device's roi_polygon.json file
+     (via SSH, SCP, or the device agent's file-write API, whichever is available)
+
+2. ENDPOINT: GET /api/devices/{device_id}/roi
+   Response: { "polygon": [[x1,y1],...], "updated_at": "<ISO timestamp>" }
+   - Returns current ROI from roi_polygon.json
+
+3. EDGE RELOAD MECHANISM
+   Option A (Recommended): The edge gateway polls roi_polygon.json every 10 s
+   for file modification time. If changed, it reloads automatically.
+   Add to main.py's main loop (already has a placeholder):
+       _roi_check_interval = 10  # seconds
+       _last_roi_mtime = 0.0
+       ...
+       now_mono_roi = time.monotonic()
+       if now_mono_roi - _last_roi_check > _roi_check_interval:
+           try:
+               mtime = os.path.getmtime(ROI_CONFIG_FILE)
+               if mtime != _last_roi_mtime:
+                   new_roi = load_roi_polygon()
+                   _motion.active_polygon_roi = new_roi
+                   if litter_engine:
+                       litter_engine.aod_polygon_norm = new_roi
+                   _last_roi_mtime = mtime
+                   print(f"[ROI] Reloaded from disk: {len(new_roi)} pts")
+           except Exception:
+               pass
+           _last_roi_check = now_mono_roi
+
+   Option B: Expose a small HTTP endpoint on the device that accepts the polygon
+   and writes it to roi_polygon.json directly (requires a lightweight Flask/FastAPI
+   server running on the Pi alongside main.py).
+
+4. FRONTEND (DASHBOARD) REQUIREMENTS
+   - Display a live frame snapshot overlaid with the current ROI polygon
+   - Allow the user to drag polygon vertices or click new points on the image
+   - Send the updated polygon to the backend PUT endpoint
+   - Show confirmation when the device acknowledges the new ROI
+   - Include validation: minimum 3 points, coordinates in [0,1] range
+
+POLYGON FORMAT EXAMPLE
+-----------------------
+roi_polygon.json content:
+[
+  [0.7094, 0.3312],
+  [0.7109, 0.6083],
+  [0.9219, 0.6312],
+  [0.9203, 0.3271]
+]
+
+The above is a 4-point polygon occupying the right-side viewport area.

@@ -312,23 +312,67 @@ class IMX708CameraCapture:
             # Configure autofocus (PDAF is supported by IMX708)
             self.set_autofocus(self.af_mode)
 
-            # Warm-up: allow AWB and AEC to converge naturally
-            time.sleep(1.2)
-
-            # Ensure continuous AWB is active (NEVER disable AwbEnable or lock gains!)
+            # ── Colour / AWB fix for IMX708 Wide NoIR ─────────────────────────
+            # The IMX708 NoIR lacks an IR-cut filter.  Without the correct NoIR
+            # tuning file, libcamera's AWB algorithm over-corrects blue/magenta
+            # channel gains and greens appear purple/magenta in the output.
+            #
+            # Fix strategy:
+            #   1. Use AwbMode=Daylight (warmer gains, Rg ≈ 2.0, Bg ≈ 1.5) so
+            #      the green channel is not suppressed by the default Auto mode
+            #      which tends to pick cool (blue-dominant) gains on a NoIR.
+            #   2. Enable AeEnable so exposure is stable during AWB convergence.
+            #   3. Extend warm-up to 2.5 s to allow gains to fully converge.
+            #   4. If no NoIR tuning file was found, apply explicit ColourGains
+            #      that approximate the correct Rg/Bg ratio for daylight NoIR.
+            #
+            # DO NOT lock gains (ColourGains) permanently when the tuning file
+            # IS loaded — the tuning file's CCM is already calibrated.
             try:
                 if libcam_controls and hasattr(libcam_controls, "AwbModeEnum"):
+                    # Daylight AWB mode gives correct greens for outdoor NoIR use.
+                    # Indoor scenes can still look slightly warm but green dominance
+                    # is correct — far better than the purple cast from Auto mode.
                     self._picam2.set_controls({
+                        "AeEnable":  True,
                         "AwbEnable": True,
-                        "AwbMode": libcam_controls.AwbModeEnum.Auto
+                        "AwbMode":   libcam_controls.AwbModeEnum.Daylight,
                     })
+                    print("[IMX708] AWB set to Daylight mode for NoIR green channel correction.")
                 else:
+                    # Fallback: use integer enum (4 = Daylight in libcamera)
+                    self._picam2.set_controls({
+                        "AeEnable":  True,
+                        "AwbEnable": True,
+                        "AwbMode":   4,
+                    })
+                    print("[IMX708] AWB set to Daylight mode (integer enum fallback).")
+            except Exception as awb_err:
+                print(f"[IMX708] Note: AWB Daylight mode not applied: {awb_err}. Falling back to Auto.")
+                try:
                     self._picam2.set_controls({"AwbEnable": True})
-            except Exception:
-                pass
+                except Exception:
+                    pass
 
-            print(f"[IMX708] Initialized successfully ({self.width}x{self.height} @ {self.fps} fps, PDAF: {self.af_mode}, RB swap: {self.swap_rb})")
+            # Extended warm-up: 2.5 s for AWB and AEC to fully converge on NoIR
+            time.sleep(2.5)
+
+            # If the NoIR tuning file was NOT loaded, apply a gentle explicit
+            # ColourGains correction that reduces blue dominance.
+            # Rg ≈ 2.1 (red gain) and Bg ≈ 1.45 (blue gain) are empirically good
+            # for outdoor daylight on IMX708 Wide NoIR without a tuning file.
+            tuning_active = bool(os.environ.get("LIBCAMERA_RPI_TUNING_FILE", ""))
+            if not tuning_active:
+                try:
+                    self._picam2.set_controls({"ColourGains": (2.1, 1.45)})
+                    print("[IMX708] Applied fallback ColourGains (Rg=2.1, Bg=1.45) — no tuning file detected.")
+                except Exception:
+                    pass
+
+            print(f"[IMX708] Initialized successfully ({self.width}x{self.height} @ {self.fps} fps, "
+                  f"PDAF: {self.af_mode}, RB swap: {self.swap_rb})")
             self._is_opened = True
+
 
         except Exception as exc:
             self._is_opened = False

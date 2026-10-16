@@ -1,0 +1,111 @@
+SITE-SIDE PROMPT: Live Device Log Viewer
+=========================================
+
+FEATURE OVERVIEW
+----------------
+Allow the site/dashboard to view the live terminal/device log output of a
+specific device in real time, exactly as it appears when running the program.
+This includes all printed lines from main.py (sensor init, stop events, motion
+captures, litter detections, GPS data, etc.).
+
+WHAT THE EDGE PROGRAM ALREADY DOES
+------------------------------------
+The main.py program now writes to TWO log outputs simultaneously:
+
+1. ROLLING DEVICE LOG FILE: logs/device.log
+   - Location: swstp_edge/logs/device.log
+   - Appended automatically by session_logger.py for all key events:
+       SESSION START, SENSOR INIT, STOP BEGIN, STOP END,
+       MOTION CAPTURE #N, LITTER DETECTED, SESSION END
+   - Rolling cap: 5 MB max; oldest half is truncated when limit is reached
+   - Plain text format: "[YYYY-MM-DDTHH:MM:SS] EVENT_TYPE | fields..."
+
+2. SESSION JSON LOGS: logs/sessions/<timestamp>_<device_id>.json
+   - One structured JSON file per session with full event detail
+   - Includes all stops, captures, litter events with coordinates
+   - Useful for historical review and analytics
+
+3. STDOUT/STDERR (live terminal output)
+   - All print() statements in main.py, camera.py, litter_engine.py, etc.
+   - When running as a systemd service: journalctl -u swstp-edge -f
+   - Can be redirected to a file:
+       python3 main.py --headless 2>&1 | tee logs/live.log
+
+BACKEND API REQUIREMENTS
+-------------------------
+1. ENDPOINT: GET /api/devices/{device_id}/logs/live  (SSE stream)
+   - Tails logs/device.log on the Pi in real time
+   - Uses Server-Sent Events (SSE) for push-based streaming:
+     Content-Type: text/event-stream
+   - Backend SSHes to the Pi and runs:
+       tail -f /home/pi/swstp_edge/logs/device.log
+   - Each new log line is sent as an SSE event:
+       data: [2026-10-17T12:34:56] MOTION CAPTURE #3 | lat=18.9... \n\n
+
+2. ENDPOINT: GET /api/devices/{device_id}/logs/device
+   Query params: ?lines=200&offset=0
+   Response: {
+     "lines": ["[2026-10-17T12:34:56] SESSION START | ...", ...],
+     "total_lines": 450,
+     "file_size_bytes": 12345
+   }
+   - Returns last N lines from device.log (paginated)
+
+3. ENDPOINT: GET /api/devices/{device_id}/logs/sessions
+   Response: {
+     "sessions": [
+       { "filename": "2026-10-17_12-34-56_DEVICE01.json", "size_bytes": 3200,
+         "created_at": "2026-10-17T12:34:56Z" },
+       ...
+     ]
+   }
+
+4. ENDPOINT: GET /api/devices/{device_id}/logs/sessions/{filename}
+   Response: Full JSON session log (from logs/sessions/<filename>.json)
+
+5. ENDPOINT: DELETE /api/devices/{device_id}/logs/device
+   - Clears (truncates) device.log on the Pi (admin only)
+
+6. LIVE JOURNALCTL STREAM (alternative to device.log)
+   For raw systemd service output (richer but noisier):
+     ssh pi@device_ip "journalctl -u swstp-edge -f --no-pager --output=cat"
+   Strip ANSI codes before sending to browser:
+     import re; ANSI = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
+
+EDGE-SIDE FILE PATHS
+---------------------
+  Live device log : swstp_edge/logs/device.log
+  Session logs    : swstp_edge/logs/sessions/*.json
+  Systemd journal : journalctl -u swstp-edge  (or swstp-unified)
+
+FRONTEND (DASHBOARD) REQUIREMENTS
+-----------------------------------
+- "Live Logs" tab on the device detail page
+- Real-time scrolling terminal panel (monospace font, dark background)
+- Auto-scroll toggle (default: ON)
+- Filter bar: filter lines by keyword (e.g. "LITTER", "STOP", "ERROR")
+- Colour coding by event type:
+    green  = MOTION CAPTURE, LITTER DETECTED, PASSED
+    yellow = STOP BEGIN/END, warnings
+    red    = ERROR, FAULT, FAILED
+    cyan   = SESSION START/END
+    white  = all other lines
+- Download button: export current session log as JSON or CSV
+- "Clear logs" button (admin only)
+- Timestamp column separate from message for readability
+
+LOG LINE EXAMPLES (device.log format)
+--------------------------------------
+[2026-10-17T08:00:01] SESSION START | device=DEV001 | session_id=42 | log=...
+[2026-10-17T08:00:02] SENSOR INIT | RTC=OK | IMU=OK | GNSS=OK | Cam=OK (Sony IMX708)
+[2026-10-17T08:05:14] STOP BEGIN   | stop_id=stop-abc123 | lat=18.9876 lon=72.8765
+[2026-10-17T08:05:22] MOTION CAPTURE #1 | stop=stop-abc123 | lat=18.9876 lon=72.8765 | speed=0.0 km/h | file=motion_RTC_....jpg
+[2026-10-17T08:05:48] STOP END     | stop_id=stop-abc123 | duration=34.2s | captures=3 | reason=vehicle_moved
+[2026-10-17T08:08:33] LITTER DETECTED | 2 object(s): [plastic_bag, bottle] | lat=18.9901 lon=72.8788 | file=litter_T0023_E0005_....jpg
+[2026-10-17T09:30:00] SESSION END  | device=DEV001 | runtime=5398s | stops=12 | motion_captures=28 | litter_inferences=234 | litter_detected_frames=7 | exit=normal_shutdown
+
+SECURITY NOTE
+-------------
+- Only authenticated users (admin, operator, technician) should access logs
+- Log streaming should use authenticated WebSocket/SSE (JWT token in header)
+- PII in coordinates should be access-controlled (operator+ only)

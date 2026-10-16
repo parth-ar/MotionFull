@@ -187,15 +187,17 @@ class LitterEngine:
         gnss_lost_timeout_sec: float = _cfg.LITTER_GNSS_LOST_TIMEOUT_SEC,
         time_fallback_sec: float = _cfg.LITTER_TIME_FALLBACK_SEC,
         device_id: str = "UNPROVISIONED",
+        session_logger=None,   # Optional SessionLogger instance for detailed logging
     ):
         self.output_dir           = output_dir
         self.conf                 = conf
         self.overlap_threshold    = overlap_threshold
-        self.aod_polygon_norm     = aod_polygon_normalized  # normalized [0-1] coords (from roi_polygon.json)
+        self.aod_polygon_norm     = aod_polygon_normalized
         self.distance_interval_m  = distance_interval_m
         self.gnss_lost_timeout_sec = gnss_lost_timeout_sec
         self.time_fallback_sec    = time_fallback_sec
         self.device_id            = device_id
+        self._session_logger      = session_logger  # may be None
 
         os.makedirs(output_dir, exist_ok=True)
         _ensure_save_thread()
@@ -559,10 +561,38 @@ class LitterEngine:
             except Exception:
                 pass
 
-            print(f"[LITTER] *** LITTER DETECTED *** Event #{self._event_count} → {filename}")
+            print(f"[LITTER] *** LITTER DETECTED *** Event #{self._event_count} -> {filename}")
+
+            # Session log: record this detection event
+            if self._session_logger is not None:
+                try:
+                    litter_detections = [d for d in detected_items if not d.get("in_aod")]
+                    self._session_logger.record_litter_event(
+                        lat         = float(lat) if lat is not None else None,
+                        lon         = float(lon) if lon is not None else None,
+                        detections  = litter_detections,
+                        rtc_ts      = rtc_ts or "",
+                        image_file  = os.path.basename(filename),
+                        gnss_source = op_mode,
+                    )
+                except Exception:
+                    pass
         else:
             # Clean frame — no save, no LED blink
             print(f"[LITTER] Trigger #{trigger_n}: clean frame (0 litter). No save.")
+
+            # Session log: record clean inference frame (no detections)
+            if self._session_logger is not None:
+                try:
+                    self._session_logger.record_litter_event(
+                        lat        = float(lat) if lat is not None else None,
+                        lon        = float(lon) if lon is not None else None,
+                        detections = [],   # empty = clean frame
+                        rtc_ts     = rtc_ts or "",
+                        gnss_source = op_mode,
+                    )
+                except Exception:
+                    pass
 
     # -------------------------------------------------------------------------
     # Status / HUD info

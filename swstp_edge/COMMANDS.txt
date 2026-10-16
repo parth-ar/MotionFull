@@ -146,9 +146,8 @@ print('Reset to default polygon.')
 7. SENSOR & HARDWARE DIAGNOSTICS
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-  Camera Module 3 (Sony IMX708) Diagnostics:
-    # Automated IMX708 benchmark and test capture tool:
-    python3 /home/pi/swstp_unified/test_imx708_camera.py
+    # Automated sensor diagnostic tool (RTC + IMU + GNSS + PiCam + LTE):
+    python3 /home/pi/swstp_unified/test_all_sensors.py
 
     # Check if IMX708 is detected on the CSI bus by libcamera:
     rpicam-hello --list-cameras

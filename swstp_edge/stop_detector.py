@@ -47,8 +47,8 @@ try:
     except ImportError:
         REST_CONFIRM_SEC = REST_DEBOUNCE_SEC
 except ImportError:
-    STOP_SPEED_GATE          = 5.0
-    REST_SPEED_THRESHOLD_KMH = 5.0
+    STOP_SPEED_GATE          = 3.5
+    REST_SPEED_THRESHOLD_KMH = 3.5
     IMU_REST_ACCEL_TOLERANCE = 0.45
     IMU_REST_GYRO_TOLERANCE  = 4.0
     REST_DEBOUNCE_SEC        = 1.0

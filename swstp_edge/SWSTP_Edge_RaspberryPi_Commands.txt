@@ -323,8 +323,8 @@ Test Camera Module 3 detection:
 rpicam-hello --list-cameras
 (or: libcamera-hello --list-cameras)
 
-Run automated IMX708 benchmark and test capture:
-./venv/bin/python test_imx708_camera.py
+Run full automated sensor benchmark (RTC + IMU + GNSS + PiCam + LTE):
+./venv/bin/python test_all_sensors.py
 
 Run edge gateway with explicit IMX708:
 ./venv/bin/python main.py --source imx708 --headless

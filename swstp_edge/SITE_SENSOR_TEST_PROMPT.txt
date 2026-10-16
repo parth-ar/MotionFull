@@ -1,0 +1,76 @@
+SITE-SIDE PROMPT: Remote Sensor Diagnostic Test Runner
+=======================================================
+
+FEATURE OVERVIEW
+----------------
+Allow the site/dashboard to trigger test_all_sensors.py remotely on a specific
+device and stream the results back to the browser in real time, so technicians
+can diagnose sensor issues without physical access to the Pi.
+
+WHAT THE EDGE PROGRAM ALREADY DOES
+------------------------------------
+- test_all_sensors.py is a standalone, self-contained script
+- It supports individual test skip flags: --no-rtc, --no-imu, --no-gnss, --no-picam, --no-lte
+- It prints ANSI-coloured diagnostic output to stdout
+- Exit code 0 on all-pass, non-zero on failure (can be checked by the invoker)
+- No changes to any running system files
+
+BACKEND API REQUIREMENTS
+-------------------------
+1. ENDPOINT: POST /api/devices/{device_id}/run-sensor-test
+   Body (optional): {
+     "skip": ["gnss", "lte"]   // optional list of tests to skip
+   }
+   - Backend SSHes into the device and runs:
+       cd /path/to/swstp_edge && python3 test_all_sensors.py [--no-X flags] 2>&1
+   - The command output is streamed line by line to the API response
+   - Use Server-Sent Events (SSE) or WebSocket for real-time streaming:
+     Content-Type: text/event-stream  (for SSE)
+
+2. ENDPOINT: GET /api/devices/{device_id}/sensor-test/status
+   Response: {
+     "running": true/false,
+     "last_run_at": "<ISO timestamp>",
+     "last_result": "PASSED" | "FAILED" | "PARTIAL",
+     "summary": { "RTC": true, "IMU": true, "GNSS": false, "PiCam": true, "LTE": null }
+   }
+
+3. STREAMING EXECUTION
+   The test runs for up to ~60 seconds (GNSS wait time).
+   Use paramiko (Python SSH) or subprocess over SSH tunnel:
+     import paramiko
+     ssh = paramiko.SSHClient()
+     ssh.connect(device_ip, username='pi', key_filename=KEY_PATH)
+     stdin, stdout, stderr = ssh.exec_command(
+         'cd /home/pi/swstp_edge && python3 test_all_sensors.py --gnss-wait 15'
+     )
+     for line in iter(stdout.readline, ''):
+         yield f"data: {line}\n\n"   # SSE format
+
+4. EDGE-SIDE PREPARATION (already done in main program)
+   - test_all_sensors.py already handles all 5 sensors
+   - The script can be run independently (does not conflict with running main.py)
+   - ANSI escape codes in output should be stripped for browser display:
+       import re
+       ANSI_ESCAPE = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
+       clean_line = ANSI_ESCAPE.sub('', raw_line)
+
+5. EDGE-SIDE HTTP TRIGGER (Alternative to SSH)
+   If a lightweight agent runs on the Pi (e.g. Flask on port 5050):
+     POST /local/run-sensor-test
+     Response: { "job_id": "abc123" }
+   Then: GET /local/sensor-test/{job_id}/stream  (SSE)
+
+6. FRONTEND (DASHBOARD) REQUIREMENTS
+   - "Run Diagnostic" button per device on the device detail page
+   - Allow selecting which tests to run (checkboxes: RTC, IMU, GNSS, PiCam, LTE)
+   - Show a live terminal-style output panel (monospace font, auto-scroll)
+   - Colour-code lines: green for PASSED, red for FAILED, yellow for warnings
+   - Show a summary badge at the end: "X/5 PASSED"
+   - Store the last test result and timestamp in the device record
+
+SECURITY NOTE
+-------------
+Only authenticated admin/technician roles should be able to trigger sensor tests.
+Each test run should be logged on the backend with: device_id, triggered_by, timestamp.
+Rate-limit to max 1 test per device per 5 minutes.

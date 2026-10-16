@@ -24,6 +24,8 @@ import threading
 import time
 import uuid
 
+import session_logger as _session_logger
+
 # Headless / systemd safety
 if "--headless" in sys.argv or "DISPLAY" not in os.environ:
     os.environ["QT_QPA_PLATFORM"] = "offscreen"
@@ -289,6 +291,14 @@ def main() -> None:
     print(f" GNSS:             NavCast TCP reader started ({_cfg.NAVCAST_HOST}:{_cfg.NAVCAST_PORT})")
     print("========================================================\n")
 
+    # ── Session logger (initialised after sensors and session ID) ─────────
+    _slog = _session_logger.SessionLogger(
+        device_id   = device_id,
+        session_id  = effective_session_id,
+        backend_url = effective_backend_url,
+        ulb_id      = effective_ulb_id,
+    )
+
     # ── Camera / video source ─────────────────────────────────────────────
     initial_source = args.source if args.source is not None else getattr(_cfg, "CAMERA_SOURCE_DEFAULT", "auto")
     if str(initial_source).isdigit():
@@ -326,6 +336,7 @@ def main() -> None:
         af_info = f" | Autofocus: {cam_info.get('autofocus')}" if is_imx else ""
         print(f"[CAMERA] Active: {cam_model} on '{source}' ({cam_w}x{cam_h} @ {fps:.1f} FPS{af_info})")
     else:
+        cam_model = "None"
         source = initial_source or 0
         cam_w, cam_h, fps = target_cam_w, target_cam_h, target_cam_fps
         hardware_state["camera"] = {
@@ -336,6 +347,27 @@ def main() -> None:
             leds.set_camera_scanning(True)
         except Exception:
             pass
+
+    # ── Record sensor init into session log ───────────────────────────────
+    _slog.record_sensor_init(
+        rtc_ok        = bool(rtc_ok),
+        imu_ok        = bool(imu_ok),
+        gnss_ok       = bool(gnss_ok),
+        camera_ok     = cap is not None,
+        camera_model  = cam_model if cap is not None else "None",
+        camera_source = str(source),
+        camera_resolution = f"{cam_w}x{cam_h}" if cap is not None else "N/A",
+    )
+    _slog.record_configuration(
+        roi_polygon          = _motion.active_polygon_roi or [],
+        litter_distance_m    = args.litter_distance,
+        litter_conf          = args.litter_conf,
+        litter_weights       = args.litter_weights,
+        headless             = args.headless,
+        save_dir             = args.save_dir,
+        navcast_host         = _cfg.NAVCAST_HOST,
+        navcast_port         = _cfg.NAVCAST_PORT,
+    )
 
     stop_event = threading.Event()
 
@@ -431,6 +463,7 @@ def main() -> None:
             gnss_lost_timeout_sec = _cfg.LITTER_GNSS_LOST_TIMEOUT_SEC,
             time_fallback_sec     = _cfg.LITTER_TIME_FALLBACK_SEC,
             device_id             = device_id,
+            session_logger        = _slog,
         )
 
     delay       = max(1, int(1000 / (fps if (fps and 0 < fps < 120) else 30)))
@@ -450,6 +483,20 @@ def main() -> None:
     last_known_frame = None
     consecutive_motion_frames = 0
 
+    # ── Stop detection state tracking for session log ─────────────────────
+    _prev_stop_id: str = ""    # track stop_id transitions for begin/end logging
+
+    # ── ROI hot-reload: watch roi_polygon.json for remote updates ──────────
+    # The backend can write a new polygon to roi_polygon.json at any time.
+    # The main loop polls the file's modification time every 10 s and reloads.
+    _roi_reload_interval_s: float = 10.0
+    _roi_last_check_mono:   float = 0.0
+    _roi_last_mtime:        float = 0.0
+    try:
+        _roi_last_mtime = os.path.getmtime(getattr(_cfg, "ROI_CONFIG_FILE", ""))
+    except Exception:
+        pass
+
     stop_detector = VehicleStopDetector()
 
     print("[INIT] Unified Edge Gateway running.")
@@ -468,6 +515,25 @@ def main() -> None:
 
     try:
         while not stop_event.is_set():
+
+            # ── 0. ROI hot-reload (polls file mtime every 10 s) ───────────
+            _now_check = time.monotonic()
+            if _now_check - _roi_last_check_mono >= _roi_reload_interval_s:
+                _roi_last_check_mono = _now_check
+                try:
+                    _roi_cfg_path = getattr(_cfg, "ROI_CONFIG_FILE", "")
+                    if _roi_cfg_path:
+                        _mtime = os.path.getmtime(_roi_cfg_path)
+                        if _mtime != _roi_last_mtime:
+                            _new_roi = load_roi_polygon()
+                            _motion.active_polygon_roi = _new_roi
+                            if litter_engine is not None:
+                                litter_engine.aod_polygon_norm = _new_roi
+                            _slog.record_configuration(roi_polygon=_new_roi)
+                            _roi_last_mtime = _mtime
+                            print(f"[ROI] Remote update detected — reloaded {len(_new_roi)} pts from disk.")
+                except Exception:
+                    pass
 
             # ── 1. Camera Scanning / Hold ─────────────────────────────────
             if cap is None or not cap.isOpened():
@@ -649,6 +715,35 @@ def main() -> None:
             current_stop_id        = stop_status["stop_event_id"]
             current_capture_count  = stop_status["capture_count"]
 
+            # ── Session log: track stop begin/end transitions ──────────────
+            if current_stop_id and current_stop_id != _prev_stop_id:
+                # New stop started
+                if _prev_stop_id:
+                    _slog.record_stop_end(
+                        stop_id    = _prev_stop_id,
+                        duration_sec = 0.0,
+                        n_captures   = 0,
+                        end_reason   = "vehicle_moved",
+                    )
+                _slog.record_stop_begin(
+                    stop_id   = current_stop_id,
+                    lat       = cap_lat,
+                    lon       = cap_lon,
+                    timestamp = rtc_ts or "",
+                )
+                _prev_stop_id = current_stop_id
+            elif _prev_stop_id and not current_stop_id:
+                # Stop ended (vehicle resumed)
+                _slog.record_stop_end(
+                    stop_id    = _prev_stop_id,
+                    duration_sec = current_event_duration,
+                    n_captures   = current_capture_count,
+                    end_lat      = cap_lat,
+                    end_lon      = cap_lon,
+                    end_reason   = "vehicle_moved",
+                )
+                _prev_stop_id = ""
+
             latest_sensor["is_vehicle_stopped"]   = is_vehicle_stopped
             latest_sensor["vehicle_motion_state"] = stop_status["state"]
             latest_sensor["stop_duration_sec"]    = current_event_duration
@@ -660,9 +755,10 @@ def main() -> None:
             latest_sensor["pending_rest_sec"]     = stop_status.get("pending_rest_sec", 0.0)
             latest_sensor["rest_confirm_sec"]     = stop_status.get("rest_confirm_sec", 1.0)
 
-            # Gating condition: Motion detection is ACTIVE only when vehicle is confirmed STOPPED (< 5.0 km/h).
-            # When moving (speed >= 5.0 km/h or vehicle not at stop), motion detection is on hold.
-            motion_gate_active = is_vehicle_stopped and (vehicle_speed < 5.0)
+            # Gating condition: Motion detection is ACTIVE only when vehicle is confirmed STOPPED (< 3.5 km/h).
+            # When moving (speed >= 3.5 km/h or vehicle not at stop), motion detection is on hold.
+            motion_speed_threshold = float(getattr(_cfg, "REST_SPEED_THRESHOLD_KMH", 3.5))
+            motion_gate_active = is_vehicle_stopped and (vehicle_speed < motion_speed_threshold)
 
             # ── 5. Downsample for motion processing ───────────────────────
             if FRAME_SIZE is not None:
@@ -684,12 +780,12 @@ def main() -> None:
             total_frames_seen += 1
 
             if not motion_gate_active:
-                # Vehicle is in motion (>= 5.0 km/h) — motion detection ON HOLD
+                # Vehicle is in motion (>= 3.5 km/h) — motion detection ON HOLD
                 bg_model                  = None   # Clear background model while moving so road scenery never contaminates it
                 stop_warmup_cnt           = 0
                 consecutive_motion_frames = 0
             else:
-                # Vehicle is STOPPED (< 5.0 km/h confirmed by GNSS & IMU) — Motion detection ACTIVE
+                # Vehicle is STOPPED (< 3.5 km/h confirmed by GNSS & IMU) — Motion detection ACTIVE
                 if bg_model is None:
                     bg_model        = gray_blur.astype(np.float32)
                     stop_warmup_cnt = 1
@@ -905,6 +1001,12 @@ def main() -> None:
                           f"Speed: {vehicle_speed:.1f} km/h")
                     cleanup_old_local_captures(args.save_dir, retention_days=3)
 
+                    # Session log: record this capture
+                    try:
+                        _slog.record_motion_capture(item_meta)
+                    except Exception:
+                        pass
+
                     # LED: triple yellow blink on motion snap
                     try:
                         leds.notify_motion_snap()
@@ -959,6 +1061,21 @@ def main() -> None:
             stop_detector.active_stop.duration_sec = max(0.0, time.monotonic() - stop_detector.active_stop.start_mono)
             stop_detector.active_stop.end_reason   = "Edge gateway shutdown"
             print("\n" + stop_detector.active_stop.format_summary() + "\n")
+            # Session log: close any open stop
+            if _prev_stop_id:
+                _slog.record_stop_end(
+                    stop_id      = _prev_stop_id,
+                    duration_sec = stop_detector.active_stop.duration_sec,
+                    n_captures   = stop_detector.active_stop.capture_count
+                                   if hasattr(stop_detector.active_stop, "capture_count") else 0,
+                    end_reason   = "Edge gateway shutdown",
+                )
+
+        # Finalise session log
+        try:
+            _slog.finalize(exit_reason="normal_shutdown")
+        except Exception as slog_err:
+            print(f"[SESSION LOG] finalize error: {slog_err}")
 
         # Shutdown litter engine gracefully
         if litter_engine is not None:

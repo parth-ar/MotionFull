@@ -60,8 +60,8 @@ Before installing as a service, test the Camera Module 3 (IMX708) and sensors:
 
     cd /home/pi/swstp_unified
 
-    # 1. Quick diagnostic test of Camera Module 3 (IMX708):
-    python3 test_imx708_camera.py
+    # 1. Full diagnostic test of all sensors (RTC + IMU + GNSS + PiCam + LTE):
+    python3 test_all_sensors.py
 
     # 2. Test run the edge gateway:
     python3 main.py --headless --no-power-monitor
@@ -74,8 +74,8 @@ Watch the output for 30-60 seconds. You should see:
 
 Press Ctrl+C to stop the test run when satisfied.
 
-If you see errors about the camera, run:
-    python3 test_imx708_camera.py
+If you see errors about sensors or camera, run:
+    python3 test_all_sensors.py
     rpicam-hello --list-cameras
     v4l2-ctl --list-devices
 

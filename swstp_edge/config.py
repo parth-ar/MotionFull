@@ -22,6 +22,10 @@ CAPTURES_DIR    = os.path.join(_HERE, "captures", "motion")   # Motion captures 
 # Litter detection
 LITTER_CAPTURES_DIR = os.path.join(_HERE, "captures", "litter")  # Litter captures sub-dir
 
+# Session / device logs
+SESSION_LOG_DIR = os.path.join(_HERE, "logs", "sessions")    # Detailed per-session JSON logs
+DEVICE_LOG_FILE = os.path.join(_HERE, "logs", "device.log")  # Rolling terminal/device log
+
 # ---------------------------------------------------------------------------
 # Device identity  (loaded from device_config.json)
 # ---------------------------------------------------------------------------
@@ -126,12 +130,23 @@ COMPLEMENTARY_ALPHA = 0.98
 
 # ---------------------------------------------------------------------------
 # LED BCM GPIO pin assignments (Pi 40-pin header)
+# Updated per hardware revision — Raspberry Pi 4B physical pin → BCM mapping:
+#   Physical 11 → BCM 17  RTC status LED   (green)
+#   Physical 13 → BCM 27  IMU status LED   (green)
+#   Physical 15 → BCM 22  GNSS status LED  (green)
+#   Physical 16 → BCM 23  Yellow LED       (heartbeat/snap)
+#   Physical 18 → BCM 24  Red LED          (fault/litter alert)
+#   Physical 22 → BCM 25  LTE status LED   (green)
+#   Physical 36 → BCM 16  GNSS module RST  (MAX-M10S active-low reset)
 # ---------------------------------------------------------------------------
-LED_RTC_GREEN  = 17   # BCM 17 — RTC status  (green)
-LED_IMU_GREEN  = 27   # BCM 27 — IMU status  (green)
-LED_GNSS_GREEN = 22   # BCM 22 — GNSS status (green)
-LED_YELLOW     = 23   # BCM 23 — heartbeat / snap (yellow)
-LED_RED        = 24   # BCM 24 — fault / litter alert (red)
+LED_RTC_GREEN  = 17   # BCM 17 — Physical 11 — RTC status  (green)
+LED_IMU_GREEN  = 27   # BCM 27 — Physical 13 — IMU status  (green)
+LED_GNSS_GREEN = 22   # BCM 22 — Physical 15 — GNSS status (green)
+LED_YELLOW     = 23   # BCM 23 — Physical 16 — heartbeat / snap (yellow)
+LED_RED        = 24   # BCM 24 — Physical 18 — fault / litter alert (red)
+LED_LTE_GREEN  = 25   # BCM 25 — Physical 22 — LTE/modem status (green)
+
+GNSS_RESET_PIN = 16   # BCM 16 — Physical 36 — MAX-M10S RST (active-low, drive LOW to reset)
 
 LED_FAULT_BLINK_INTERVAL  = 0.400    # seconds
 LED_YELLOW_BLINK_INTERVAL = 1.000    # seconds
@@ -153,7 +168,7 @@ BG_ALPHA                   = 0.05   # Background model learning rate under norma
 FAST_BG_ALPHA              = 0.25   # Accelerated adaptation rate when global lighting shock is detected
 MOTION_CONSECUTIVE_FRAMES  = 2      # Consecutive frames of confirmed motion required before capture (rejects 1-frame flashes)
 WARMUP_FRAMES              = 30
-SAVE_COOLDOWN_SEC          = 5.0    # 5-second buffer between motion captures
+SAVE_COOLDOWN_SEC          = 10.0    # 10-second buffer between motion captures
 FRAME_SIZE                 = (320, 180) # Downsampled resolution for motion processing
 
 # ---------------------------------------------------------------------------
