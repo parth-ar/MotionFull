@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 """
-test_navcast_gnss.py — Standalone GNSS connection & accuracy test script.
+test_navcast_gnss.py — Legacy Phone NavCast GNSS Connection & Accuracy Test Script.
 
-Designed for testing phone GNSS data sent via NavCast (USB Serial or USB Tethering Network)
-without modifying any core application code.
+NOTE: The SWSTP device now uses the u-blox MAX-M10S hardware GNSS module as its primary
+component (shares connections with NEO-6M). For hardware GNSS diagnostics, use:
+    python test_max_m10s_gnss.py
+    python test_all_sensors.py
+
+This script remains as a standalone legacy utility for phone NavCast testing.
 
 Features:
 - Dual Connection Modes:

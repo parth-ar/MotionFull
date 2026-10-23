@@ -29,8 +29,8 @@ requests>=2.31.0
 # MPU-6500 I2C register access
 smbus2>=0.4.3
 
-# NEO-6M GNSS via gpsd (optional fallback if NavCast TCP is not used)
-gpsdclient>=1.0.0
+# u-blox MAX-M10S / NEO-6M GNSS UART driver (serial NMEA reader)
+pyserial>=3.5
 
 # Status LED GPIO control
 # gpiozero selects its pin factory in this priority order:

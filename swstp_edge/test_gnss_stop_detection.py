@@ -1811,7 +1811,31 @@ def run_serial_mode(
         print("[ERROR] pyserial is required for serial mode. Install with: pip install pyserial")
         return
 
-    print(f"\n[SERIAL GNSS] Opening port {port_name} at {baudrate} baud ...")
+    # Auto-detect serial port if requested or if configured port doesn't exist
+    if port_name in ("auto", None, "") or (not os.path.exists(port_name) and not port_name.upper().startswith("COM")):
+        candidates = []
+        for p in ("/dev/serial0", "/dev/ttyAMA0", "/dev/ttyS0"):
+            if os.path.exists(p):
+                candidates.append(p)
+        import glob
+        for p in glob.glob("/dev/ttyUSB*") + glob.glob("/dev/ttyACM*"):
+            if os.path.exists(p):
+                candidates.append(p)
+        try:
+            import serial.tools.list_ports
+            for cp in serial.tools.list_ports.comports():
+                candidates.append(cp.device)
+        except Exception:
+            pass
+        if candidates:
+            detected_port = candidates[0]
+            print(f"[SERIAL GNSS] Auto-detected GNSS serial port: {detected_port}")
+            port_name = detected_port
+        elif port_name in ("auto", None, ""):
+            print("[SERIAL GNSS] No serial port detected! Defaulting to /dev/serial0.")
+            port_name = "/dev/serial0"
+
+    print(f"\n[SERIAL GNSS] Opening port {port_name} at {baudrate} baud (u-blox MAX-M10S / NEO-6M)...")
     parser = NMEAParser()
 
     try:
@@ -2095,8 +2119,8 @@ Examples:
     parser.add_argument(
         "--mode",
         choices=["sim", "tcp", "serial", "manual", "file"],
-        default="tcp",
-        help="Execution mode (default: 'tcp')",
+        default="serial",
+        help="Execution mode (default: 'serial')",
     )
     parser.add_argument(
         "--imu",
@@ -2139,24 +2163,24 @@ Examples:
     parser.add_argument(
         "--host",
         default=DEFAULT_NAVCAST_HOST,
-        help=f"NavCast TCP host IP (default: {DEFAULT_NAVCAST_HOST})",
+        help=f"NavCast TCP host IP (legacy fallback mode, default: {DEFAULT_NAVCAST_HOST})",
     )
     parser.add_argument(
         "--port",
         type=int,
         default=DEFAULT_NAVCAST_PORT,
-        help=f"NavCast TCP port (default: {DEFAULT_NAVCAST_PORT})",
+        help=f"NavCast TCP port (legacy fallback mode, default: {DEFAULT_NAVCAST_PORT})",
     )
     parser.add_argument(
         "--serial-port",
-        default="COM4",
-        help="Serial/COM port name for GPS receiver (default: COM4)",
+        default="auto",
+        help="Serial/UART port for GPS receiver (default: 'auto')",
     )
     parser.add_argument(
         "--baud",
         type=int,
-        default=115200,
-        help="Serial baud rate for GPS receiver (default: 115200)",
+        default=9600,
+        help="Serial baud rate for GPS receiver (u-blox MAX-M10S / NEO-6M default: 9600)",
     )
     parser.add_argument(
         "--file",

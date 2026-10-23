@@ -475,6 +475,56 @@ class NavCastGNSSReader:
 
 
 # ===========================================================================
+# HARDWARE SERIAL GNSS READER (u-blox MAX-M10S / NEO-6M)
+# ===========================================================================
+
+class HardwareGNSSReader:
+    """Hardware serial GNSS reader for u-blox MAX-M10S (or NEO-6M)."""
+
+    def __init__(self, log_fn=None):
+        self._log = log_fn or print
+        self._gnss = None
+        self.connected = False
+        self.last_error = ""
+
+    def start(self):
+        try:
+            from sensors import gnss as gnss_mod
+            gnss_mod.init()
+            self._gnss = gnss_mod
+            self.connected = True
+            self._log("[GNSS] u-blox MAX-M10S hardware serial reader started.")
+        except Exception as exc:
+            self.last_error = str(exc)
+            self._log(f"[GNSS] Failed to start sensors.gnss: {exc}")
+
+    def stop(self):
+        if self._gnss:
+            try:
+                self._gnss.stop()
+            except Exception:
+                pass
+        self.connected = False
+
+    def get_position(self):
+        if self._gnss:
+            d = self._gnss.read()
+            return d.get("latitude"), d.get("longitude"), d.get("fix", False)
+        return None, None, False
+
+    def get_state(self):
+        if self._gnss:
+            st = self._gnss.read()
+            st["connected"] = self._gnss.gnss_ok
+            st["host"] = getattr(self._gnss, "_active_port", "/dev/serial0") or "/dev/serial0"
+            st["port"] = 9600
+            st["scan_in_progress"] = False
+            return st
+        return {"data_received": False, "fix": False, "status": "NO_DATA", "connected": False}
+
+
+
+# ===========================================================================
 # GNSS SIMULATOR (fallback, --sim flag)
 # ===========================================================================
 
@@ -1042,11 +1092,11 @@ class YOLOTestGUI:
 
     # ── GNSS Source Panel ──────────────────────────────────────────────────
     def _build_gnss_panel(self, parent, FB, FS, FT):
-        p = self._box(parent, "GNSS SOURCE (NAVCAST)", FT)
+        p = self._box(parent, "GNSS SOURCE (MAX-M10S)", FT)
 
         row = tk.Frame(p, bg=P["panel"])
         row.pack(fill="x", pady=(0, 4))
-        src = "SIMULATION (--sim)" if self._use_sim else "NavCast TCP (auto-scan)"
+        src = "SIMULATION (--sim)" if self._use_sim else "u-blox MAX-M10S Hardware"
         tk.Label(row, text="Source:", bg=P["panel"], fg=P["dim"], font=FS).pack(side="left")
         self._lbl_gnss_src = tk.Label(
             row, text=src,
@@ -1443,16 +1493,18 @@ class YOLOTestGUI:
 def parse_args():
     ap = argparse.ArgumentParser(
         description="GUI test for YOLO litter detection engine (SWSTP Edge). "
-                    "NavCast TCP with auto-scan is the default GNSS source."
+                    "u-blox MAX-M10S hardware serial is the default GNSS source."
     )
+    ap.add_argument("--tcp",       action="store_true",
+                    help="Use legacy NavCast TCP connection instead of hardware GNSS")
     ap.add_argument("--host",      default=NAVCAST_HOST_DEFAULT,
-                    help=f"NavCast TCP host (default: '{NAVCAST_HOST_DEFAULT}' to auto-scan phone IP across tether/hotspot interfaces)")
+                    help=f"NavCast TCP host (default: '{NAVCAST_HOST_DEFAULT}')")
     ap.add_argument("--port",      type=int, default=NAVCAST_PORT_DEFAULT,
                     help=f"NavCast TCP port (default: {NAVCAST_PORT_DEFAULT})")
     ap.add_argument("--no-scan",   action="store_true",
                     help="Disable automatic network scan; connect only to specified --host")
     ap.add_argument("--sim",       action="store_true",
-                    help="Use simulated GNSS instead of NavCast (offline testing)")
+                    help="Use simulated GNSS instead of hardware GNSS (offline testing)")
     ap.add_argument("--sim-speed", type=float, default=SIM_SPEED_KMH_DEFAULT, dest="sim_speed",
                     help=f"Sim speed km/h when --sim is used (default {SIM_SPEED_KMH_DEFAULT})")
     ap.add_argument("--weights",   default=None,
@@ -1538,13 +1590,17 @@ def main():
             print("[INFO] Sim starting with no fix (fallback mode).")
         gnss_source.start()
         print(f"[INFO] GNSS: Simulation @ {args.sim_speed:.0f} km/h")
-    else:
+    elif args.tcp:
         auto_scan = not args.no_scan
         gnss_source = NavCastGNSSReader(
             host=args.host, port=args.port, log_fn=print, auto_scan=auto_scan
         )
         gnss_source.start()
         print(f"[INFO] GNSS: NavCast TCP starting (auto_scan={auto_scan})...")
+    else:
+        gnss_source = HardwareGNSSReader(log_fn=print)
+        gnss_source.start()
+        print("[INFO] GNSS: u-blox MAX-M10S hardware serial reader started.")
 
     def _console_log(msg): print(msg)
 

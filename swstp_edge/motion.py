@@ -163,6 +163,8 @@ def run_roi_setup_phase(cap, win_title: str, frame_w: int, frame_h: int) -> list
     print("  \u2022 Left-click  : place a new point")
     print("  \u2022 Right-click : undo last point")
     print("  \u2022 C key       : clear and start fresh")
+    print("  \u2022 W key       : cycle AWB white balance mode (Auto \u2192 Daylight \u2192 Cloudy \u2192 Indoor \u2192 Fluorescent)")
+    print("  \u2022 V key       : toggle Red/Blue color channel swap")
     print("  \u2022 Enter/Space : confirm new polygon (need \u22653 pts), or keep saved polygon")
     print("  \u2022 Esc         : skip \u2014 use current saved polygon as-is\n")
 
@@ -174,6 +176,9 @@ def run_roi_setup_phase(cap, win_title: str, frame_w: int, frame_h: int) -> list
             py = int(p[1] * disp_h) if p[1] <= 1.0 else int(p[1])
             pts.append((px, py))
         return pts
+
+    awb_toast_text = ""
+    awb_toast_until = 0.0
 
     while True:
         ok, frame = cap.read()
@@ -189,6 +194,7 @@ def run_roi_setup_phase(cap, win_title: str, frame_w: int, frame_h: int) -> list
         now = time.time()
 
         saved_px = _saved_poly_px()
+        current_awb = cap.get_awb_mode() if hasattr(cap, "get_awb_mode") else "Auto"
 
         # ── Draw currently saved polygon (dimmed) ──
         if len(saved_px) >= 3 and not new_points_px:
@@ -230,8 +236,19 @@ def run_roi_setup_phase(cap, win_title: str, frame_w: int, frame_h: int) -> list
 
         # ── Top banner ──
         cv2.rectangle(display, (0, 0), (w, 50), (15, 15, 18), -1)
-        cv2.putText(display, "SETUP  —  Area of Interest (AoI)",
+        cv2.putText(display, "SETUP  \u2014  Area of Interest (AoI)",
                     (10, 32), cv2.FONT_HERSHEY_DUPLEX, 0.75, (0, 220, 255), 1, cv2.LINE_AA)
+        awb_badge = f"AWB: {current_awb.upper()} [W: cycle]"
+        cv2.putText(display, awb_badge,
+                    (w - 290, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (100, 255, 180), 1, cv2.LINE_AA)
+
+        # ── Toast message overlay (AWB switch notification) ──
+        if now < awb_toast_until:
+            cv2.rectangle(display, (w // 2 - 270, 56), (w // 2 + 270, 94), (20, 32, 24), -1)
+            cv2.rectangle(display, (w // 2 - 270, 56), (w // 2 + 270, 94), (60, 230, 130), 2)
+            cv2.putText(display, awb_toast_text,
+                        (w // 2 - 255, 82),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.52, (255, 255, 255), 1, cv2.LINE_AA)
 
         # ── Bottom instruction strip ──
         cv2.rectangle(display, (0, h - 62), (w, h), (15, 15, 18), -1)
@@ -239,17 +256,17 @@ def run_roi_setup_phase(cap, win_title: str, frame_w: int, frame_h: int) -> list
 
         if new_points_px:
             tip1 = (f"Drawing: {len(new_points_px)} pts placed  |  "
-                    f"Right-click: undo  |  C: clear  |  Enter/Space: confirm (need ≥3)")
+                    f"Right-click: undo  |  C: clear  |  Enter/Space: confirm (need \u22653)")
         else:
             tip1 = ("Showing SAVED polygon  |  Left-click to draw a NEW one  |  "
                     "Enter/Space: keep saved  |  Esc: skip")
-        tip2 = "Left-click: add point | Right-click: undo | C: clear | V: toggle RB colors | Enter: confirm | Esc: keep saved"
+        tip2 = f"Left-click: add point | C: clear | W: cycle AWB ({current_awb}) | V: toggle RB colors | Enter: confirm | Esc: keep saved"
         cv2.putText(display, tip1, (10, h - 42),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.46, (200, 200, 200), 1, cv2.LINE_AA)
         cv2.putText(display, tip2, (10, h - 18),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.42, (140, 140, 140), 1, cv2.LINE_AA)
 
-        # ── "Need ≥3 points" warning flash ──
+        # ── "Need \u22653 points" warning flash ──
         if now < warn_until:
             cv2.putText(display, "Need at least 3 points to confirm!",
                         (w // 2 - 190, h // 2),
@@ -266,7 +283,7 @@ def run_roi_setup_phase(cap, win_title: str, frame_w: int, frame_h: int) -> list
         if key in (13, 32):  # Enter or Space
             if new_points_px:
                 if len(new_points_px) >= 3:
-                    # Convert display-pixel coords → normalised [0-1]
+                    # Convert display-pixel coords \u2192 normalised [0-1]
                     # Use disp_w/disp_h (setup display size) since clicks
                     # were captured against the upscaled frame.
                     normalised = [
@@ -291,6 +308,16 @@ def run_roi_setup_phase(cap, win_title: str, frame_w: int, frame_h: int) -> list
         elif key in (ord('c'), ord('C')):
             new_points_px.clear()
             print("[ROI/AoD SETUP] Cleared new points — start drawing fresh.")
+
+        elif key in (ord('w'), ord('W')):
+            if hasattr(cap, "cycle_awb_mode"):
+                new_awb = cap.cycle_awb_mode()
+                awb_toast_text = f"AWB: {new_awb.upper()} (Live dynamic update \u2014 no restart)"
+                awb_toast_until = now + 2.5
+                print(f"[ROI/AoD SETUP] Camera AWB cycled to: {new_awb} (applied live, no restart needed)")
+            else:
+                awb_toast_text = "AWB mode cycling not supported on this video backend"
+                awb_toast_until = now + 2.0
 
         elif key in (ord('v'), ord('V')):
             if hasattr(cap, "swap_rb"):

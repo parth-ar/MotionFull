@@ -165,6 +165,9 @@ def build_parser() -> argparse.ArgumentParser:
                              "device index (e.g. 0), V4L2 device (/dev/video0), or MP4 path. Default: auto-detect.")
     parser.add_argument("--af-mode", default="continuous", choices=["continuous", "auto", "manual"],
                         help="Autofocus mode for Camera Module 3 / IMX708 (default: continuous PDAF)")
+    parser.add_argument("--awb-mode", default=getattr(_cfg, "CAMERA_AWB_MODE", "auto"),
+                        choices=["auto", "daylight", "cloudy", "indoor", "tungsten", "fluorescent"],
+                        help="White balance mode for Camera Module 3 / IMX708 (default: auto, matches rpicam-hello)")
     parser.add_argument("--hdr", action="store_true",
                         help="Enable hardware HDR mode on Sony IMX708 sensor")
     parser.add_argument("--port", "-p", default="Pi-native",
@@ -288,7 +291,7 @@ def main() -> None:
     print(f" Litter Detection: {'ENABLED' if not args.no_litter else 'DISABLED (--no-litter)'}")
     print(f" RTC:              {'OK (DS3231)' if rtc_ok else 'FALLBACK (system clock)'} [{rtc_sensor.sync_source.upper()}]")
     print(f" IMU:              {'OK (MPU-6500 @ 0x69)' if imu_ok else 'FAULT'}")
-    print(f" GNSS:             NavCast TCP reader started ({_cfg.NAVCAST_HOST}:{_cfg.NAVCAST_PORT})")
+    print(f" GNSS:             u-blox MAX-M10S reader started ({getattr(_cfg, 'GNSS_SERIAL_PORT', '/dev/serial0')} @ {getattr(_cfg, 'GNSS_BAUD_RATE', 9600)} baud)")
     print("========================================================\n")
 
     # ── Session logger (initialised after sensors and session ID) ─────────
@@ -319,6 +322,7 @@ def main() -> None:
         target_fps=target_cam_fps,
         af_mode=args.af_mode,
         hdr=args.hdr,
+        awb_mode=args.awb_mode,
     )
 
     if cap is not None:
@@ -365,8 +369,9 @@ def main() -> None:
         litter_weights       = args.litter_weights,
         headless             = args.headless,
         save_dir             = args.save_dir,
-        navcast_host         = _cfg.NAVCAST_HOST,
-        navcast_port         = _cfg.NAVCAST_PORT,
+        gnss_module          = "u-blox MAX-M10S",
+        gnss_port            = getattr(_cfg, "GNSS_SERIAL_PORT", "/dev/serial0"),
+        gnss_baud            = getattr(_cfg, "GNSS_BAUD_RATE", 9600),
     )
 
     stop_event = threading.Event()
@@ -549,6 +554,7 @@ def main() -> None:
                     target_fps=target_cam_fps,
                     af_mode=args.af_mode,
                     hdr=args.hdr,
+                    awb_mode=args.awb_mode,
                 )
                 if new_cap is not None:
                     cap    = new_cap
@@ -901,7 +907,7 @@ def main() -> None:
             # try_trigger() only posts to queue when 5 m threshold is crossed.
             if litter_engine is not None:
                 try:
-                    # gnss_hardware_fix is True only for a real NavCast hardware fix.
+                    # gnss_hardware_fix is True only for a real MAX-M10S hardware fix.
                     # location_source "last_known" or "fallback" means coordinates are
                     # held/estimated — litter engine must not count those as valid GNSS.
                     _loc_src = latest_sensor.get("location_source")
@@ -1024,6 +1030,10 @@ def main() -> None:
                         cap.swap_rb = not cap.swap_rb
                         status_str = "ENABLED (OpenCV BGR)" if cap.swap_rb else "DISABLED (Raw [R,G,B])"
                         print(f"\n[CAMERA] Color channel swap: {status_str}")
+                elif k in (ord('w'), ord('W')):
+                    if cap is not None and hasattr(cap, "cycle_awb_mode"):
+                        new_awb = cap.cycle_awb_mode()
+                        print(f"\n[CAMERA] Dynamic AWB mode cycled to: {new_awb} (applied live, no camera restart needed).")
                 elif k == ord('t'):
                     _motion.camera_feed_active = not _motion.camera_feed_active
                     print(f"\n[CAMERA] Camera feed {'ACTIVATED / ON' if _motion.camera_feed_active else 'PAUSED / OFF'}.")

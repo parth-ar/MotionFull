@@ -191,6 +191,8 @@ class IMX708CameraCapture:
         af_mode: str = "continuous",
         hdr: bool = False,
         swap_rb: Optional[bool] = None,
+        awb_mode: Optional[str] = None,
+        tuning_file: Optional[str] = None,
     ):
         self.camera_idx = camera_idx
         self.width = int(width)
@@ -208,9 +210,27 @@ class IMX708CameraCapture:
             except Exception:
                 self.swap_rb = True
 
+        if awb_mode is not None:
+            self.awb_mode = str(awb_mode).lower().strip()
+        else:
+            try:
+                from config import CAMERA_AWB_MODE
+                self.awb_mode = str(CAMERA_AWB_MODE).lower().strip()
+            except Exception:
+                self.awb_mode = "auto"
+
+        if tuning_file is not None:
+            self.tuning_file = str(tuning_file).strip() or None
+        else:
+            try:
+                from config import CAMERA_TUNING_FILE
+                self.tuning_file = CAMERA_TUNING_FILE
+            except Exception:
+                self.tuning_file = None
+
         self._picam2: Optional[Any] = None
         self._is_opened = False
-        self._sensor_model = "Sony IMX708 (Camera Module 3 Wide NoIR)"
+        self._sensor_model = "Sony IMX708 (Camera Module 3)"
         self._props: Dict[str, Any] = {}
 
         if not _HAS_PICAMERA2:
@@ -231,12 +251,11 @@ class IMX708CameraCapture:
 
     def _find_tuning_file(self) -> Optional[str]:
         """
-        Locate the IMX708 Wide NoIR tuning JSON file.
-        CRITICAL: Never return standard imx708.json (IR-cut) for a NoIR sensor!
-        If imx708_wide_noir.json is not found, returns None so libcamera's
-        native auto-detection logic can pick the profile without interference.
+        Locate candidate IMX708 tuning JSON files if available on disk.
         """
         candidates = [
+            "imx708_wide.json",
+            "imx708.json",
             "imx708_wide_noir.json",
             "imx708_noir.json",
         ]
@@ -259,20 +278,20 @@ class IMX708CameraCapture:
                 except Exception as hdr_err:
                     print(f"[IMX708] HDR setting skipped: {hdr_err}")
 
-            # ── Tuning file — IMX708 Wide NoIR colour calibration ─────────────
-            # Clean up any bad override from prior runs (e.g. imx708.json with IR cut)
-            cur_tuning = os.environ.get("LIBCAMERA_RPI_TUNING_FILE", "")
-            if cur_tuning and ("imx708_wide_noir" not in cur_tuning and "imx708_noir" not in cur_tuning):
-                print(f"[IMX708] Removing incorrect IR-cut tuning file override from env: {cur_tuning}")
-                os.environ.pop("LIBCAMERA_RPI_TUNING_FILE", None)
-
-            # Search specifically for the NoIR tuning file
-            tuning_path = self._find_tuning_file()
-            if tuning_path:
-                os.environ["LIBCAMERA_RPI_TUNING_FILE"] = tuning_path
-                print(f"[IMX708] Applied NoIR tuning file: {tuning_path}")
+            # ── Libcamera tuning file configuration ───────────────────────────
+            # Standard behaviour (identical to 'rpicam-hello'):
+            # Libcamera queries sensor EEPROM/DeviceTree and loads the matching tuning file automatically.
+            # An explicit override is only applied if CAMERA_TUNING_FILE is set in config.py or passed in.
+            if self.tuning_file and os.path.isfile(self.tuning_file):
+                os.environ["LIBCAMERA_RPI_TUNING_FILE"] = self.tuning_file
+                print(f"[IMX708] Applied custom tuning file: {self.tuning_file}")
             else:
-                print("[IMX708] No explicit NoIR tuning file found; allowing libcamera native auto-detection.")
+                # Remove any previous manual tuning override from environment so libcamera auto-detection is clean
+                if "LIBCAMERA_RPI_TUNING_FILE" in os.environ:
+                    popped = os.environ.pop("LIBCAMERA_RPI_TUNING_FILE", None)
+                    print(f"[IMX708] Cleared env tuning file ({popped}); letting libcamera auto-detect.")
+                else:
+                    print("[IMX708] Libcamera native auto-detection active (standard rpicam-hello behavior).")
 
             # Construct Picamera2 (libcamera reads LIBCAMERA_RPI_TUNING_FILE or auto-detects)
             self._picam2 = Picamera2(self.camera_idx)
@@ -282,7 +301,7 @@ class IMX708CameraCapture:
                 self._props = self._picam2.camera_properties or {}
                 model = self._props.get("Model")
                 if model:
-                    self._sensor_model = f"{model} (Camera Module 3 Wide NoIR)"
+                    self._sensor_model = f"{model} (Camera Module 3)"
             except Exception:
                 pass
 
@@ -312,67 +331,17 @@ class IMX708CameraCapture:
             # Configure autofocus (PDAF is supported by IMX708)
             self.set_autofocus(self.af_mode)
 
-            # ── Colour / AWB fix for IMX708 Wide NoIR ─────────────────────────
-            # The IMX708 NoIR lacks an IR-cut filter.  Without the correct NoIR
-            # tuning file, libcamera's AWB algorithm over-corrects blue/magenta
-            # channel gains and greens appear purple/magenta in the output.
-            #
-            # Fix strategy:
-            #   1. Use AwbMode=Daylight (warmer gains, Rg ≈ 2.0, Bg ≈ 1.5) so
-            #      the green channel is not suppressed by the default Auto mode
-            #      which tends to pick cool (blue-dominant) gains on a NoIR.
-            #   2. Enable AeEnable so exposure is stable during AWB convergence.
-            #   3. Extend warm-up to 2.5 s to allow gains to fully converge.
-            #   4. If no NoIR tuning file was found, apply explicit ColourGains
-            #      that approximate the correct Rg/Bg ratio for daylight NoIR.
-            #
-            # DO NOT lock gains (ColourGains) permanently when the tuning file
-            # IS loaded — the tuning file's CCM is already calibrated.
-            try:
-                if libcam_controls and hasattr(libcam_controls, "AwbModeEnum"):
-                    # Daylight AWB mode gives correct greens for outdoor NoIR use.
-                    # Indoor scenes can still look slightly warm but green dominance
-                    # is correct — far better than the purple cast from Auto mode.
-                    self._picam2.set_controls({
-                        "AeEnable":  True,
-                        "AwbEnable": True,
-                        "AwbMode":   libcam_controls.AwbModeEnum.Daylight,
-                    })
-                    print("[IMX708] AWB set to Daylight mode for NoIR green channel correction.")
-                else:
-                    # Fallback: use integer enum (4 = Daylight in libcamera)
-                    self._picam2.set_controls({
-                        "AeEnable":  True,
-                        "AwbEnable": True,
-                        "AwbMode":   4,
-                    })
-                    print("[IMX708] AWB set to Daylight mode (integer enum fallback).")
-            except Exception as awb_err:
-                print(f"[IMX708] Note: AWB Daylight mode not applied: {awb_err}. Falling back to Auto.")
-                try:
-                    self._picam2.set_controls({"AwbEnable": True})
-                except Exception:
-                    pass
+            # ── Configure White Balance (AWB) ─────────────────────────────────
+            # Default is "auto", enabling the continuous ISP AWB algorithm (identical to rpicam-hello).
+            # No manual ColourGains (e.g. 2.1, 1.45) are forced, eliminating the yellowish mist or reddish tint.
+            self.set_awb_mode(self.awb_mode)
 
-            # Extended warm-up: 2.5 s for AWB and AEC to fully converge on NoIR
-            time.sleep(2.5)
-
-            # If the NoIR tuning file was NOT loaded, apply a gentle explicit
-            # ColourGains correction that reduces blue dominance.
-            # Rg ≈ 2.1 (red gain) and Bg ≈ 1.45 (blue gain) are empirically good
-            # for outdoor daylight on IMX708 Wide NoIR without a tuning file.
-            tuning_active = bool(os.environ.get("LIBCAMERA_RPI_TUNING_FILE", ""))
-            if not tuning_active:
-                try:
-                    self._picam2.set_controls({"ColourGains": (2.1, 1.45)})
-                    print("[IMX708] Applied fallback ColourGains (Rg=2.1, Bg=1.45) — no tuning file detected.")
-                except Exception:
-                    pass
+            # Short warm-up for ISP AE and AWB statistics convergence
+            time.sleep(1.0)
 
             print(f"[IMX708] Initialized successfully ({self.width}x{self.height} @ {self.fps} fps, "
-                  f"PDAF: {self.af_mode}, RB swap: {self.swap_rb})")
+                  f"PDAF: {self.af_mode}, AWB: {self.get_awb_mode()}, RB swap: {self.swap_rb})")
             self._is_opened = True
-
 
         except Exception as exc:
             self._is_opened = False
@@ -383,6 +352,89 @@ class IMX708CameraCapture:
                     pass
                 self._picam2 = None
             raise RuntimeError(f"Failed to initialize IMX708 camera: {exc}") from exc
+
+    # Libcamera AWB mode mapping
+    AWB_MODE_MAP = {
+        "auto": 0,
+        "incandescent": 1,
+        "tungsten": 2,
+        "fluorescent": 3,
+        "indoor": 4,
+        "daylight": 5,
+        "cloudy": 6,
+    }
+    AWB_CYCLE_MODES = ["auto", "daylight", "cloudy", "indoor", "fluorescent"]
+
+    def set_awb_mode(self, mode: Union[str, int]) -> bool:
+        """
+        Configure White Balance dynamically without restarting the camera.
+        Supported modes:
+          - 'auto' (default, continuous ISP calculation like rpicam-hello)
+          - 'daylight' (outdoor direct sunlight)
+          - 'cloudy' (outdoor overcast)
+          - 'indoor' (indoor warm lighting)
+          - 'tungsten' (incandescent/tungsten bulbs)
+          - 'fluorescent' (office fluorescent lighting)
+        """
+        if self._picam2 is None:
+            return False
+
+        mode_str = str(mode).lower().strip()
+        awb_int = self.AWB_MODE_MAP.get(mode_str, 0) if isinstance(mode, str) else int(mode)
+
+        try:
+            ctrls: Dict[str, Any] = {
+                "AeEnable": True,
+                "AwbEnable": True,
+            }
+            if libcam_controls is not None and hasattr(libcam_controls, "AwbModeEnum"):
+                _enum_lookup = {
+                    0: libcam_controls.AwbModeEnum.Auto,
+                    1: getattr(libcam_controls.AwbModeEnum, "Incandescent", libcam_controls.AwbModeEnum.Tungsten),
+                    2: libcam_controls.AwbModeEnum.Tungsten,
+                    3: libcam_controls.AwbModeEnum.Fluorescent,
+                    4: libcam_controls.AwbModeEnum.Indoor,
+                    5: libcam_controls.AwbModeEnum.Daylight,
+                    6: libcam_controls.AwbModeEnum.Cloudy,
+                }
+                ctrls["AwbMode"] = _enum_lookup.get(awb_int, libcam_controls.AwbModeEnum.Auto)
+            else:
+                ctrls["AwbMode"] = awb_int
+
+            # Reset any manual locked ColourGains so dynamic ISP AWB operates freely
+            if mode_str == "auto":
+                try:
+                    ctrls["ColourGains"] = (0.0, 0.0)
+                except Exception:
+                    pass
+
+            self._picam2.set_controls(ctrls)
+            self.awb_mode = mode_str
+            print(f"[IMX708] Dynamic AWB mode updated to: {self.get_awb_mode().upper()} (runtime ISP update, no camera restart)")
+            return True
+        except Exception as exc:
+            print(f"[IMX708] Error setting AWB mode '{mode}': {exc}")
+            return False
+
+    def cycle_awb_mode(self) -> str:
+        """
+        Cycle through common AWB modes in real-time on the live video stream:
+        Auto -> Daylight -> Cloudy -> Indoor -> Fluorescent -> Auto
+        Takes effect immediately on the very next frame without restarting the camera.
+        Returns the new active mode display name.
+        """
+        current = self.awb_mode.lower()
+        if current in self.AWB_CYCLE_MODES:
+            idx = (self.AWB_CYCLE_MODES.index(current) + 1) % len(self.AWB_CYCLE_MODES)
+        else:
+            idx = 0
+        new_mode = self.AWB_CYCLE_MODES[idx]
+        self.set_awb_mode(new_mode)
+        return self.get_awb_mode()
+
+    def get_awb_mode(self) -> str:
+        """Return the current active AWB mode name formatted for display (e.g. 'Auto')."""
+        return self.awb_mode.capitalize()
 
     def set_autofocus(self, mode: Union[str, int]) -> bool:
         """
@@ -491,6 +543,7 @@ class IMX708CameraCapture:
             "resolution": f"{self.width}x{self.height}",
             "fps": self.fps,
             "autofocus": f"{self.af_mode.capitalize()} (PDAF)",
+            "awb_mode": self.get_awb_mode(),
             "hdr": self.hdr,
         }
 
@@ -517,6 +570,8 @@ def probe_video_source(
     af_mode: str = "continuous",
     hdr: bool = False,
     swap_rb: Optional[bool] = None,
+    awb_mode: Optional[str] = None,
+    tuning_file: Optional[str] = None,
 ) -> Tuple[Optional[Any], int, int, float, Dict[str, Any]]:
     """
     Probe and open a video source.
@@ -556,6 +611,8 @@ def probe_video_source(
                 af_mode=af_mode,
                 hdr=hdr,
                 swap_rb=swap_rb,
+                awb_mode=awb_mode,
+                tuning_file=tuning_file,
             )
             ret, frame = cap.read()
             if ret and frame is not None and frame.size > 0:
@@ -565,6 +622,7 @@ def probe_video_source(
                     "backend": "picamera2",
                     "is_imx708": True,
                     "autofocus": cap.get_info()["autofocus"],
+                    "awb_mode": cap.get_info()["awb_mode"],
                 })
                 return cap, w, h, target_fps, cam_info
             cap.release()
@@ -597,6 +655,8 @@ def probe_video_source(
                         af_mode=af_mode,
                         hdr=hdr,
                         swap_rb=swap_rb,
+                        awb_mode=awb_mode,
+                        tuning_file=tuning_file,
                     )
                     ret, frame = cap.read()
                     if ret and frame is not None and frame.size > 0:
@@ -606,6 +666,7 @@ def probe_video_source(
                             "backend": "picamera2",
                             "is_imx708": True,
                             "autofocus": cap.get_info()["autofocus"],
+                            "awb_mode": cap.get_info()["awb_mode"],
                         })
                         return cap, w, h, target_fps, cam_info
                     cap.release()
@@ -729,6 +790,8 @@ def scan_for_camera(
     af_mode: str = "continuous",
     hdr: bool = False,
     swap_rb: Optional[bool] = None,
+    awb_mode: Optional[str] = None,
+    tuning_file: Optional[str] = None,
 ) -> Tuple[Optional[Any], Any, int, int, float, Dict[str, Any]]:
     """
     Scan candidate video sources and return the first successfully opened camera.
@@ -744,6 +807,8 @@ def scan_for_camera(
             af_mode=af_mode,
             hdr=hdr,
             swap_rb=swap_rb,
+            awb_mode=awb_mode,
+            tuning_file=tuning_file,
         )
         if cap is not None:
             return cap, cand, w, h, fps, info

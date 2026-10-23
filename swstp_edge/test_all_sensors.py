@@ -5,7 +5,7 @@ test_all_sensors.py — Standalone diagnostic script for SWSTP Edge sensors.
 Initialises and reads all sensor modules in order:
   1. RTC   — DS3231 via I2C (with internet/NTP sync attempt)
   2. IMU   — MPU-6500 via I2C (with calibration)
-  3. GNSS  — NavCast TCP NMEA stream (background thread)
+  3. GNSS  — u-blox MAX-M10S Hardware UART NMEA (Serial)
   4. PiCam — Sony IMX708 (Camera Module 3) via Picamera2
   5. LTE   — Cellular/LTE connectivity (network reachability + SIM check)
 
@@ -30,6 +30,13 @@ import datetime
 import json
 import sys
 import time
+
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 
 # ── Pretty-print helpers ─────────────────────────────────────────────────────
 
@@ -256,7 +263,7 @@ def test_imu(num_samples: int = 5):
 # ════════════════════════════════════════════════════════════════════════════
 
 def test_gnss(wait_sec: int = 30):
-    _section("GNSS — NavCast TCP NMEA  (USB tethering)", color=GREEN)
+    _section("GNSS — u-blox MAX-M10S Hardware GNSS  (UART /dev/serial0)", color=GREEN)
 
     try:
         from sensors import gnss as gnss_mod
@@ -265,12 +272,12 @@ def test_gnss(wait_sec: int = 30):
         return False
 
     try:
-        from config import NAVCAST_HOST, NAVCAST_PORT
+        from config import GNSS_SERIAL_PORT, GNSS_BAUD_RATE
     except ImportError:
-        NAVCAST_HOST = "10.208.43.190"
-        NAVCAST_PORT = 10110
+        GNSS_SERIAL_PORT = "/dev/serial0"
+        GNSS_BAUD_RATE   = 9600
 
-    print(f"\n  {DIM}Starting NavCast TCP reader → {NAVCAST_HOST}:{NAVCAST_PORT}{RESET}")
+    print(f"\n  {DIM}Starting MAX-M10S GNSS serial reader → {GNSS_SERIAL_PORT} @ {GNSS_BAUD_RATE} baud{RESET}")
     gnss_mod.init()
 
     # ── Wait for data ─────────────────────────────────────────────────────
@@ -312,11 +319,11 @@ def test_gnss(wait_sec: int = 30):
     print()
     status = data.get("status")
     if status == "FIX":
-        _ok(f"GNSS FIX acquired")
+        _ok("u-blox MAX-M10S GNSS FIX acquired")
     elif status == "NO_FIX":
-        _warn("GNSS data flowing — no positional fix yet")
+        _warn("GNSS data flowing from MAX-M10S — no positional fix yet (ensure antenna is placed near window/outdoors)")
     else:
-        _err(f"No GNSS data received (status={status}). Check NavCast app & USB tethering.")
+        _err(f"No GNSS data received (status={status}). Check MAX-M10S UART wiring (TX->RXD Pin 10, RX->TXD Pin 8), power (3.3V/5V), and enable_uart=1 in /boot/firmware/config.txt.")
 
     _sub("GNSS read() snapshot")
     _field("data_received",       data.get("data_received"))

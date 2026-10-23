@@ -105,7 +105,7 @@ This is the default operating mode in the vehicle:
 - It runs with '--headless' and 'QT_QPA_PLATFORM=offscreen' so it never tries to
   open a window and will never crash due to a missing screen.
 - It automatically loads the saved 'roi_polygon.json'.
-- It auto-detects NavCast GPS tethering (no manual IP/port required).
+- It connects to the u-blox MAX-M10S hardware GNSS over UART (/dev/serial0).
 - It syncs with the DS3231 RTC and reads MPU-6500 IMU.
 - It uploads motion evidence when vehicle speed < 5 km/h.
 

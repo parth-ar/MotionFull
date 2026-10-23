@@ -108,7 +108,7 @@ hardware_state: dict = {
     "camera":  {"detected": False, "source": None, "model": "None", "is_imx708": False, "resolution": None, "fps": None, "autofocus": "N/A"},
     "serial":  {"connected": True, "port": "Pi-native", "baud": None, "desc": "Raspberry Pi native sensors"},
     "rtc":     {"detected": False, "module": "DS3231 (I2C 0x68)", "last_ts": None, "logged_online": False, "logged_error": False},
-    "gps":     {"detected": False, "module": "NavCast (TCP USB tethering)", "fix": False, "coords": None, "logged_detected": False, "logged_fix": False, "logged_fallback": False},
+    "gps":     {"detected": False, "module": "u-blox MAX-M10S (UART /dev/serial0)", "fix": False, "coords": None, "logged_detected": False, "logged_fix": False, "logged_fallback": False},
     "backend": {"connected": False, "last_ping": 0, "upload_count": 0, "telemetry_count": 0, "active_session_id": 0},
 }
 
@@ -147,7 +147,7 @@ def build_telemetry_packet(device_id: str) -> dict:
     if gnss_data.get("data_received") and not hardware_state["gps"]["logged_detected"]:
         hardware_state["gps"]["detected"]        = True
         hardware_state["gps"]["logged_detected"] = True
-        _log_hardware("GPS MODULE (NavCast)", "STREAM DETECTED", "NavCast NMEA TCP stream active.")
+        _log_hardware("GPS MODULE (MAX-M10S)", "STREAM DETECTED", "u-blox MAX-M10S NMEA serial stream active.")
 
     if gnss_fix and lat_raw is not None and lon_raw is not None:
         if abs(lat_raw) > 0.001 and abs(lon_raw) > 0.001:
@@ -158,7 +158,7 @@ def build_telemetry_packet(device_id: str) -> dict:
                 hardware_state["gps"]["fix"]        = True
                 hardware_state["gps"]["logged_fix"] = True
                 _log_hardware(
-                    "GPS MODULE (NavCast)", "SATELLITE FIX & ROAD SNAP",
+                    "GPS MODULE (MAX-M10S)", "SATELLITE FIX & ROAD SNAP",
                     f"Raw GPS: ({lat_raw:.6f}, {lon_raw:.6f}) -> Road: ({snapped_lat:.6f}, {snapped_lon:.6f}) "
                     f"[Drift: {drift_m:.1f}m | SafeZone: {in_sz} | Snapped: {is_snapped}]"
                 )

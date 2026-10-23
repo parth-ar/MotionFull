@@ -102,6 +102,9 @@ CAMERA_AF_MODE           = "continuous"# Options: "continuous", "auto", "manual"
 CAMERA_PREFER_IMX708     = True        # Prioritise IMX708 / Picamera2 over standard V4L2
 CAMERA_IMX708_HDR        = False       # Hardware HDR mode for IMX708 sensor
 CAMERA_SWAP_RB           = True        # Convert Picamera2 [R,G,B] array to OpenCV native [B,G,R]
+CAMERA_AWB_MODE          = "auto"      # Default White Balance: "auto" (standard dynamic ISP, matches rpicam-hello).
+                                       # Options: "auto", "daylight", "cloudy", "indoor", "tungsten", "fluorescent"
+CAMERA_TUNING_FILE       = None        # Optional path to libcamera tuning JSON file (None = native auto-detection like rpicam-hello)
 
 # ---------------------------------------------------------------------------
 # Telemetry rate
@@ -117,11 +120,17 @@ GNSS_DETAIL_INTERVAL_SEC = 1.0
 GNSS_SATELLITE_SNAP_SEC  = 5.0
 
 # ---------------------------------------------------------------------------
-# NavCast GNSS — phone app streaming NMEA over USB tethering TCP
+# u-blox MAX-M10S GNSS Hardware Configuration (UART Serial)
+# Pin connections (identical to NEO-6M):
+#   TXD (GNSS) -> Raspberry Pi Physical 10 / BCM 15 (RXD0 / /dev/serial0)
+#   RXD (GNSS) -> Raspberry Pi Physical 8  / BCM 14 (TXD0)
+#   VCC        -> Raspberry Pi Physical 1  (3.3V) or Physical 2/4 (5V)
+#   GND        -> Raspberry Pi Physical 6  (GND)
+#   RST (Opt)  -> Raspberry Pi Physical 36 / BCM 16 (GNSS_RESET_PIN)
 # ---------------------------------------------------------------------------
-NAVCAST_HOST        = "10.208.43.190"
-NAVCAST_PORT        = 10110
-NAVCAST_AUTO_DETECT = True
+GNSS_SERIAL_PORT    = "/dev/serial0"   # Default hardware UART on Raspberry Pi
+GNSS_BAUD_RATE      = 9600             # Standard NMEA default baud rate for MAX-M10S / NEO-6M
+GNSS_AUTO_DETECT    = True             # Auto-scan candidate serial ports if default fails
 
 # ---------------------------------------------------------------------------
 # IMU complementary filter
@@ -154,7 +163,7 @@ LED_YELLOW_BLINK_INTERVAL = 1.000    # seconds
 # ---------------------------------------------------------------------------
 # GNSS fallback / IP-geolocation
 # ---------------------------------------------------------------------------
-ENABLE_GPS_FALLBACK        = True
+ENABLE_GPS_FALLBACK        = False
 GNSS_FALLBACK_TIMEOUT_SEC  = 20
 GNSS_FALLBACK_REFRESH_SEC  = 300
 
