@@ -115,7 +115,7 @@ TELEMETRY_INTERVAL_SEC = 1.0 / TELEMETRY_RATE_HZ
 # ---------------------------------------------------------------------------
 # GNSS / timing thresholds
 # ---------------------------------------------------------------------------
-GNSS_DATA_TIMEOUT_SEC    = 6.0
+GNSS_DATA_TIMEOUT_SEC    = 10.0
 GNSS_DETAIL_INTERVAL_SEC = 1.0
 GNSS_SATELLITE_SNAP_SEC  = 5.0
 

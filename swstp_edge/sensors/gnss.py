@@ -1,10 +1,12 @@
 """
 sensors/gnss.py — u-blox MAX-M10S GNSS Hardware Driver (Primary GNSS, UART NMEA Serial).
 
-DESIGN
-------
+DESIGN & CONNECTION
+-------------------
 Reads standard NMEA 0183 sentences from the u-blox MAX-M10S GNSS module via
 hardware UART (/dev/serial0 on Raspberry Pi 4B) or USB-to-UART serial adapters.
+Architecture directly mirrors test_max_m10s_gnss.py (and test_neo6m_gnss.py) for
+seamless, flicker-free streaming without baud-hunting or port cycling.
 
 The u-blox MAX-M10S is the primary GNSS receiver for the SWSTP edge node.
 Hardware Pin Connections:
@@ -77,7 +79,6 @@ except ImportError:
 # ---------------------------------------------------------------------------
 RECONNECT_DELAY   = 2.0    # seconds between serial reconnect attempts
 _READ_TIMEOUT_SEC = 1.0    # serial read timeout so thread can inspect _stop_event
-_PROBE_IDLE_SEC   = 4.0    # seconds of silence on a port before testing candidate ports
 
 _TALKER_CONSTELLATION = {
     "GP": "GPS",
@@ -129,8 +130,41 @@ _target_baud: int | None = None
 
 
 # ---------------------------------------------------------------------------
-# Port Auto-Detection & Hardware Reset
+# Port Auto-Detection & Hardware Reset (Directly mirrored from test_max_m10s_gnss)
 # ---------------------------------------------------------------------------
+
+def auto_detect_gnss_port() -> str | None:
+    """Scan candidate serial ports for MAX-M10S on Raspberry Pi and PC.
+    Identical logic to test_max_m10s_gnss.py and test_neo6m_gnss.py.
+    """
+    candidates = []
+
+    # 1. Raspberry Pi hardware UART ports (Physical Pins 8 & 10)
+    pi_uarts = ["/dev/serial0", "/dev/ttyAMA0", "/dev/ttyS0"]
+    for p in pi_uarts:
+        if os.path.exists(p):
+            candidates.append(p)
+
+    # 2. USB to UART adapters (/dev/ttyUSB*, /dev/ttyACM*)
+    candidates.extend(sorted(glob.glob("/dev/ttyUSB*")))
+    candidates.extend(sorted(glob.glob("/dev/ttyACM*")))
+
+    # 3. Windows COM ports (bench/development)
+    if HAVE_PYSERIAL:
+        try:
+            ports = serial.tools.list_ports.comports()
+            for p in ports:
+                candidates.append(p.device)
+        except Exception:
+            pass
+
+    return candidates[0] if candidates else None
+
+
+# Backwards compatibility aliases
+find_gnss_port = auto_detect_gnss_port
+auto_detect_neo6m_port = auto_detect_gnss_port
+
 
 def get_candidate_ports(preferred: str | None = None) -> list[str]:
     """Return an ordered list of candidate serial ports to probe for MAX-M10S."""
@@ -146,36 +180,31 @@ def get_candidate_ports(preferred: str | None = None) -> list[str]:
     if _target_port:
         _add(_target_port)
 
+    # Auto-detected port has top priority
+    auto_p = auto_detect_gnss_port()
+    if auto_p:
+        _add(auto_p)
+
     cfg_port = getattr(_cfg, "GNSS_SERIAL_PORT", "/dev/serial0")
     if cfg_port:
         _add(cfg_port)
 
-    # 1. USB-to-UART adapters (/dev/ttyUSB*, /dev/ttyACM*)
-    for p in sorted(glob.glob("/dev/ttyUSB*") + glob.glob("/dev/ttyACM*")):
-        if os.path.exists(p):
-            _add(p)
-
-    # 2. Raspberry Pi hardware UART ports
     for p in ("/dev/serial0", "/dev/ttyAMA0", "/dev/ttyS0"):
         if os.path.exists(p):
             _add(p)
 
-    # 3. Windows COM ports (development/bench testing)
+    for p in sorted(glob.glob("/dev/ttyUSB*") + glob.glob("/dev/ttyACM*")):
+        if os.path.exists(p):
+            _add(p)
+
     if HAVE_PYSERIAL:
         try:
-            ports = serial.tools.list_ports.comports()
-            for p in ports:
+            for p in serial.tools.list_ports.comports():
                 _add(p.device)
         except Exception:
             pass
 
     return candidates
-
-
-def find_gnss_port() -> str | None:
-    """Locate the u-blox MAX-M10S UART or USB serial port."""
-    candidates = get_candidate_ports()
-    return candidates[0] if candidates else GNSS_SERIAL_PORT
 
 
 def hardware_reset() -> bool:
@@ -302,13 +331,13 @@ def _parse_gga(fields: list) -> None:
         return
 
     quality = _safe_int(fields[6])   # 0=no fix, 1=SPS, 2=DGPS, 4=RTK, 5=Float RTK
-    has_fix = quality > 0
+    has_fix = (quality > 0)
 
     lat = _parse_lat(fields[2], fields[3])
     lon = _parse_lon(fields[4], fields[5])
-    alt = _safe_float(fields[9])
-    hdop = _safe_float(fields[8]) if len(fields) > 8 else None
     num_sats = _safe_int(fields[7])
+    hdop = _safe_float(fields[8]) if len(fields) > 8 else None
+    alt = _safe_float(fields[9]) if len(fields) > 9 else None
 
     now = time.monotonic()
     with _lock:
@@ -340,11 +369,8 @@ def _parse_rmc(fields: list) -> None:
         return
 
     now = time.monotonic()
-    with _lock:
-        _state["data_received"]  = True
-        _state["last_data_time"] = now
-
-    active = fields[2].strip().upper() == "A"
+    status = fields[2].strip().upper() if fields[2] else "V"
+    active = (status == "A")
 
     lat = _parse_lat(fields[3], fields[4]) if len(fields) > 4 else None
     lon = _parse_lon(fields[5], fields[6]) if len(fields) > 6 else None
@@ -355,6 +381,8 @@ def _parse_rmc(fields: list) -> None:
     speed_kmh = round(speed_kn * 1.852, 2) if speed_kn is not None else None
 
     with _lock:
+        _state["data_received"]  = True
+        _state["last_data_time"] = now
         if speed_kmh is not None:
             _state["speed_kmh"] = speed_kmh
         if course is not None:
@@ -514,22 +542,50 @@ def _dispatch(line: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Background Serial Reader Thread with Auto-Port & Auto-Baud Scanning
+# State Reset Helper
+# ---------------------------------------------------------------------------
+
+def _reset_state_to_disconnected() -> None:
+    """Strictly reset all GNSS state when serial port closes or NMEA stream is disconnected.
+    Ensures zero stale coordinates or false fixes are retained.
+    """
+    global gnss_ok, _active_port
+    gnss_ok = False
+    _active_port = None
+    with _lock:
+        _state["data_received"]         = False
+        _state["fix"]                   = False
+        _state["status"]                = "NO_DATA"
+        _state["latitude"]              = None
+        _state["longitude"]             = None
+        _state["altitude_m"]            = None
+        _state["speed_kmh"]             = None
+        _state["course_deg"]            = None
+        _state["satellites"]            = 0
+        _state["satellites_in_view"]    = 0
+        _state["satellite_records"]     = 0
+        _state["satellites_detail"]     = None
+        _state["hdop"]                  = None
+        _state["last_data_time"]        = None
+        _state["last_fix_time"]         = None
+        _state["last_detail_snap_time"] = None
+
+
+# ---------------------------------------------------------------------------
+# Background Serial Reader Thread (Mirrors test_max_m10s_gnss.py connection)
 # ---------------------------------------------------------------------------
 
 def _serial_thread() -> None:
-    """Background worker that connects to the MAX-M10S hardware UART serial port,
+    """Background worker that opens the MAX-M10S hardware UART serial port directly,
     reads NMEA sentences line-by-line, and updates module state.
-    Auto-detects ports and bauds if data is not actively flowing.
+    
+    Adopts the proven architecture of test_max_m10s_gnss.py:
+      - Uses auto_detect_gnss_port() to resolve /dev/serial0 first
+      - Connects directly at 9600 baud without hopping or cycling
+      - Avoids invasive multi-baud probing loops that interrupt the stream
+      - Stays locked onto the open stream and handles read timeouts seamlessly
     """
     global gnss_ok, _active_port, _active_baud
-
-    # Candidate bauds to test (MAX-M10S default is 9600; high-speed is 38400 or 115200)
-    base_baud = _target_baud or GNSS_BAUD_RATE
-    candidate_bauds = [base_baud]
-    for b in (9600, 38400, 115200):
-        if b not in candidate_bauds:
-            candidate_bauds.append(b)
 
     while not _stop_event.is_set():
         if not HAVE_PYSERIAL:
@@ -538,122 +594,76 @@ def _serial_thread() -> None:
             _stop_event.wait(RECONNECT_DELAY)
             continue
 
-        candidate_ports = get_candidate_ports(_target_port)
-        if not candidate_ports:
-            candidate_ports = [GNSS_SERIAL_PORT]
+        target_port = _target_port or auto_detect_gnss_port() or getattr(_cfg, "GNSS_SERIAL_PORT", "/dev/serial0")
+        target_baud = _target_baud or getattr(_cfg, "GNSS_BAUD_RATE", 9600)
 
-        connected_and_streamed = False
+        ser = None
+        try:
+            ser = serial.Serial(
+                port=target_port,
+                baudrate=target_baud,
+                timeout=_READ_TIMEOUT_SEC,
+                bytesize=serial.EIGHTBITS,
+                parity=serial.PARITY_NONE,
+                stopbits=serial.STOPBITS_ONE,
+            )
+            _active_port = target_port
+            _active_baud = target_baud
+            print(f"[GNSS] Serial port opened: {target_port} @ {target_baud} baud")
+        except Exception as exc:
+            _active_port = None
+            _stop_event.wait(RECONNECT_DELAY)
+            continue
 
-        for port in candidate_ports:
-            if _stop_event.is_set():
-                break
+        last_valid_sentence_mono = time.monotonic()
+        buffer = bytearray()
 
-            for baud in candidate_bauds:
-                if _stop_event.is_set():
-                    break
-
-                ser = None
+        try:
+            while not _stop_event.is_set():
                 try:
-                    ser = serial.Serial(
-                        port=port,
-                        baudrate=baud,
-                        timeout=_READ_TIMEOUT_SEC,
-                        bytesize=serial.EIGHTBITS,
-                        parity=serial.PARITY_NONE,
-                        stopbits=serial.STOPBITS_ONE,
-                    )
-
-                    # Probe port for valid NMEA sentences
-                    probe_start = time.monotonic()
-                    port_has_nmea = False
-
-                    while (time.monotonic() - probe_start) < _PROBE_IDLE_SEC and not _stop_event.is_set():
-                        try:
-                            line_bytes = ser.readline()
-                        except Exception:
-                            break
-
-                        if not line_bytes:
-                            continue
-
-                        line = line_bytes.decode("ascii", errors="replace").strip()
-                        if "$" in line:
-                            if _dispatch(line):
-                                port_has_nmea = True
-                                break
-
-                    if not port_has_nmea:
-                        # Try next baud or port
-                        ser.close()
-                        ser = None
-                        continue
-
-                    # Confirmed NMEA stream! Lock onto this port and baud
-                    _active_port = port
-                    _active_baud = baud
-                    gnss_ok = True
-                    print(f"[GNSS] Primary GNSS active: u-blox MAX-M10S on {port} @ {baud} baud")
-
-                    last_valid_sentence_mono = time.monotonic()
-                    while not _stop_event.is_set():
-                        try:
-                            line_bytes = ser.readline()
-                        except Exception as read_err:
-                            print(f"[GNSS] Read error on {port}: {read_err}")
-                            break
-
-                        if not line_bytes:
-                            # 1.0s read timeout elapsed with no newline.
-                            # Standard 1 Hz GPS bursts can have inter-epoch timing jitter.
-                            # Only treat as disconnected if completely silent for >= 12 seconds.
-                            if (time.monotonic() - last_valid_sentence_mono) >= 12.0:
-                                print(f"[GNSS] No NMEA data on {port} for 12s — stream lost, re-establishing...")
-                                break
-                            continue
-
-                        line = line_bytes.decode("ascii", errors="replace").strip()
-                        if "$" in line:
-                            if _dispatch(line):
-                                last_valid_sentence_mono = time.monotonic()
-
-                    connected_and_streamed = True
-
-                except Exception as exc:
-                    pass
-                finally:
-                    if ser:
-                        try:
-                            ser.close()
-                        except Exception:
-                            pass
-
-                if connected_and_streamed:
+                    # In Linux/POSIX, bulk reading available bytes from the serial buffer
+                    # avoids byte-by-byte read(1) GIL contention under camera/OpenCV load.
+                    waiting = getattr(ser, "in_waiting", 0)
+                    to_read = max(1, min(waiting, 2048)) if waiting > 0 else 1
+                    chunk = ser.read(to_read)
+                except Exception as read_err:
+                    print(f"[GNSS] Read error on {target_port}: {read_err}")
                     break
 
-            if connected_and_streamed:
-                break
+                if not chunk:
+                    # Read timeout (1.0s) with no bytes received
+                    now_mono = time.monotonic()
+                    if (now_mono - last_valid_sentence_mono) >= GNSS_DATA_TIMEOUT_SEC:
+                        if gnss_ok:
+                            print(f"[GNSS] Stream silent for {GNSS_DATA_TIMEOUT_SEC}s on {target_port} — disconnecting")
+                            _reset_state_to_disconnected()
+                    continue
 
-        gnss_ok = False
-        _active_port = None
-        with _lock:
-            _state["data_received"]         = False
-            _state["fix"]                   = False
-            _state["status"]                = "NO_DATA"
-            _state["latitude"]              = None
-            _state["longitude"]             = None
-            _state["altitude_m"]            = None
-            _state["speed_kmh"]             = None
-            _state["course_deg"]            = None
-            _state["satellites"]            = 0
-            _state["satellites_in_view"]    = 0
-            _state["satellite_records"]     = 0
-            _state["satellites_detail"]     = None
-            _state["hdop"]                  = None
-            _state["last_data_time"]        = None
-            _state["last_fix_time"]         = None
-            _state["last_detail_snap_time"] = None
+                buffer.extend(chunk)
 
-        _stop_event.wait(RECONNECT_DELAY)
+                # Process all complete lines in buffer cleanly without partial-line truncation
+                while b"\n" in buffer:
+                    line_bytes, buffer = buffer.split(b"\n", 1)
+                    line = line_bytes.decode("ascii", errors="replace").strip()
+                    if "$" in line:
+                        idx = line.find("$")
+                        nmea_sentence = line[idx:]
+                        if _dispatch(nmea_sentence):
+                            last_valid_sentence_mono = time.monotonic()
+                            if not gnss_ok:
+                                gnss_ok = True
+                                print(f"[GNSS] Primary GNSS stream locked: u-blox MAX-M10S on {target_port} @ {target_baud} baud")
+
+        except Exception as loop_err:
+            print(f"[GNSS] Exception in serial reader loop: {loop_err}")
+        finally:
+            if ser:
+                try:
+                    ser.close()
+                except Exception:
+                    pass
+            _reset_state_to_disconnected()
+            _stop_event.wait(RECONNECT_DELAY)
 
 
 # ---------------------------------------------------------------------------
@@ -674,7 +684,7 @@ def init(port: str | None = None, baud: int | None = None) -> bool:
         _target_baud = baud
 
     if _thread and _thread.is_alive():
-        target_p = _target_port or find_gnss_port() or GNSS_SERIAL_PORT
+        target_p = _target_port or auto_detect_gnss_port() or GNSS_SERIAL_PORT
         target_b = _target_baud or GNSS_BAUD_RATE
         print(f"[GNSS] Primary u-blox MAX-M10S reader already running ({target_p} @ {target_b} baud)")
         return True
@@ -682,9 +692,9 @@ def init(port: str | None = None, baud: int | None = None) -> bool:
     _stop_event.clear()
     _thread = threading.Thread(target=_serial_thread, name="gnss-max-m10s", daemon=True)
     _thread.start()
-    target_p = _target_port or find_gnss_port() or GNSS_SERIAL_PORT
+    target_p = _target_port or auto_detect_gnss_port() or GNSS_SERIAL_PORT
     target_b = _target_baud or GNSS_BAUD_RATE
-    print(f"[GNSS] Primary u-blox MAX-M10S reader initiated (probed: {target_p} @ {target_b} baud)")
+    print(f"[GNSS] Primary u-blox MAX-M10S reader initiated ({target_p} @ {target_b} baud)")
     return True
 
 
