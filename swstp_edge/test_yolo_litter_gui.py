@@ -6,12 +6,11 @@ test_yolo_litter_gui.py  --  Standalone GUI Test for YOLO Litter Detection Engin
 Tests ONLY the YOLO litter detection model.
 No motion detection, no cloud uploads, no sensors/* imports required.
 
-DEFAULT GNSS SOURCE: NavCast TCP (phone NMEA stream via USB tethering).
-  Host: 10.208.43.190  Port: 10110  (matches config.py NAVCAST_HOST/PORT)
-  Pass --host / --port to override. Use --sim to fall back to simulation.
+DEFAULT GNSS SOURCE: u-blox MAX-M10S Hardware Serial (Pi UART / USB-serial).
+  Pass --sim to fall back to simulation.
 
 KEY FEATURES:
-  - Live NavCast NMEA parsed in background: GGA, RMC, GSA, GSV with checksum.
+  - Live MAX-M10S NMEA parsed in background: GGA, RMC, GSA, GSV.
   - Auto-reconnect on TCP disconnect.
   - Real GNSS coordinates drive the 5 m distance trigger and TIME_FALLBACK.
   - Saves detected frames locally: JPEG + JSON sidecar with production banner overlay.
@@ -19,8 +18,8 @@ KEY FEATURES:
   - Live GUI: distance bar, mode badge, satellite count, HDOP, speed, log.
 
 USAGE:
-  python test_yolo_litter_gui.py                         # NavCast default host
-  python test_yolo_litter_gui.py --host 192.168.x.x     # custom NavCast IP
+  python test_yolo_litter_gui.py                         # Hardware GNSS default
+  python test_yolo_litter_gui.py --gnss-port /dev/serial0
   python test_yolo_litter_gui.py --sim                   # simulation fallback
   python test_yolo_litter_gui.py --camera 0              # laptop webcam
   python test_yolo_litter_gui.py --mode fallback         # start in clock fallback
@@ -53,7 +52,7 @@ import numpy as np
 # Ensure local detector.py is found first
 # ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
-# Ensure local modules (detector.py, sensors/navcast_discovery.py) are found
+# Ensure local modules (detector.py) are found
 # ---------------------------------------------------------------------------
 _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
@@ -67,16 +66,7 @@ except ImportError as _det_err:
     _DETECTOR_AVAILABLE = False
     _DETECTOR_IMPORT_ERROR = str(_det_err)
 
-try:
-    from sensors.navcast_discovery import discover_navcast, get_candidate_ips, auto_detect_navcast
-except ImportError:
-    try:
-        sys.path.insert(0, os.path.join(_HERE, "sensors"))
-        from navcast_discovery import discover_navcast, get_candidate_ips, auto_detect_navcast
-    except ImportError:
-        discover_navcast = None
-        get_candidate_ips = None
-        auto_detect_navcast = None
+# Hardware GNSS only (no phone tethering / network GNSS)
 
 if hasattr(sys.stdout, "reconfigure"):
     try:
@@ -91,12 +81,12 @@ if hasattr(sys.stdout, "reconfigure"):
 LITTER_DISTANCE_INTERVAL_M    = 5.0
 LITTER_GNSS_LOST_TIMEOUT_SEC  = 5.0
 LITTER_TIME_FALLBACK_SEC      = 30.0
-LITTER_CONF_THRESHOLD         = 0.25
+LITTER_CONF_THRESHOLD         = 0.60
 GNSS_DATA_TIMEOUT_SEC         = 3.0    # mirrors config.py
 
-# NavCast defaults — "auto" enables automatic network/tether discovery
-NAVCAST_HOST_DEFAULT = "auto"
-NAVCAST_PORT_DEFAULT = 10110
+# Hardware GNSS defaults
+DEFAULT_GNSS_PORT = None
+DEFAULT_GNSS_BAUD = 9600
 
 SIM_SPEED_KMH_DEFAULT     = 20.0
 SIM_UPDATE_HZ             = 10
@@ -131,347 +121,6 @@ def move_coords(lat, lon, bearing_deg, distance_m):
         math.cos(d) - math.sin(lat1) * math.sin(lat2),
     )
     return math.degrees(lat2), math.degrees(lon2)
-
-
-# ===========================================================================
-# SELF-CONTAINED NAVCAST GNSS READER
-# Mirrors sensors/gnss.py but requires NO project imports.
-# Parses GGA + RMC + GSA + GSV with XOR checksum validation.
-# Auto-reconnects on TCP error.
-# ===========================================================================
-
-class NavCastGNSSReader:
-    """
-    Self-contained NavCast TCP NMEA reader.
-    Connects to the NavCast Android app over USB tethering TCP and parses
-    $GGA / $GNGGA, $RMC / $GNRMC, $GSA / $GNGSA, $GSV / $GNGSV sentences.
-
-    Call get_position() from any thread to get (lat, lon, has_fix).
-    Call get_state() for the full parsed state dict.
-    """
-
-    _RECONNECT_DELAY = 5.0
-    _SOCKET_TIMEOUT  = 10.0
-    _RECV_BUF        = 4096
-
-    def __init__(self, host: str = "auto", port: int = NAVCAST_PORT_DEFAULT,
-                 log_fn=None, auto_scan: bool = True):
-        self._host   = host
-        self._port   = port
-        self._log    = log_fn or print
-        self._auto_scan = auto_scan
-        self._needs_scan = (host == "auto" or not host)
-        self._rescan_requested = threading.Event()
-        self._lock   = threading.Lock()
-        self._stop   = threading.Event()
-
-        # Internal state (mirrors sensors/gnss.py _state shape)
-        self._state = {
-            "data_received":      False,
-            "fix":                False,
-            "status":             "NO_DATA",
-            "latitude":           None,
-            "longitude":          None,
-            "altitude_m":         None,
-            "speed_kmh":          None,
-            "course_deg":         None,
-            "satellites":         0,
-            "satellites_in_view": 0,
-            "hdop":               None,
-            "last_data_time":     None,
-            "last_fix_time":      None,
-        }
-        self.connected  = False
-        self.last_error = ""
-
-        self._thread = threading.Thread(
-            target=self._reader_thread, daemon=True, name="navcast-gnss"
-        )
-
-    def start(self):
-        self._thread.start()
-
-    def stop(self):
-        self._stop.set()
-
-    def request_rescan(self):
-        """Signal the reader thread to perform a fresh discovery scan."""
-        self._needs_scan = True
-        self._rescan_requested.set()
-
-    @property
-    def endpoint(self) -> str:
-        return f"{self._host}:{self._port}"
-
-    # -----------------------------------------------------------------------
-    # Public interface
-    # -----------------------------------------------------------------------
-    def get_position(self) -> tuple[float, float, bool]:
-        """Returns (lat, lon, has_fix). Thread-safe."""
-        with self._lock:
-            snap = dict(self._state)
-        now       = time.monotonic()
-        last_data = snap.get("last_data_time")
-        data_ok   = last_data is not None and (now - last_data) < GNSS_DATA_TIMEOUT_SEC
-        has_fix   = snap["fix"] and data_ok
-        lat = snap["latitude"]  if has_fix else None
-        lon = snap["longitude"] if has_fix else None
-        return lat, lon, has_fix
-
-    def get_state(self) -> dict:
-        """Returns full snapshot dict. Thread-safe."""
-        with self._lock:
-            snap = dict(self._state)
-        now       = time.monotonic()
-        last_data = snap.get("last_data_time")
-        data_ok   = last_data is not None and (now - last_data) < GNSS_DATA_TIMEOUT_SEC
-        has_fix   = snap["fix"] and data_ok
-        status    = "FIX" if has_fix else ("NO_FIX" if data_ok else "NO_DATA")
-        return {
-            "data_received":      data_ok,
-            "fix":                has_fix,
-            "status":             status,
-            "latitude":           snap["latitude"]  if has_fix else None,
-            "longitude":          snap["longitude"] if has_fix else None,
-            "altitude_m":         snap["altitude_m"],
-            "speed_kmh":          snap["speed_kmh"] if has_fix else None,
-            "course_deg":         snap["course_deg"],
-            "satellites":         snap["satellites"],
-            "satellites_in_view": snap["satellites_in_view"],
-            "hdop":               snap["hdop"],
-        }
-
-    # -----------------------------------------------------------------------
-    # NMEA checksum validation
-    # -----------------------------------------------------------------------
-    @staticmethod
-    def _checksum_ok(sentence: str) -> bool:
-        if "*" not in sentence:
-            return True  # no checksum field — accept
-        try:
-            body, cs = sentence.rsplit("*", 1)
-            body = body.lstrip("$").lstrip("!")
-            computed = 0
-            for ch in body:
-                computed ^= ord(ch)
-            return computed == int(cs[:2], 16)
-        except Exception:
-            return False
-
-    # -----------------------------------------------------------------------
-    # Coordinate parsing
-    # -----------------------------------------------------------------------
-    @staticmethod
-    def _parse_lat(raw: str, hemi: str) -> Optional[float]:
-        if not raw or not hemi:
-            return None
-        try:
-            raw = raw.strip()
-            dot = raw.index(".")
-            val = float(raw[:dot - 2]) + float(raw[dot - 2:]) / 60.0
-            return round(-val if hemi.upper() == "S" else val, 8)
-        except Exception:
-            return None
-
-    @staticmethod
-    def _parse_lon(raw: str, hemi: str) -> Optional[float]:
-        if not raw or not hemi:
-            return None
-        try:
-            raw = raw.strip()
-            dot = raw.index(".")
-            val = float(raw[:dot - 2]) + float(raw[dot - 2:]) / 60.0
-            return round(-val if hemi.upper() == "W" else val, 8)
-        except Exception:
-            return None
-
-    @staticmethod
-    def _sf(s: str) -> Optional[float]:
-        try:
-            return float(s.strip()) if s and s.strip() else None
-        except Exception:
-            return None
-
-    @staticmethod
-    def _si(s: str) -> int:
-        try:
-            return int(s.strip()) if s and s.strip() else 0
-        except Exception:
-            return 0
-
-    # -----------------------------------------------------------------------
-    # NMEA sentence parsers  (mirrors sensors/gnss.py parsers exactly)
-    # -----------------------------------------------------------------------
-    def _parse_gga(self, f: list):
-        # $--GGA,time,lat,N/S,lon,E/W,quality,numSV,HDOP,alt,...
-        if len(f) < 10:
-            return
-        quality = self._si(f[6])
-        has_fix = quality > 0
-        lat = self._parse_lat(f[2], f[3])
-        lon = self._parse_lon(f[4], f[5])
-        alt  = self._sf(f[9])
-        hdop = self._sf(f[8]) if len(f) > 8 else None
-        nsats = self._si(f[7])
-        now = time.monotonic()
-        with self._lock:
-            self._state["data_received"]  = True
-            self._state["last_data_time"] = now
-            if has_fix and lat is not None and lon is not None:
-                self._state["fix"]        = True
-                self._state["status"]     = "FIX"
-                self._state["latitude"]   = lat
-                self._state["longitude"]  = lon
-                self._state["altitude_m"] = round(alt, 2) if alt is not None else None
-                self._state["satellites"] = nsats
-                self._state["hdop"]       = round(hdop, 2) if hdop is not None else None
-                self._state["last_fix_time"] = now
-            elif not self._state["fix"]:
-                self._state["status"] = "NO_FIX"
-
-    def _parse_rmc(self, f: list):
-        # $--RMC,time,status,lat,N/S,lon,E/W,speed_kn,course,...
-        if len(f) < 3:
-            return
-        now = time.monotonic()
-        with self._lock:
-            self._state["data_received"]  = True
-            self._state["last_data_time"] = now
-        active = f[2].strip().upper() == "A"
-        if not active or len(f) < 9:
-            return
-        lat      = self._parse_lat(f[3], f[4])
-        lon      = self._parse_lon(f[5], f[6])
-        speed_kn = self._sf(f[7])
-        course   = self._sf(f[8])
-        speed_kmh = round(speed_kn * 1.852, 2) if speed_kn is not None else None
-        with self._lock:
-            if lat is not None and lon is not None:
-                self._state["fix"]        = True
-                self._state["status"]     = "FIX"
-                self._state["latitude"]   = lat
-                self._state["longitude"]  = lon
-                self._state["speed_kmh"]  = speed_kmh
-                self._state["course_deg"] = round(course, 2) if course is not None else None
-                self._state["last_fix_time"] = now
-
-    def _parse_gsa(self, f: list):
-        # $--GSA,...,PDOP,HDOP,VDOP
-        if len(f) < 17:
-            return
-        hdop = self._sf(f[16]) if len(f) > 16 else None
-        if hdop is not None:
-            with self._lock:
-                self._state["hdop"] = round(hdop, 2)
-
-    def _parse_gsv(self, f: list):
-        # $--GSV,num_msgs,msg_num,total_sats,...
-        if len(f) < 4:
-            return
-        total = self._si(f[3])
-        with self._lock:
-            self._state["satellites_in_view"] = total
-
-    # -----------------------------------------------------------------------
-    # NMEA dispatcher
-    # -----------------------------------------------------------------------
-    _PARSERS_SUFFIXES = {
-        "GGA": "_parse_gga",
-        "RMC": "_parse_rmc",
-        "GSA": "_parse_gsa",
-        "GSV": "_parse_gsv",
-    }
-
-    def _dispatch(self, line: str):
-        line = line.strip()
-        if not line.startswith("$"):
-            return
-        if not self._checksum_ok(line):
-            return
-        body   = line.lstrip("$").split("*")[0]
-        fields = body.split(",")
-        if not fields:
-            return
-        sid = fields[0].upper()
-        for suffix, method_name in self._PARSERS_SUFFIXES.items():
-            if sid.endswith(suffix):
-                try:
-                    getattr(self, method_name)(fields)
-                except Exception:
-                    pass
-                break
-
-    # -----------------------------------------------------------------------
-    # Background reader thread  (mirrors sensors/gnss.py _navcast_thread)
-    # -----------------------------------------------------------------------
-    def _reader_thread(self):
-        while not self._stop.is_set():
-            sock = None
-            try:
-                # If auto-scan is enabled and needed, or rescan was requested
-                if (self._auto_scan and self._needs_scan) or self._rescan_requested.is_set():
-                    self._rescan_requested.clear()
-                    self._log("[GNSS] Auto-scanning network interfaces for NavCast data stream...")
-                    pref_h = None if self._host == "auto" else self._host
-                    if discover_navcast is not None:
-                        found_h, found_p = discover_navcast(
-                            preferred_host=pref_h, preferred_port=self._port
-                        )
-                        if found_h and found_p:
-                            self._host = found_h
-                            self._port = found_p
-                            self._needs_scan = False
-                            self._log(f"[GNSS] SUCCESS: Found NavCast stream @ {self._host}:{self._port}")
-                        else:
-                            self._log(f"[GNSS] Auto-scan found no active NavCast. Trying {self._host}:{self._port}...")
-                    else:
-                        self._log("[GNSS] Discovery module not available; skipping auto-scan.")
-
-                target_host = "10.208.43.190" if self._host == "auto" else self._host
-
-                self._log(f"[GNSS] Connecting to NavCast @ {target_host}:{self._port} ...")
-                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sock.settimeout(self._SOCKET_TIMEOUT)
-                sock.connect((target_host, self._port))
-                self._host = target_host
-                self.connected  = True
-                self.last_error = ""
-                self._needs_scan = False
-                self._log(f"[GNSS] NavCast connected: {self._host}:{self._port}")
-
-                buf = ""
-                while not self._stop.is_set():
-                    try:
-                        chunk = sock.recv(self._RECV_BUF)
-                    except socket.timeout:
-                        continue
-                    if not chunk:
-                        self._log("[GNSS] NavCast connection closed by remote.")
-                        break
-                    buf += chunk.decode("ascii", errors="replace")
-                    while "\n" in buf:
-                        line, buf = buf.split("\n", 1)
-                        self._dispatch(line)
-
-            except OSError as exc:
-                self.connected  = False
-                self.last_error = str(exc)
-                with self._lock:
-                    self._state["data_received"] = False
-                    self._state["fix"]           = False
-                    self._state["status"]        = "NO_DATA"
-                if self._auto_scan:
-                    self._needs_scan = True
-                    self._log(f"[GNSS] NavCast error ({exc}). Auto-scanning on retry in {self._RECONNECT_DELAY:.0f}s...")
-                else:
-                    self._log(f"[GNSS] NavCast error ({exc}). Retry in {self._RECONNECT_DELAY:.0f}s...")
-            finally:
-                self.connected = False
-                if sock:
-                    try: sock.close()
-                    except Exception: pass
-
-            self._stop.wait(self._RECONNECT_DELAY)
 
 
 # ===========================================================================
@@ -1019,7 +668,7 @@ class YOLOTestGUI:
                  weights_label, distance_interval_m, output_dir, use_sim, leds=None):
         self._root        = root
         self._engine      = engine
-        self._gnss        = gnss_source   # NavCastGNSSReader or GNSSSimulator
+        self._gnss        = gnss_source   # HardwareGNSSReader or GNSSSimulator
         self._camera      = camera
         self._running     = True
         self._dist_m      = distance_interval_m
@@ -1059,7 +708,7 @@ class YOLOTestGUI:
         tb.pack(fill="x")
         tk.Label(tb, text="  YOLO Litter Engine Test  --  SWSTP Edge",
                  bg=P["panel"], fg=P["accent"], font=FH).pack(side="left", padx=12)
-        src_txt = "SIM" if self._use_sim else "NavCast GNSS"
+        src_txt = "SIM" if self._use_sim else "MAX-M10S GNSS"
         tk.Label(tb, text=f"GNSS: {src_txt} | Model: {weights_label}",
                  bg=P["panel"], fg=P["dim"], font=FS).pack(side="right", padx=12)
 
@@ -1193,8 +842,8 @@ class YOLOTestGUI:
                            selectcolor=P["bg"], activebackground=P["panel"],
                            activeforeground=P["text"], font=FB).pack(anchor="w", pady=4)
         else:
-            # Live mode: show NavCast info
-            tk.Label(p, text="NavCast live stream controls:",
+            # Live mode: show Hardware GNSS info
+            tk.Label(p, text="Hardware GNSS controls:",
                      bg=P["panel"], fg=P["dim"], font=FS).pack(anchor="w", pady=(0, 6))
 
         def btn(txt, cmd, bg):
@@ -1204,7 +853,7 @@ class YOLOTestGUI:
 
         btn("Force Trigger NOW",           self._force_trigger,  "#1f4e79")
         if not self._use_sim:
-            btn("Auto-Scan NavCast Stream", self._rescan_navcast, "#0e3a40")
+            btn("Rescan Hardware Ports", self._rescan_hardware_gnss, "#0e3a40")
         if self._use_sim:
             btn("Force GNSS Loss / Fallback",  self._force_fallback, "#4a2c0a")
             btn("Restore GNSS + Re-anchor",    self._restore_gnss,   "#0a3321")
@@ -1298,7 +947,10 @@ class YOLOTestGUI:
     # -----------------------------------------------------------------------
     # CONTROLS
     # -----------------------------------------------------------------------
-    def _rescan_navcast(self):
+    def _rescan_hardware_gnss(self):
+        if hasattr(self._gnss, 'start'):
+            self._gnss.start()
+        return
         self._log("[GNSS] Manual auto-scan requested -- scanning network interfaces...")
         if hasattr(self._gnss, "request_rescan"):
             self._gnss.request_rescan()
@@ -1376,13 +1028,13 @@ class YOLOTestGUI:
     def _tick(self):
         if not self._running: return
 
-        # Pull position from either NavCast or sim
+        # Pull position from either hardware GNSS or sim
         lat, lon, has_fix = self._gnss.get_position()
         gnss_state        = self._gnss.get_state()
 
-        # Update NavCast GNSS panel
+        # Update Hardware GNSS panel
         if not self._use_sim:
-            reader: NavCastGNSSReader = self._gnss
+            reader: HardwareGNSSReader = self._gnss
             connected = reader.connected
             status = gnss_state.get("status", "NO_DATA")
             if hasattr(reader, "endpoint"):
@@ -1495,14 +1147,10 @@ def parse_args():
         description="GUI test for YOLO litter detection engine (SWSTP Edge). "
                     "u-blox MAX-M10S hardware serial is the default GNSS source."
     )
-    ap.add_argument("--tcp",       action="store_true",
-                    help="Use legacy NavCast TCP connection instead of hardware GNSS")
-    ap.add_argument("--host",      default=NAVCAST_HOST_DEFAULT,
-                    help=f"NavCast TCP host (default: '{NAVCAST_HOST_DEFAULT}')")
-    ap.add_argument("--port",      type=int, default=NAVCAST_PORT_DEFAULT,
-                    help=f"NavCast TCP port (default: {NAVCAST_PORT_DEFAULT})")
-    ap.add_argument("--no-scan",   action="store_true",
-                    help="Disable automatic network scan; connect only to specified --host")
+    ap.add_argument("--gnss-port", default=DEFAULT_GNSS_PORT,
+                    help="Hardware GNSS serial port (default: auto-detect)")
+    ap.add_argument("--gnss-baud", type=int, default=DEFAULT_GNSS_BAUD,
+                    help="Hardware GNSS baud rate (default: 9600)")
     ap.add_argument("--sim",       action="store_true",
                     help="Use simulated GNSS instead of hardware GNSS (offline testing)")
     ap.add_argument("--sim-speed", type=float, default=SIM_SPEED_KMH_DEFAULT, dest="sim_speed",
@@ -1542,8 +1190,7 @@ def main():
     if args.sim:
         print("  GNSS: SIMULATION")
     else:
-        scan_desc = "auto-scan enabled" if not args.no_scan else "auto-scan disabled"
-        print(f"  GNSS: NavCast TCP ({args.host}:{args.port}, {scan_desc})")
+        print("  GNSS: u-blox MAX-M10S Hardware Serial")
     print("=" * 70)
 
     if not _DETECTOR_AVAILABLE:
@@ -1590,13 +1237,6 @@ def main():
             print("[INFO] Sim starting with no fix (fallback mode).")
         gnss_source.start()
         print(f"[INFO] GNSS: Simulation @ {args.sim_speed:.0f} km/h")
-    elif args.tcp:
-        auto_scan = not args.no_scan
-        gnss_source = NavCastGNSSReader(
-            host=args.host, port=args.port, log_fn=print, auto_scan=auto_scan
-        )
-        gnss_source.start()
-        print(f"[INFO] GNSS: NavCast TCP starting (auto_scan={auto_scan})...")
     else:
         gnss_source = HardwareGNSSReader(log_fn=print)
         gnss_source.start()

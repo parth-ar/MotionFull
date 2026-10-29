@@ -143,25 +143,26 @@ COMPLEMENTARY_ALPHA = 0.98
 #   Physical 11 → BCM 17  RTC status LED   (green)
 #   Physical 13 → BCM 27  IMU status LED   (green)
 #   Physical 15 → BCM 22  GNSS status LED  (green)
-#   Physical 16 → BCM 23  Yellow LED       (heartbeat/snap)
-#   Physical 18 → BCM 24  Red LED          (fault/litter alert)
-#   Physical 22 → BCM 25  LTE status LED   (green)
+#   Physical 16 → BCM 23  Red LED          (error indicator only — blinks on fault, OFF when healthy)
+#   Physical 18 → BCM 24  Yellow LED       (system ready & snap — solid ON, triple blink on capture)
+#   Physical 19 → BCM 10  LTE status LED   (green)
 #   Physical 36 → BCM 16  GNSS module RST  (MAX-M10S active-low reset)
 # ---------------------------------------------------------------------------
 LED_RTC_GREEN  = 17   # BCM 17 — Physical 11 — RTC status  (green)
 LED_IMU_GREEN  = 27   # BCM 27 — Physical 13 — IMU status  (green)
 LED_GNSS_GREEN = 22   # BCM 22 — Physical 15 — GNSS status (green)
-LED_YELLOW     = 23   # BCM 23 — Physical 16 — heartbeat / snap (yellow)
-LED_RED        = 24   # BCM 24 — Physical 18 — fault / litter alert (red)
-LED_LTE_GREEN  = 25   # BCM 25 — Physical 22 — LTE/modem status (green)
+LED_RED        = 23   # BCM 23 — Physical 16 — error indicator only (red, blinks on fault, OFF when healthy)
+LED_YELLOW     = 24   # BCM 24 — Physical 18 — system ready / snap (yellow, solid ON, triple blink on capture)
+LED_LTE_GREEN  = 10   # BCM 10 — Physical 19 — LTE/modem status (green)
 
 GNSS_RESET_PIN = 16   # BCM 16 — Physical 36 — MAX-M10S RST (active-low, drive LOW to reset)
 
 LED_FAULT_BLINK_INTERVAL  = 0.400    # seconds
 LED_YELLOW_BLINK_INTERVAL = 1.000    # seconds
+REQUIRE_LTE_FOR_HEALTH    = False    # If True, LTE disconnection also triggers Red error blink
 
 # ---------------------------------------------------------------------------
-# GNSS fallback / IP-geolocation
+# GNSS fallback / IP-geolocation (Completely disabled — MAX-M10S hardware GNSS only)
 # ---------------------------------------------------------------------------
 ENABLE_GPS_FALLBACK        = False
 GNSS_FALLBACK_TIMEOUT_SEC  = 20
@@ -208,7 +209,7 @@ LITTER_GNSS_LOST_TIMEOUT_SEC = 5.0
 LITTER_TIME_FALLBACK_SEC     = 30.0
 
 # YOLO inference confidence threshold
-LITTER_CONF_THRESHOLD        = 0.25
+LITTER_CONF_THRESHOLD        = 0.60
 
 # Fraction of detection bounding box that must overlap the AoD polygon to be ignored
 LITTER_OVERLAP_THRESHOLD     = 0.50

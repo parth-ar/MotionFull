@@ -501,11 +501,12 @@ def _upload_and_cleanup_evidence(session: requests.Session,
     lat = item.get("latitude")
     lon = item.get("longitude")
     if lat is None or lon is None or (abs(lat) < 0.001 and abs(lon) < 0.001):
-        lat = latest_sensor.get("lat")
-        lon = latest_sensor.get("lon")
-        if lat is None or lon is None or (abs(lat) < 0.001 and abs(lon) < 0.001):
-            lat = latest_sensor.get("last_known_valid_lat") or 0.0
-            lon = latest_sensor.get("last_known_valid_lon") or 0.0
+        if latest_sensor.get("gps_valid"):
+            lat = latest_sensor.get("lat")
+            lon = latest_sensor.get("lon")
+        else:
+            lat = None
+            lon = None
 
     speed = item.get("speed_kph", item.get("vehicle_speed_kmh", 0.0))
     if speed is None:
@@ -518,8 +519,8 @@ def _upload_and_cleanup_evidence(session: requests.Session,
         "height":             height,
         "compressionQuality": compression_quality,
         "idempotencyKey":     idempotency_key,
-        "latitude":           round(float(lat), 8) if lat is not None else 0.0,
-        "longitude":          round(float(lon), 8) if lon is not None else 0.0,
+        "latitude":           round(float(lat), 8) if (lat is not None and abs(float(lat)) > 0.001) else None,
+        "longitude":          round(float(lon), 8) if (lon is not None and abs(float(lon)) > 0.001) else None,
         "speedKph":           speed,
         "motionConfidence":   item.get("motionConfidence", 0.95),
         "sessionId":          active_sid,

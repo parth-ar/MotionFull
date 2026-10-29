@@ -27,7 +27,7 @@ KEY CAPABILITIES:
 3. MULTIPLE TESTING MODES:
    - 'sim'     : Automated simulation running realistic driving, deceleration, stop, drift,
                  camera capture, transient noise spikes, and acceleration.
-   - 'tcp'     : Connect to NavCast Android app streaming NMEA over USB tethering / Wi-Fi.
+   - 'tcp'     : Connect to TCP NMEA stream over network.
    - 'udp'     : Listen for UDP NMEA broadcasts.
    - 'serial'  : Read from physical GPS USB / COM port (if pyserial installed).
    - 'manual'  : Interactive terminal to type speeds and inject events in real time.
@@ -41,8 +41,8 @@ USAGE EXAMPLES:
   # 2. Run simulation with synthetic IMU enabled (testing dual fusion):
   python test_gnss_stop_detection.py --mode sim --imu synthetic
 
-  # 3. Connect to live NavCast GNSS on phone (USB tethering):
-  python test_gnss_stop_detection.py --mode tcp --host 10.208.43.190 --port 10110
+  # 3. Connect to live TCP NMEA stream:
+  python test_gnss_stop_detection.py --mode tcp --host 127.0.0.1 --port 10110
 
   # 4. Interactive manual testing (type speeds live):
 
@@ -107,9 +107,9 @@ SPEED_SMOOTHING_WINDOW: int     = 1       # Number of readings to average (1 = r
 REQUIRE_GPS_FIX: bool           = True    # Require active GPS fix for stop detection
 MAX_STATIONARY_DRIFT_M: float   = 25.0    # Alert threshold for GPS drift radius while stopped
 
-# Default NavCast connection parameters
-DEFAULT_NAVCAST_HOST: str       = "10.208.43.190"
-DEFAULT_NAVCAST_PORT: int       = 10110
+# Default TCP connection parameters
+DEFAULT_TCP_HOST: str           = "127.0.0.1"
+DEFAULT_TCP_PORT: int           = 10110
 
 
 # ============================================================================
@@ -1228,7 +1228,7 @@ class NMEAParser:
                 result["status"] = status
                 result["fix"] = (status == "A")
                 # Always extract coordinates and speed, even when fix is void ('V').
-                # Many phones (NavCast included) report valid speed in void RMC sentences.
+                # Many GNSS receivers report valid speed in void RMC sentences.
                 if fields[3] and fields[4]:
                     result["latitude"] = self.parse_coordinate(fields[3], fields[4])
                 if fields[5] and fields[6]:
@@ -1463,7 +1463,7 @@ def run_simulation(detector: VehicleStopDetector, imu_provider: SyntheticIMUProv
 
 
 # ============================================================================
-# Automatic Network & Wi-Fi Discovery for NavCast
+# Automatic Network & Wi-Fi Discovery for TCP NMEA Stream
 # ============================================================================
 RE_IPV4 = re.compile(r"\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b")
 DEFAULT_CANDIDATE_PORTS = [10110, 2947, 11123, 50000, 8080]
@@ -1552,7 +1552,7 @@ def get_candidate_network_ips(fallback_host: Optional[str] = None) -> List[str]:
     return candidates
 
 
-def probe_navcast_server(host: str, port: int, timeout: float = 0.4) -> Tuple[bool, bool]:
+def probe_tcp_nmea_server(host: str, port: int, timeout: float = 0.4) -> Tuple[bool, bool]:
     """
     Checks if TCP (host, port) is open and streaming NMEA sentences ($G, $P, GGA, RMC, GSV, VTG).
     Returns (is_open: bool, is_nmea: bool).
@@ -1577,17 +1577,17 @@ def probe_navcast_server(host: str, port: int, timeout: float = 0.4) -> Tuple[bo
                 pass
 
 
-def discover_navcast(
+def discover_tcp_nmea_server(
     preferred_host: Optional[str] = None,
-    preferred_port: int = DEFAULT_NAVCAST_PORT,
+    preferred_port: int = DEFAULT_TCP_PORT,
     timeout: float = 0.4,
 ) -> Tuple[Optional[str], Optional[int]]:
     """
-    Scans candidate IPs concurrently to auto-detect NavCast on Wi-Fi or USB tethering.
+    Scans candidate IPs concurrently to auto-detect TCP NMEA server.
     """
     # 1. Quick probe preferred_host first if responsive
     if preferred_host:
-        is_open, is_nmea = probe_navcast_server(preferred_host, preferred_port, timeout=0.3)
+        is_open, is_nmea = probe_tcp_nmea_server(preferred_host, preferred_port, timeout=0.3)
         if is_open and is_nmea:
             return (preferred_host, preferred_port)
 
@@ -1606,7 +1606,7 @@ def discover_navcast(
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=min(16, len(targets))) as pool:
         future_map = {
-            pool.submit(probe_navcast_server, ip, p, timeout): (ip, p)
+            pool.submit(probe_tcp_nmea_server, ip, p, timeout): (ip, p)
             for ip, p in targets
         }
         for future in concurrent.futures.as_completed(future_map):
@@ -1625,7 +1625,7 @@ def discover_navcast(
 
 
 # ============================================================================
-# Mode 2: Live NavCast TCP Connection (Wi-Fi & USB Tethering)
+# Mode 2: Live TCP GNSS Connection
 # ============================================================================
 def run_tcp_mode(
     detector: VehicleStopDetector,
@@ -1635,7 +1635,7 @@ def run_tcp_mode(
     auto_detect: bool = True,
     debug: bool = False,
 ) -> None:
-    """Connects to phone NavCast app streaming NMEA sentences over TCP (Wi-Fi or USB tethering)."""
+    """Connects to TCP NMEA stream."""
     parser = NMEAParser()
     active_host = host
     active_port = port
@@ -1648,21 +1648,21 @@ def run_tcp_mode(
 
     while True:
         if auto_detect:
-            print(f"[TCP GNSS] Auto-detecting NavCast server across Wi-Fi & network interfaces...")
-            disc_host, disc_port = discover_navcast(preferred_host=active_host, preferred_port=active_port)
+            print(f"[TCP GNSS] Auto-detecting TCP NMEA server across network interfaces...")
+            disc_host, disc_port = discover_tcp_nmea_server(preferred_host=active_host, preferred_port=active_port)
             if disc_host and disc_port:
-                print(f"[AUTO-DETECT] ✔ Successfully found NavCast server @ {disc_host}:{disc_port}")
+                print(f"[AUTO-DETECT] ✔ Successfully found TCP NMEA server @ {disc_host}:{disc_port}")
                 active_host, active_port = disc_host, disc_port
             else:
                 print(f"[AUTO-DETECT] Could not discover active server; will try {active_host}:{active_port}...")
 
-        print(f"[TCP GNSS] Connecting to NavCast at {active_host}:{active_port} ...")
+        print(f"[TCP GNSS] Connecting to TCP NMEA at {active_host}:{active_port} ...")
         sock = None
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.settimeout(6.0)
             sock.connect((active_host, active_port))
-            print(f"[TCP GNSS] ✔ Connected! Receiving live NMEA data stream from phone...")
+            print(f"[TCP GNSS] ✔ Connected! Receiving live NMEA data stream...")
             print("Press Ctrl+C to stop.\n")
 
             buffer = ""
@@ -1693,7 +1693,7 @@ def run_tcp_mode(
                         _last_diag_mono = now
                     continue
                 if not chunk:
-                    print("\n[TCP GNSS] NavCast connection closed by phone. Auto-reconnecting in 3s...")
+                    print("\n[TCP GNSS] TCP connection closed. Auto-reconnecting in 3s...")
                     break
                 buffer += chunk.decode("ascii", errors="replace")
 
@@ -2102,13 +2102,13 @@ Examples:
   # 2. Run simulation with synthetic IMU fusion enabled:
   python test_gnss_stop_detection.py --mode sim --imu synthetic
 
-  # 3. Connect to live NavCast phone app:
+  # 3. Connect to live TCP NMEA stream:
   python test_gnss_stop_detection.py --mode tcp --host 10.208.43.190 --port 10110
 
   # 4. Interactive manual testing:
   python test_gnss_stop_detection.py --mode manual
 
-  # 5. Connect with live NavCast phone GPS (TCP) + live Arduino IMU (COM3 @ 115200):
+  # 5. Connect with live TCP GNSS + live Arduino IMU (COM3 @ 115200):
   python test_gnss_stop_detection.py --mode tcp --imu-port COM3 --imu-baud 115200
 
   # 6. Read physical GPS receiver via serial COM port:
@@ -2162,14 +2162,14 @@ Examples:
     )
     parser.add_argument(
         "--host",
-        default=DEFAULT_NAVCAST_HOST,
-        help=f"NavCast TCP host IP (legacy fallback mode, default: {DEFAULT_NAVCAST_HOST})",
+        default=DEFAULT_TCP_HOST,
+        help=f"TCP NMEA host IP (default: {DEFAULT_TCP_HOST})",
     )
     parser.add_argument(
         "--port",
         type=int,
-        default=DEFAULT_NAVCAST_PORT,
-        help=f"NavCast TCP port (legacy fallback mode, default: {DEFAULT_NAVCAST_PORT})",
+        default=DEFAULT_TCP_PORT,
+        help=f"TCP NMEA port (default: {DEFAULT_TCP_PORT})",
     )
     parser.add_argument(
         "--serial-port",
@@ -2214,7 +2214,7 @@ Examples:
         "--auto-detect",
         action="store_true",
         default=True,
-        help="Auto-detect NavCast phone IP across Wi-Fi and tethering interfaces (default: enabled)",
+        help="Auto-detect TCP NMEA server across network interfaces (default: enabled)",
     )
     parser.add_argument(
         "--no-auto-detect",

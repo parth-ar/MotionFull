@@ -17,7 +17,7 @@ Inference:
     fires, the new frame is dropped (prevents queue buildup on slow hardware).
   - Saves annotated image + JSON sidecar to LITTER_CAPTURES_DIR only when
     litter is actually detected (not for clean frames).
-  - Fires leds.notify_litter_snap() (Red-Yellow-Red-Yellow) on litter detection.
+  - Fires leds.notify_litter_snap() (Yellow triple blink) on litter detection (Red LED is error-only).
 
 Area of Disinterest (AoD):
   - The ROI polygon used by motion detection (roi_polygon.json) is inverted here:
@@ -537,14 +537,14 @@ class LitterEngine:
                         (14, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2, cv2.LINE_AA)
 
             # GNSS
-            if has_fix:
+            if has_fix and lat is not None and lon is not None:
                 gps_text = f"GNSS: {float(lat):.8f}, {float(lon):.8f}"
                 gps_col  = (0, 255, 0)
             elif op_mode == "TIME_FALLBACK":
                 gps_text = "GNSS: NO FIX (CLOCK TRIGGER)"
                 gps_col  = (0, 165, 255)
             else:
-                gps_text = "GNSS: NO FIX"
+                gps_text = "GNSS: NO FIX / DISCONNECTED"
                 gps_col  = (0, 0, 255)
             cv2.putText(banner, gps_text,
                         (14, 54), cv2.FONT_HERSHEY_SIMPLEX, 0.65, gps_col, 2, cv2.LINE_AA)
@@ -568,8 +568,8 @@ class LitterEngine:
                 "inference_ms":   infer_ms,
                 "gnss": {
                     "fix":        has_fix,
-                    "latitude":   float(lat) if lat is not None else None,
-                    "longitude":  float(lon) if lon is not None else None,
+                    "latitude":   float(lat) if (has_fix and lat is not None) else None,
+                    "longitude":  float(lon) if (has_fix and lon is not None) else None,
                     "speed_kmh":  (gnss_data.get("speed_kmh") if isinstance(gnss_data, dict) and gnss_data.get("speed_kmh") is not None else (gnss_data.get("speed") if isinstance(gnss_data, dict) else None)),
                     "satellites": gnss_data.get("satellites") if isinstance(gnss_data, dict) else None,
                     "hdop":       gnss_data.get("hdop") if isinstance(gnss_data, dict) else None,
@@ -595,7 +595,7 @@ class LitterEngine:
             # Async write (does not block inference thread beyond queue put)
             _save_queue.put((filename, final_frame, sidecar_fn, sidecar_data))
 
-            # LED: Red-Yellow-Red-Yellow blink — litter detected!
+            # LED: Yellow triple blink on litter event (Red is error-only)
             try:
                 leds.notify_litter_snap()
             except Exception:

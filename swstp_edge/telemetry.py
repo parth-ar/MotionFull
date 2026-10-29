@@ -108,9 +108,59 @@ hardware_state: dict = {
     "camera":  {"detected": False, "source": None, "model": "None", "is_imx708": False, "resolution": None, "fps": None, "autofocus": "N/A"},
     "serial":  {"connected": True, "port": "Pi-native", "baud": None, "desc": "Raspberry Pi native sensors"},
     "rtc":     {"detected": False, "module": "DS3231 (I2C 0x68)", "last_ts": None, "logged_online": False, "logged_error": False},
-    "gps":     {"detected": False, "module": "u-blox MAX-M10S (UART /dev/serial0)", "fix": False, "coords": None, "logged_detected": False, "logged_fix": False, "logged_fallback": False},
+    "gps":     {"detected": False, "module": "u-blox MAX-M10S GNSS (Primary)", "fix": False, "coords": None, "logged_detected": False, "logged_fix": False, "logged_fallback": False},
     "backend": {"connected": False, "last_ping": 0, "upload_count": 0, "telemetry_count": 0, "active_session_id": 0},
+    "lte":     {"detected": False, "connected": False},
 }
+
+_last_lte_check: float = 0.0
+_cached_lte_ok: bool = False
+
+def _get_lte_status() -> bool:
+    """
+    Check LTE / cellular / network connectivity without blocking the 20 Hz loop.
+    Returns True if:
+      - Backend connection is active, OR
+      - Cellular modem USB/serial ports (/dev/ttyUSB*, /dev/cdc-wdm*) are present, OR
+      - Cellular network interface (wwan0, ppp0, etc.) is detected.
+    """
+    global _last_lte_check, _cached_lte_ok
+    now = time.monotonic()
+    backend_conn = bool(hardware_state.get("backend", {}).get("connected", False))
+    if backend_conn:
+        _cached_lte_ok = True
+        hardware_state["lte"]["connected"] = True
+        hardware_state["lte"]["detected"]  = True
+        return True
+
+    # Rate-limit hardware scans to once every 3 seconds
+    if now - _last_lte_check < 3.0:
+        return _cached_lte_ok
+    _last_lte_check = now
+
+    import glob
+    modem_ports = glob.glob("/dev/ttyUSB*") + glob.glob("/dev/ttyACM*") + glob.glob("/dev/cdc-wdm*")
+    if modem_ports:
+        _cached_lte_ok = True
+        hardware_state["lte"]["detected"] = True
+        return True
+
+    try:
+        import os
+        net_path = "/sys/class/net"
+        if os.path.exists(net_path):
+            for iface in os.listdir(net_path):
+                if any(k in iface.lower() for k in ("ppp", "wwan", "usb", "lte", "rmnet")):
+                    _cached_lte_ok = True
+                    hardware_state["lte"]["detected"] = True
+                    return True
+    except Exception:
+        pass
+
+    _cached_lte_ok = False
+    hardware_state["lte"]["detected"]  = False
+    hardware_state["lte"]["connected"] = False
+    return False
 
 # Thread-safe queues (same names and semantics as the original script)
 upload_queue    = queue.Queue(maxsize=50)
@@ -144,10 +194,16 @@ def build_telemetry_packet(device_id: str) -> dict:
     lon_raw   = gnss_data.get("longitude")
 
     # --- 4. Update latest_sensor state (GNSS path) ---
-    if gnss_data.get("data_received") and not hardware_state["gps"]["logged_detected"]:
-        hardware_state["gps"]["detected"]        = True
-        hardware_state["gps"]["logged_detected"] = True
-        _log_hardware("GPS MODULE (MAX-M10S)", "STREAM DETECTED", "u-blox MAX-M10S NMEA serial stream active.")
+    if gnss_data.get("data_received"):
+        if not hardware_state["gps"]["logged_detected"]:
+            hardware_state["gps"]["detected"]        = True
+            hardware_state["gps"]["logged_detected"] = True
+            _log_hardware("GPS MODULE (MAX-M10S)", "STREAM DETECTED", "u-blox MAX-M10S NMEA serial stream active.")
+    else:
+        if hardware_state["gps"]["detected"] or hardware_state["gps"]["logged_detected"]:
+            hardware_state["gps"]["detected"]        = False
+            hardware_state["gps"]["logged_detected"] = False
+            _log_hardware("GPS MODULE (MAX-M10S)", "DISCONNECTED", "u-blox MAX-M10S NMEA serial stream lost / disconnected.")
 
     if gnss_fix and lat_raw is not None and lon_raw is not None:
         if abs(lat_raw) > 0.001 and abs(lon_raw) > 0.001:
@@ -190,21 +246,43 @@ def build_telemetry_packet(device_id: str) -> dict:
             )
             if heading is not None:
                 with _lock:
-                    latest_sensor["heading"]                      = heading
-                    latest_sensor["last_known_valid_heading"]     = heading
+                    latest_sensor["heading"]                  = heading
+                    latest_sensor["last_known_valid_heading"] = heading
 
             track_field_events(snapped_lat, snapped_lon,
                                latest_sensor["speed"], latest_sensor.get("heading") or 0.0)
     else:
+        # No GNSS fix or GNSS disconnected — coordinates MUST be None (no false or held locations)
         with _lock:
-            if latest_sensor.get("location_source") == "gnss":
-                latest_sensor["gps_valid"] = False
-            speed_val = gnss_data.get("speed_kmh")
-            if speed_val is not None:
-                latest_sensor["speed"] = speed_val
+            latest_sensor["gps_valid"]                  = False
+            latest_sensor["location_source"]            = None
+            latest_sensor["lat"]                        = None
+            latest_sensor["lon"]                        = None
+            latest_sensor["raw_gps_lat"]                = None
+            latest_sensor["raw_gps_lon"]                = None
+            latest_sensor["is_inside_safe_zone"]        = False
+            latest_sensor["is_snapped"]                 = False
+            latest_sensor["road_bearing"]               = None
+            latest_sensor["heading"]                    = None
+            latest_sensor["last_known_valid_lat"]       = None
+            latest_sensor["last_known_valid_lon"]       = None
+            latest_sensor["last_known_valid_heading"]   = None
+            if not gnss_data.get("data_received"):
+                # GNSS module disconnected / no data received
+                latest_sensor["alt"]        = 0.0
+                latest_sensor["speed"]      = 0.0
+                latest_sensor["satellites"] = 0
+            else:
+                # GNSS module streaming sentences but waiting for satellite lock
+                speed_val = gnss_data.get("speed_kmh")
+                latest_sensor["speed"]      = speed_val if speed_val is not None else 0.0
+                latest_sensor["satellites"] = gnss_data.get("satellites", 0)
+                latest_sensor["alt"]        = gnss_data.get("altitude_m") or 0.0
+
         if hardware_state["gps"]["logged_fix"]:
-            hardware_state["gps"]["fix"] = False
+            hardware_state["gps"]["fix"]        = False
             hardware_state["gps"]["logged_fix"] = False
+            _log_hardware("GPS MODULE (MAX-M10S)", "FIX LOST", "Satellite fix lost — coordinates cleared.")
 
     # --- 5. Update RTC state in latest_sensor ---
     with _lock:
@@ -230,11 +308,16 @@ def build_telemetry_packet(device_id: str) -> dict:
     uptime_ms = int((time.time() - _boot_time) * 1000)
 
     # --- 8. Update LED state ---
+    cam_ok = bool(hardware_state.get("camera", {}).get("detected", False))
+    lte_ok = _get_lte_status()
+
     leds.update(
         rtc            = bool(rtc_data.get("valid")),
         imu            = bool(imu_data.get("valid")),
         gnss_fix       = bool(gnss_data.get("fix")),
         gnss_connected = bool(gnss_data.get("data_received")),
+        lte            = lte_ok,
+        camera         = cam_ok,
     )
 
     # --- 9. Snapshot latest_sensor values for packet (avoids race) ---

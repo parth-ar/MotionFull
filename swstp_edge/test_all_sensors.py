@@ -262,8 +262,8 @@ def test_imu(num_samples: int = 5):
 # 3. GNSS
 # ════════════════════════════════════════════════════════════════════════════
 
-def test_gnss(wait_sec: int = 30):
-    _section("GNSS — u-blox MAX-M10S Hardware GNSS  (UART /dev/serial0)", color=GREEN)
+def test_gnss(wait_sec: int = 30, port: str | None = None, baud: int | None = None) -> bool:
+    _section("GNSS — u-blox MAX-M10S Hardware GNSS Diagnostic", color=GREEN)
 
     try:
         from sensors import gnss as gnss_mod
@@ -277,11 +277,14 @@ def test_gnss(wait_sec: int = 30):
         GNSS_SERIAL_PORT = "/dev/serial0"
         GNSS_BAUD_RATE   = 9600
 
-    print(f"\n  {DIM}Starting MAX-M10S GNSS serial reader → {GNSS_SERIAL_PORT} @ {GNSS_BAUD_RATE} baud{RESET}")
-    gnss_mod.init()
+    target_port = port or GNSS_SERIAL_PORT
+    target_baud = baud or GNSS_BAUD_RATE
+
+    print(f"\n  {DIM}Starting MAX-M10S GNSS serial reader → {target_port} @ {target_baud} baud{RESET}")
+    gnss_mod.init(port=port, baud=baud)
 
     # ── Wait for data ─────────────────────────────────────────────────────
-    print(f"  {DIM}Waiting up to {wait_sec} s for GNSS data …{RESET}\n")
+    print(f"  {DIM}Waiting up to {wait_sec} s for MAX-M10S GNSS data …{RESET}\n")
     deadline = time.time() + wait_sec
     got_data = False
     got_fix  = False
@@ -315,17 +318,26 @@ def test_gnss(wait_sec: int = 30):
 
     # ── Final snapshot ────────────────────────────────────────────────────
     data = gnss_mod.read()
+    active_port = gnss_mod.get_active_port() or target_port
+    active_baud = gnss_mod.get_active_baud() or target_baud
 
     print()
     status = data.get("status")
+    passed = False
     if status == "FIX":
-        _ok("u-blox MAX-M10S GNSS FIX acquired")
+        _ok(f"u-blox MAX-M10S GNSS FIX acquired on {active_port} @ {active_baud} baud")
+        passed = True
     elif status == "NO_FIX":
-        _warn("GNSS data flowing from MAX-M10S — no positional fix yet (ensure antenna is placed near window/outdoors)")
+        _warn(f"GNSS stream active on {active_port} @ {active_baud} baud — no positional fix yet (ensure antenna is placed near window/outdoors)")
+        passed = True
     else:
         _err(f"No GNSS data received (status={status}). Check MAX-M10S UART wiring (TX->RXD Pin 10, RX->TXD Pin 8), power (3.3V/5V), and enable_uart=1 in /boot/firmware/config.txt.")
+        passed = False
 
-    _sub("GNSS read() snapshot")
+    _sub("u-blox MAX-M10S GNSS read() snapshot")
+    _field("primary_module",      data.get("primary_module", "u-blox MAX-M10S"))
+    _field("active_port",         active_port)
+    _field("active_baud",         active_baud)
     _field("data_received",       data.get("data_received"))
     _field("fix",                 data.get("fix"))
     _field("status",              data.get("status"))
@@ -343,7 +355,7 @@ def test_gnss(wait_sec: int = 30):
     # ── Satellite detail ──────────────────────────────────────────────────
     detail = data.get("satellites_detail")
     if detail:
-        _sub(f"Satellite detail ({len(detail)} records)")
+        _sub(f"Satellite detail ({len(detail)} records across constellations)")
         header = (f"    {'PRN':>4}  {'Const':<6}  {'Elev°':>5}  "
                   f"{'Azim°':>5}  {'SNR dB':>6}  {'Used':>4}")
         print(f"  {DIM}{header}{RESET}")
@@ -368,7 +380,7 @@ def test_gnss(wait_sec: int = 30):
     gnss_mod.stop()
 
     _hr()
-    return True
+    return passed
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -854,7 +866,7 @@ def test_lte() -> bool:
         from config import LED_LTE_GREEN
         import gpiod
         _sub("LTE status LED hardware test")
-        _field("LED GPIO Pin", f"BCM {LED_LTE_GREEN} (Physical 22)")
+        _field("LED GPIO Pin", f"BCM {LED_LTE_GREEN} (Physical 19)")
         _ok("LTE LED pin configured in config.py")
     except Exception:
         pass
@@ -887,6 +899,10 @@ def main():
                         help="Number of IMU read samples to display (default: 5)")
     parser.add_argument("--gnss-wait",   type=int, default=30,
                         help="Seconds to wait for GNSS data (default: 30)")
+    parser.add_argument("--gnss-port",   default=None,
+                        help="Serial port for u-blox MAX-M10S (default: /dev/serial0 or auto-detect)")
+    parser.add_argument("--gnss-baud",   type=int, default=9600,
+                        help="Baud rate for u-blox MAX-M10S (default: 9600)")
     parser.add_argument("--cam-frames",  type=int, default=30,
                         help="Number of camera benchmark frames (default: 30)")
     parser.add_argument("--cam-width",   type=int, default=640,
@@ -926,7 +942,7 @@ def main():
         print(f"  {DIM}[IMU]   skipped (--no-imu){RESET}\n")
 
     if not args.no_gnss:
-        results["GNSS"]  = test_gnss(args.gnss_wait)
+        results["GNSS"]  = test_gnss(args.gnss_wait, port=args.gnss_port, baud=args.gnss_baud)
     else:
         print(f"  {DIM}[GNSS]  skipped (--no-gnss){RESET}\n")
 

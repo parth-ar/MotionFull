@@ -182,10 +182,14 @@ def build_parser() -> argparse.ArgumentParser:
                         help="White balance mode for Camera Module 3 / IMX708 (default: auto, matches rpicam-hello)")
     parser.add_argument("--hdr", action="store_true",
                         help="Enable hardware HDR mode on Sony IMX708 sensor")
-    parser.add_argument("--port", "-p", default="Pi-native",
-                        help="[IGNORED on Pi] Legacy serial port flag")
-    parser.add_argument("--baud", "-b", type=int, default=115200,
-                        help="[IGNORED on Pi] Legacy baud rate flag")
+    parser.add_argument("--gnss-port", default=getattr(_cfg, "GNSS_SERIAL_PORT", "/dev/serial0"),
+                        help="Serial port for u-blox MAX-M10S primary GNSS (default: /dev/serial0 or auto-detect)")
+    parser.add_argument("--gnss-baud", type=int, default=getattr(_cfg, "GNSS_BAUD_RATE", 9600),
+                        help="Baud rate for u-blox MAX-M10S GNSS (default: 9600)")
+    parser.add_argument("--port", "-p", default=None,
+                        help="Alias for --gnss-port")
+    parser.add_argument("--baud", "-b", type=int, default=None,
+                        help="Alias for --gnss-baud")
     parser.add_argument("--backend-url", default=DEFAULT_BACKEND_URL,
                         help="SWSTP Backend URL")
     parser.add_argument("--device-id", default=None,
@@ -243,7 +247,7 @@ def main() -> None:
         print("[INIT] WARNING: Device ID not set. Edit device_config.json to provision.")
 
     effective_ulb_id = args.ulb_id if (args.ulb_id and args.ulb_id != "AUTO") else DEFAULT_ULB_ID
-    enable_fallback  = not args.no_gps_fallback
+    enable_fallback  = False  # IP location fallback removed; MAX-M10S hardware GNSS only
 
     os.makedirs(args.save_dir, exist_ok=True)
     os.makedirs(LITTER_CAPTURES_DIR, exist_ok=True)
@@ -270,7 +274,9 @@ def main() -> None:
     print("\n=== SWSTP UNIFIED SENSOR INIT ===")
     rtc_ok  = rtc_sensor.init()
     imu_ok  = imu_sensor.init()
-    gnss_ok = gnss_sensor.init()
+    target_gnss_p = args.port or args.gnss_port
+    target_gnss_b = args.baud or args.gnss_baud
+    gnss_ok = gnss_sensor.init(port=target_gnss_p, baud=target_gnss_b)
 
     try:
         leds.init()
@@ -427,12 +433,13 @@ def main() -> None:
     )
     t_evidence.start()
 
-    t_gps_fallback = threading.Thread(
-        target=gps_fallback_worker,
-        args=(stop_event, enable_fallback, args.gps_fallback_timeout),
-        daemon=True, name="gps-fallback",
-    )
-    t_gps_fallback.start()
+    if enable_fallback:
+        t_gps_fallback = threading.Thread(
+            target=gps_fallback_worker,
+            args=(stop_event, enable_fallback, args.gps_fallback_timeout),
+            daemon=True, name="gps-fallback",
+        )
+        t_gps_fallback.start()
 
     # ── ROI polygon (also AoD for litter) ─────────────────────────────────
     load_roi_polygon()
@@ -713,9 +720,9 @@ def main() -> None:
             now_mono      = time.monotonic()
             vehicle_speed = float(latest_sensor.get("speed") or 0.0)
             imu_data      = latest_sensor.get("imu")
-            cap_lat       = latest_sensor.get("lat")
-            cap_lon       = latest_sensor.get("lon")
             gps_valid     = bool(latest_sensor.get("gps_valid"))
+            cap_lat       = latest_sensor.get("lat") if gps_valid else None
+            cap_lon       = latest_sensor.get("lon") if gps_valid else None
             rtc_ts        = get_rtc_timestamp()
 
             stop_status = stop_detector.update(
@@ -1030,9 +1037,9 @@ def main() -> None:
                     with open(local_path, "wb") as f:
                         f.write(evidence_bytes)
 
-                    if cap_lat is None or cap_lon is None or (abs(cap_lat) < 0.001 and abs(cap_lon) < 0.001):
-                        cap_lat = latest_sensor.get("last_known_valid_lat") or 0.0
-                        cap_lon = latest_sensor.get("last_known_valid_lon") or 0.0
+                    if not gps_valid or cap_lat is None or cap_lon is None or (abs(cap_lat) < 0.001 and abs(cap_lon) < 0.001):
+                        cap_lat = None
+                        cap_lon = None
 
                     # ── Determine dumping side for this capture ────────────────
                     _cap_side_result = None
@@ -1060,8 +1067,8 @@ def main() -> None:
                         "width":               orig_w,
                         "height":              orig_h,
                         "compression_quality": 80,
-                        "latitude":            round(float(cap_lat), 8) if cap_lat is not None else 0.0,
-                        "longitude":           round(float(cap_lon), 8) if cap_lon is not None else 0.0,
+                        "latitude":            round(float(cap_lat), 8) if (gps_valid and cap_lat is not None) else None,
+                        "longitude":           round(float(cap_lon), 8) if (gps_valid and cap_lon is not None) else None,
                         "speed_kph":           round(float(vehicle_speed), 2),
                         "vehicle_speed_kmh":   round(float(vehicle_speed), 2),
                         "stop_duration_sec":   round(float(current_event_duration), 2),
