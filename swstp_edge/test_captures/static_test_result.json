@@ -1,90 +1,90 @@
 {
-  "tested_at": "2026-10-29T08:15:56.469684+00:00",
+  "tested_at": "2026-10-29T16:15:45.511016+00:00",
   "all_passed": true,
   "roi_polygon": [
     [
-      0.7094,
-      0.3312
+      0.1,
+      0.15
     ],
     [
-      0.7109,
-      0.6083
+      0.9,
+      0.15
     ],
     [
-      0.9219,
-      0.6312
+      0.9,
+      0.85
     ],
     [
-      0.9203,
-      0.3271
+      0.1,
+      0.85
     ]
   ],
   "cases": [
     {
       "test_case": "Pure Left Box",
       "bbox": [
-        456,
-        121,
-        520,
-        224
+        66,
+        58,
+        318,
+        303
       ],
       "result": {
         "dumping_side": "left",
         "is_left_side": true,
-        "left_px": 6398,
+        "left_px": 61740,
         "right_px": 0,
-        "bisector_x": 522
+        "bisector_x": 320
       },
       "passed": true
     },
     {
       "test_case": "Pure Right Box",
       "bbox": [
-        524,
-        121,
-        589,
-        224
+        322,
+        58,
+        575,
+        303
       ],
       "result": {
         "dumping_side": "right",
         "is_left_side": false,
         "left_px": 0,
-        "right_px": 6690,
-        "bisector_x": 522
+        "right_px": 61985,
+        "bisector_x": 320
       },
       "passed": true
     },
     {
       "test_case": "Overlap Box (Majority Left)",
       "bbox": [
-        456,
-        121,
-        539,
-        224
+        66,
+        58,
+        384,
+        303
       ],
       "result": {
         "dumping_side": "left",
         "is_left_side": true,
-        "left_px": 6704,
-        "right_px": 1744,
-        "bisector_x": 522
+        "left_px": 62475,
+        "right_px": 15680,
+        "bisector_x": 320
       },
       "passed": true
     },
     {
       "test_case": "Overlap Box (Majority Right)",
       "bbox": [
-        505,
-        121,
-        589,
-        224
+        256,
+        58,
+        575,
+        303
       ],
       "result": {
         "dumping_side": "right",
         "is_left_side": false,
-        "left_px": 1827,
-        "right_px": 6894,
-        "bisector_x": 522
+        "left_px": 15925,
+        "right_px": 62475,
+        "bisector_x": 320
       },
       "passed": true
     },
@@ -92,16 +92,16 @@
       "test_case": "Outside ROI Box",
       "bbox": [
         10,
-        10,
+        2,
         80,
-        80
+        30
       ],
       "result": {
         "dumping_side": "none",
         "is_left_side": false,
         "left_px": 0,
         "right_px": 0,
-        "bisector_x": 522
+        "bisector_x": 320
       },
       "passed": true
     }

@@ -31,7 +31,7 @@ from config import (
 # ---------------------------------------------------------------------------
 # ROI polygon state
 # ---------------------------------------------------------------------------
-DEFAULT_ROI_POLYGON = [[0.35, 0.10], [0.65, 0.10], [0.65, 0.50], [0.35, 0.50]]
+DEFAULT_ROI_POLYGON = [[0.10, 0.15], [0.90, 0.15], [0.90, 0.85], [0.10, 0.85]]
 active_polygon_roi: list = DEFAULT_ROI_POLYGON.copy()
 is_drawing_polygon: bool = False
 drawn_polygon_pts:  list = []

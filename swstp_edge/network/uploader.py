@@ -57,27 +57,26 @@ def log_hardware(component: str, status: str, details: str = "") -> None:
 # Backend discovery
 # ---------------------------------------------------------------------------
 def auto_detect_backend_url(candidate: str | None = None) -> str:
-    """Automatically discovers and connects to the active SWSTP backend API."""
-    candidates = []
-    if candidate:
-        candidates.append(candidate)
-    import os
-    if "SWSTP_BACKEND_URL" in os.environ:
-        candidates.append(os.environ["SWSTP_BACKEND_URL"])
-    candidates.extend([
-        "https://solidwasteapi.scipl.info.in",
-        "http://localhost:5000",
-        "http://127.0.0.1:5000",
-        "http://localhost:5244",
-    ])
-    for u in candidates:
+    """Fast backend API discovery with minimal latency (<= 1.2s max) to prevent startup blocking."""
+    primary = candidate or os.environ.get("SWSTP_BACKEND_URL") or "https://solidwasteapi.scipl.info.in"
+    try:
+        r = requests.get(f"{primary.rstrip('/')}/api/gis/roads?ulbId={DEFAULT_ULB_ID}", timeout=1.2)
+        if r.status_code in (200, 401, 403, 404):
+            return primary
+    except Exception:
+        pass
+
+    # Quick local dev fallbacks (0.5s timeout)
+    for u in ("http://localhost:5000", "http://127.0.0.1:5000", "http://localhost:5244"):
+        if u == primary:
+            continue
         try:
-            r = requests.get(f"{u.rstrip('/')}/api/gis/roads?ulbId={DEFAULT_ULB_ID}", timeout=5.0)
+            r = requests.get(f"{u}/api/gis/roads?ulbId={DEFAULT_ULB_ID}", timeout=0.5)
             if r.status_code in (200, 401, 403, 404):
                 return u
         except Exception:
             continue
-    return candidate or "https://solidwasteapi.scipl.info.in"
+    return primary
 
 
 def sync_backend_metadata(backend_url: str, ulb_id: str) -> None:

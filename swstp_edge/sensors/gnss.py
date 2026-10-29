@@ -594,7 +594,7 @@ def _serial_thread() -> None:
                     gnss_ok = True
                     print(f"[GNSS] Primary GNSS active: u-blox MAX-M10S on {port} @ {baud} baud")
 
-                    consecutive_empty = 0
+                    last_valid_sentence_mono = time.monotonic()
                     while not _stop_event.is_set():
                         try:
                             line_bytes = ser.readline()
@@ -603,17 +603,18 @@ def _serial_thread() -> None:
                             break
 
                         if not line_bytes:
-                            consecutive_empty += 1
-                            # If silent for more than 5 seconds, port may have been unplugged
-                            if consecutive_empty >= 5:
-                                print(f"[GNSS] No data on {port} for 5s — triggering port check...")
+                            # 1.0s read timeout elapsed with no newline.
+                            # Standard 1 Hz GPS bursts can have inter-epoch timing jitter.
+                            # Only treat as disconnected if completely silent for >= 12 seconds.
+                            if (time.monotonic() - last_valid_sentence_mono) >= 12.0:
+                                print(f"[GNSS] No NMEA data on {port} for 12s — stream lost, re-establishing...")
                                 break
                             continue
 
-                        consecutive_empty = 0
                         line = line_bytes.decode("ascii", errors="replace").strip()
                         if "$" in line:
-                            _dispatch(line)
+                            if _dispatch(line):
+                                last_valid_sentence_mono = time.monotonic()
 
                     connected_and_streamed = True
 
@@ -671,6 +672,12 @@ def init(port: str | None = None, baud: int | None = None) -> bool:
         _target_port = port
     if baud and baud > 0:
         _target_baud = baud
+
+    if _thread and _thread.is_alive():
+        target_p = _target_port or find_gnss_port() or GNSS_SERIAL_PORT
+        target_b = _target_baud or GNSS_BAUD_RATE
+        print(f"[GNSS] Primary u-blox MAX-M10S reader already running ({target_p} @ {target_b} baud)")
+        return True
 
     _stop_event.clear()
     _thread = threading.Thread(target=_serial_thread, name="gnss-max-m10s", daemon=True)

@@ -252,23 +252,35 @@ def main() -> None:
     os.makedirs(args.save_dir, exist_ok=True)
     os.makedirs(LITTER_CAPTURES_DIR, exist_ok=True)
 
-    # ── Backend discovery & metadata sync ───────────────────────────────
+    # ── Backend discovery (fast <= 1.2s) ─────────────────────────────────
     effective_backend_url = auto_detect_backend_url(args.backend_url)
-    sync_backend_metadata(effective_backend_url, effective_ulb_id)
-
-    # ── Session bind ─────────────────────────────────────────────────────
     effective_session_id = args.session_id
-    if device_id and device_id not in ("UNPROVISIONED", "UNASSIGNED"):
-        sid = ensure_hardware_session(effective_backend_url, device_id)
-        if sid > 0:
-            effective_session_id = sid
-        else:
-            print(f"\n[CRITICAL AUTH] Device '{device_id}' failed backend authentication!")
-            print("[CRITICAL AUTH] Telemetry, evidence images, and live stream uploads are BLOCKED.\n")
-    else:
-        print(f"\n[CRITICAL AUTH] Device ID '{device_id}' is unprovisioned. Backend uploads are BLOCKED.\n")
-    dynamic_session_info["deviceId"] = device_id
-    latest_sensor["deviceId"]        = device_id
+    dynamic_session_info["deviceId"]   = device_id
+    dynamic_session_info["backendUrl"] = effective_backend_url
+    dynamic_session_info["ulbId"]      = effective_ulb_id
+    latest_sensor["deviceId"]          = device_id
+
+    # ── Non-blocking asynchronous backend metadata sync & session bind ───
+    # Runs in a background daemon thread so camera & sensors start instantly (<1s)
+    def _async_backend_startup_init():
+        nonlocal effective_session_id
+        try:
+            sync_backend_metadata(effective_backend_url, effective_ulb_id)
+            if device_id and device_id not in ("UNPROVISIONED", "UNASSIGNED"):
+                sid = ensure_hardware_session(effective_backend_url, device_id)
+                if sid > 0:
+                    effective_session_id = sid
+                    dynamic_session_info["active_session_id"] = sid
+                    hardware_state["backend"]["active_session_id"] = sid
+                    latest_sensor["active_session_id"] = sid
+                else:
+                    print(f"\n[AUTH NOTE] Device '{device_id}' not yet bound to an online session (offline / bench mode).\n")
+            else:
+                print(f"\n[AUTH NOTE] Device ID '{device_id}' unprovisioned. Operating locally.\n")
+        except Exception as _b_err:
+            print(f"[BACKEND INIT] Async sync note: {_b_err}")
+
+    threading.Thread(target=_async_backend_startup_init, daemon=True, name="backend-async-init").start()
 
     # ── Sensor initialisation ─────────────────────────────────────────────
     print("\n=== SWSTP UNIFIED SENSOR INIT ===")
@@ -711,9 +723,9 @@ def main() -> None:
                         pass
                     continue
 
-            orig_frame       = frame.copy()
-            raw_frame        = frame.copy()
-            last_known_frame = orig_frame.copy()
+            orig_frame       = frame
+            raw_frame        = frame
+            last_known_frame = frame
             orig_h, orig_w   = orig_frame.shape[:2]
 
             # ── 4. Vehicle Stop & State Evaluation (GNSS + IMU Fusion) ────
@@ -780,10 +792,11 @@ def main() -> None:
             latest_sensor["pending_rest_sec"]     = stop_status.get("pending_rest_sec", 0.0)
             latest_sensor["rest_confirm_sec"]     = stop_status.get("rest_confirm_sec", 1.0)
 
-            # Gating condition: Motion detection is ACTIVE only when vehicle is confirmed STOPPED (< 3.5 km/h).
-            # When moving (speed >= 3.5 km/h or vehicle not at stop), motion detection is on hold.
+            # Gating condition: Motion detection is ACTIVE when vehicle is stopped / stationary.
+            # Active when stop detector reports STOPPED or vehicle is stationary (< 1.0 km/h or bench test).
+            # When driving at road speed (>= 3.5 km/h and not stopped), motion detection is on hold.
             motion_speed_threshold = float(getattr(_cfg, "REST_SPEED_THRESHOLD_KMH", 3.5))
-            motion_gate_active = is_vehicle_stopped and (vehicle_speed < motion_speed_threshold)
+            motion_gate_active = is_vehicle_stopped or (vehicle_speed < 1.0)
 
             # ── 5. Downsample for motion processing ───────────────────────
             if FRAME_SIZE is not None:
@@ -975,7 +988,7 @@ def main() -> None:
                                 (10, 48), cv2.FONT_HERSHEY_SIMPLEX, 0.44, (0, 255, 255), 1, cv2.LINE_AA)
 
             # ── 7. Metadata Overlay & Live Stream Buffer ──────────────────
-            display_frame = overlay_metadata(orig_frame.copy(), litter_engine)
+            display_frame = overlay_metadata(orig_frame, litter_engine)
 
             with latest_frame_lock:
                 latest_stream_frame = (display_frame, time.monotonic())
@@ -992,7 +1005,7 @@ def main() -> None:
                     _gnss_hw_fix = bool(gps_valid and _loc_src == "gnss")
                     if litter_engine.update_gnss(cap_lat, cap_lon, gnss_hardware_fix=_gnss_hw_fix):
                         # Grab a clean copy of the original (unprocessed) frame
-                        litter_frame = raw_frame.copy()
+                        litter_frame = frame.copy()
                         litter_engine.try_trigger(
                             frame    = litter_frame,
                             lat      = cap_lat,

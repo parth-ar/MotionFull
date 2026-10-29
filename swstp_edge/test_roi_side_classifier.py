@@ -462,7 +462,7 @@ def run_static_test(roi_override: list | None = None, save_report: bool = True):
         },
         {
             "name": "Outside ROI Box",
-            "bbox": [10, 10, 80, 80] if rx > 90 else [w - 90, 10, w - 10, 80],
+            "bbox": [10, 2, 80, min(30, max(5, ry - 4))] if ry > 15 else ([10, ry + rh + 4, 80, h - 5] if (h - (ry + rh)) > 15 else [0, 0, 5, 5]),
             "expected": "none"
         },
     ]

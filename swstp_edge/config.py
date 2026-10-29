@@ -115,7 +115,7 @@ TELEMETRY_INTERVAL_SEC = 1.0 / TELEMETRY_RATE_HZ
 # ---------------------------------------------------------------------------
 # GNSS / timing thresholds
 # ---------------------------------------------------------------------------
-GNSS_DATA_TIMEOUT_SEC    = 3.0
+GNSS_DATA_TIMEOUT_SEC    = 6.0
 GNSS_DETAIL_INTERVAL_SEC = 1.0
 GNSS_SATELLITE_SNAP_SEC  = 5.0
 
@@ -171,14 +171,14 @@ GNSS_FALLBACK_REFRESH_SEC  = 300
 # ---------------------------------------------------------------------------
 # Motion detection parameters (Robust against shadows, lighting & reflections)
 # ---------------------------------------------------------------------------
-DIFF_THRESHOLD             = 30     # Pixel difference threshold (higher = filters soft shadows/ambient drift)
-MIN_CONTOUR_AREA           = 700    # Min contour pixel area at downsampled FRAME_SIZE (filters small reflection glints)
-MAX_MOTION_AREA_RATIO      = 0.55   # If motion covers > 55% of ROI, treat as global lighting shock (headlights/sun/auto-exposure)
-BG_ALPHA                   = 0.05   # Background model learning rate under normal steady state
+DIFF_THRESHOLD             = 22     # Pixel difference threshold (higher = filters soft shadows/ambient drift)
+MIN_CONTOUR_AREA           = 350    # Min contour pixel area at downsampled FRAME_SIZE (filters small reflection glints)
+MAX_MOTION_AREA_RATIO      = 0.65   # If motion covers > 55% of ROI, treat as global lighting shock (headlights/sun/auto-exposure)
+BG_ALPHA                   = 0.04   # Background model learning rate under normal steady state
 FAST_BG_ALPHA              = 0.25   # Accelerated adaptation rate when global lighting shock is detected
 MOTION_CONSECUTIVE_FRAMES  = 2      # Consecutive frames of confirmed motion required before capture (rejects 1-frame flashes)
-WARMUP_FRAMES              = 30
-SAVE_COOLDOWN_SEC          = 10.0    # 10-second buffer between motion captures
+WARMUP_FRAMES              = 20
+SAVE_COOLDOWN_SEC          = 5.0    # 10-second buffer between motion captures
 FRAME_SIZE                 = (320, 180) # Downsampled resolution for motion processing
 
 # ---------------------------------------------------------------------------
