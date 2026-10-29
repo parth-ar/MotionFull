@@ -447,17 +447,27 @@ def overlay_metadata(frame, litter_engine=None):
         ts_color = (0, 200, 255)
 
     gnss_detected = bool(hardware_state.get("gps", {}).get("detected", False))
-    gnss_has_fix  = bool(latest_sensor.get("gps_valid") and latest_sensor.get("lat") is not None)
+    disp_lat = latest_sensor.get("raw_gps_lat")
+    if disp_lat is None:
+        disp_lat = latest_sensor.get("lat")
+    disp_lon = latest_sensor.get("raw_gps_lon")
+    if disp_lon is None:
+        disp_lon = latest_sensor.get("lon")
+    sats = latest_sensor.get("satellites", 0)
+    gnss_has_fix = bool(latest_sensor.get("gps_valid") and disp_lat is not None and disp_lon is not None)
 
     if gnss_has_fix:
-        loc_text  = f"GNSS (MAX-M10S): {latest_sensor['lat']:.8f}, {latest_sensor['lon']:.8f}"
+        loc_text  = f"GNSS (MAX-M10S): {disp_lat:.7f}, {disp_lon:.7f} ({sats} Sats)"
         loc_color = (0, 255, 0)      # Green: Active satellite fix
+        gps_badge = f"GPS:FIX ({sats}S)" if sats > 0 else "GPS:FIX"
     elif gnss_detected:
-        loc_text  = "GNSS (MAX-M10S): Searching for fix…"
+        loc_text  = f"GNSS (MAX-M10S): Searching for fix… ({sats} Sats)" if sats > 0 else "GNSS (MAX-M10S): Searching for fix…"
         loc_color = (0, 165, 255)    # Orange: Hardware connected, seeking satellite lock
+        gps_badge = f"GPS:SEARCH ({sats}S)" if sats > 0 else "GPS:SEARCH"
     else:
         loc_text  = "GNSS (MAX-M10S): Disconnected / No Data"
         loc_color = (0, 0, 255)      # Red: Hardware disconnected / no serial data
+        gps_badge = "GPS:DISCONN"
 
     h, w = frame.shape[:2]
     font_scale  = max(0.4, (h / 480.0) * 0.45)
@@ -469,12 +479,6 @@ def overlay_metadata(frame, litter_engine=None):
     is_imx = bool(hardware_state.get("camera", {}).get("is_imx708"))
     cam_badge = ("CAM:IMX708" if is_imx else "CAM:OK") if hardware_state["camera"]["detected"] else "CAM:OFF"
     rtc_badge = "RTC:ONLINE" if rtc_ts else "RTC:WAIT"
-    if gnss_has_fix:
-        gps_badge = "GPS:FIX"
-    elif gnss_detected:
-        gps_badge = "GPS:SEARCH"
-    else:
-        gps_badge = "GPS:DISCONN"
     imu_badge = "IMU:OK" if (latest_sensor.get("imu") and latest_sensor["imu"].get("valid")) else "IMU:WAIT"
     net_badge = (
         f"NET:ONLINE (SESS #{active_sid})" if (backend_ok and active_sid > 0)

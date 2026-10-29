@@ -499,46 +499,78 @@ def _parse_gsv(fields: list, talker: str) -> None:
         _state["last_detail_snap_time"] = now
 
 
+def _parse_gll(fields: list) -> None:
+    """Parse $GLL / $GNGLL / $GPGLL — Geographic Position (Latitude/Longitude)."""
+    if len(fields) < 5:
+        return
+    now = time.monotonic()
+    status = fields[6].strip().upper() if len(fields) > 6 and fields[6] else "V"
+    active = (status == "A")
+    lat = _parse_lat(fields[1], fields[2])
+    lon = _parse_lon(fields[3], fields[4])
+
+    with _lock:
+        _state["data_received"]  = True
+        _state["last_data_time"] = now
+        if active and lat is not None and lon is not None:
+            _state["fix"]           = True
+            _state["status"]        = "FIX"
+            _state["latitude"]      = lat
+            _state["longitude"]     = lon
+            _state["last_fix_time"] = now
+        elif (now - (_state["last_fix_time"] or 0)) >= GNSS_DATA_TIMEOUT_SEC:
+            _state["fix"]       = False
+            _state["status"]    = "NO_FIX"
+            _state["latitude"]  = None
+            _state["longitude"] = None
+
+
 # ---------------------------------------------------------------------------
 # Sentence dispatcher
 # ---------------------------------------------------------------------------
 
 def _dispatch(line: str) -> bool:
     """Validate checksum and dispatch a single NMEA sentence. Returns True on valid sentence."""
-    line = line.strip()
-    idx = line.find("$")
-    if idx < 0:
+    try:
+        line = line.strip()
+        idx = line.find("$")
+        if idx < 0:
+            return False
+        line = line[idx:]
+
+        if not _nmea_checksum_ok(line):
+            return False
+
+        body = line.lstrip("$").split("*")[0]
+        fields = body.split(",")
+        if not fields or not fields[0]:
+            return False
+
+        sentence_id = fields[0].upper()
+        talker = sentence_id[:2] if len(sentence_id) >= 2 else "GN"
+
+        if sentence_id.endswith("GGA"):
+            _parse_gga(fields)
+            return True
+        elif sentence_id.endswith("RMC"):
+            _parse_rmc(fields)
+            return True
+        elif sentence_id.endswith("GLL"):
+            _parse_gll(fields)
+            return True
+        elif sentence_id.endswith("VTG"):
+            _parse_vtg(fields)
+            return True
+        elif sentence_id.endswith("GSA"):
+            _parse_gsa(fields)
+            return True
+        elif sentence_id.endswith("GSV"):
+            _parse_gsv(fields, talker)
+            return True
+
         return False
-    line = line[idx:]
-
-    if not _nmea_checksum_ok(line):
+    except Exception:
         return False
-
-    body = line.lstrip("$").split("*")[0]
-    fields = body.split(",")
-    if not fields or not fields[0]:
-        return False
-
-    sentence_id = fields[0].upper()
-    talker = sentence_id[:2] if len(sentence_id) >= 2 else "GN"
-
-    if sentence_id.endswith("GGA"):
-        _parse_gga(fields)
-        return True
-    elif sentence_id.endswith("RMC"):
-        _parse_rmc(fields)
-        return True
-    elif sentence_id.endswith("VTG"):
-        _parse_vtg(fields)
-        return True
-    elif sentence_id.endswith("GSA"):
-        _parse_gsa(fields)
-        return True
-    elif sentence_id.endswith("GSV"):
-        _parse_gsv(fields, talker)
-        return True
-
-    return False
 
 
 # ---------------------------------------------------------------------------
@@ -616,34 +648,22 @@ def _serial_thread() -> None:
             continue
 
         last_valid_sentence_mono = time.monotonic()
-        buffer = bytearray()
+        consecutive_io_errors = 0
 
         try:
             while not _stop_event.is_set():
                 try:
-                    # In Linux/POSIX, bulk reading available bytes from the serial buffer
-                    # avoids byte-by-byte read(1) GIL contention under camera/OpenCV load.
-                    waiting = getattr(ser, "in_waiting", 0)
-                    to_read = max(1, min(waiting, 2048)) if waiting > 0 else 1
-                    chunk = ser.read(to_read)
-                except Exception as read_err:
-                    print(f"[GNSS] Read error on {target_port}: {read_err}")
-                    break
+                    line_bytes = ser.readline()
+                    if not line_bytes:
+                        # Serial read timeout (1.0s) with no bytes received
+                        now_mono = time.monotonic()
+                        if (now_mono - last_valid_sentence_mono) >= GNSS_DATA_TIMEOUT_SEC:
+                            if gnss_ok:
+                                print(f"[GNSS] Stream silent for {GNSS_DATA_TIMEOUT_SEC}s on {target_port} — disconnecting")
+                                _reset_state_to_disconnected()
+                        continue
 
-                if not chunk:
-                    # Read timeout (1.0s) with no bytes received
-                    now_mono = time.monotonic()
-                    if (now_mono - last_valid_sentence_mono) >= GNSS_DATA_TIMEOUT_SEC:
-                        if gnss_ok:
-                            print(f"[GNSS] Stream silent for {GNSS_DATA_TIMEOUT_SEC}s on {target_port} — disconnecting")
-                            _reset_state_to_disconnected()
-                    continue
-
-                buffer.extend(chunk)
-
-                # Process all complete lines in buffer cleanly without partial-line truncation
-                while b"\n" in buffer:
-                    line_bytes, buffer = buffer.split(b"\n", 1)
+                    consecutive_io_errors = 0
                     line = line_bytes.decode("ascii", errors="replace").strip()
                     if "$" in line:
                         idx = line.find("$")
@@ -653,6 +673,17 @@ def _serial_thread() -> None:
                             if not gnss_ok:
                                 gnss_ok = True
                                 print(f"[GNSS] Primary GNSS stream locked: u-blox MAX-M10S on {target_port} @ {target_baud} baud")
+
+                except (serial.SerialException, OSError) as port_err:
+                    consecutive_io_errors += 1
+                    # Only tear down connection if serial port has truly failed or was unplugged
+                    if consecutive_io_errors >= 3 or not os.path.exists(target_port):
+                        print(f"[GNSS] Serial port connection error on {target_port}: {port_err}")
+                        break
+                    time.sleep(0.05)
+                except Exception:
+                    # Individual line decode/format glitches are safely skipped without dropping the stream
+                    pass
 
         except Exception as loop_err:
             print(f"[GNSS] Exception in serial reader loop: {loop_err}")

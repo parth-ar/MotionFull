@@ -14,7 +14,6 @@ This file is 100% independent — it makes NO changes to any other file.
 
 Run from the swstp_edge/ directory:
     python test_all_sensors.py [--imu-samples N] [--gnss-wait N]
-
 Optional flags:
   --imu-samples N   Number of IMU read iterations to display   (default: 5)
   --gnss-wait   N   Seconds to wait for a GNSS fix/data        (default: 30)

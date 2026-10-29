@@ -207,7 +207,12 @@ def build_telemetry_packet(device_id: str) -> dict:
 
     if gnss_fix and lat_raw is not None and lon_raw is not None:
         if abs(lat_raw) > 0.001 and abs(lon_raw) > 0.001:
-            snapped_lat, snapped_lon, in_sz, is_snapped, road_bearing = snap_coordinates_to_road(lat_raw, lon_raw)
+            try:
+                snapped_lat, snapped_lon, in_sz, is_snapped, road_bearing = snap_coordinates_to_road(lat_raw, lon_raw)
+            except Exception as snap_err:
+                snapped_lat, snapped_lon = lat_raw, lon_raw
+                in_sz, is_snapped, road_bearing = False, False, None
+
             drift_m = haversine_dist_meters(lat_raw, lon_raw, snapped_lat, snapped_lon)
 
             if not hardware_state["gps"]["logged_fix"]:
@@ -238,19 +243,25 @@ def build_telemetry_packet(device_id: str) -> dict:
                 latest_sensor["last_known_valid_timestamp"] = time.time()
 
             # Compute heading
-            heading = compute_heading_from_gps_history(
-                lat_raw, lon_raw,
-                in_safe_zone=in_sz,
-                is_snapped=is_snapped,
-                road_bearing=road_bearing,
-            )
-            if heading is not None:
-                with _lock:
-                    latest_sensor["heading"]                  = heading
-                    latest_sensor["last_known_valid_heading"] = heading
+            try:
+                heading = compute_heading_from_gps_history(
+                    lat_raw, lon_raw,
+                    in_safe_zone=in_sz,
+                    is_snapped=is_snapped,
+                    road_bearing=road_bearing,
+                )
+                if heading is not None:
+                    with _lock:
+                        latest_sensor["heading"]                  = heading
+                        latest_sensor["last_known_valid_heading"] = heading
+            except Exception:
+                pass
 
-            track_field_events(snapped_lat, snapped_lon,
-                               latest_sensor["speed"], latest_sensor.get("heading") or 0.0)
+            try:
+                track_field_events(snapped_lat, snapped_lon,
+                                   latest_sensor["speed"], latest_sensor.get("heading") or 0.0)
+            except Exception:
+                pass
     else:
         # No GNSS fix or GNSS disconnected — coordinates MUST be None (no false or held locations)
         with _lock:

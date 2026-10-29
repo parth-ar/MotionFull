@@ -733,8 +733,8 @@ def main() -> None:
             vehicle_speed = float(latest_sensor.get("speed") or 0.0)
             imu_data      = latest_sensor.get("imu")
             gps_valid     = bool(latest_sensor.get("gps_valid"))
-            cap_lat       = latest_sensor.get("lat") if gps_valid else None
-            cap_lon       = latest_sensor.get("lon") if gps_valid else None
+            cap_lat       = (latest_sensor.get("lat") if latest_sensor.get("lat") is not None else latest_sensor.get("raw_gps_lat")) if gps_valid else None
+            cap_lon       = (latest_sensor.get("lon") if latest_sensor.get("lon") is not None else latest_sensor.get("raw_gps_lon")) if gps_valid else None
             rtc_ts        = get_rtc_timestamp()
 
             stop_status = stop_detector.update(
