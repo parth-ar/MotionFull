@@ -98,6 +98,7 @@ class StopCaptureItem:
     stop_offset_sec: float
     latitude: Optional[float] = None
     longitude: Optional[float] = None
+    dumping_side: str = "unknown"
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -109,6 +110,8 @@ class StopCaptureItem:
             "stop_offset_sec": round(self.stop_offset_sec, 2),
             "latitude": round(self.latitude, 8) if self.latitude is not None else None,
             "longitude": round(self.longitude, 8) if self.longitude is not None else None,
+            "dumping_side": self.dumping_side,
+            "dumpingSide": self.dumping_side,
         }
 
 
@@ -162,8 +165,9 @@ class StopEventRecord:
             lines.append("  Previous Motion Frames Captured During This Stop:")
             for item in self.captures:
                 coords = f"({item.latitude:.6f}, {item.longitude:.6f})" if item.latitude is not None else "(N/A)"
+                side_info = f" | Side: {item.dumping_side.upper()}" if getattr(item, 'dumping_side', 'unknown') not in ('unknown', 'none') else ""
                 lines.append(
-                    f"    [{item.stop_frame_idx:02d}] {item.filename} | "
+                    f"    [{item.stop_frame_idx:02d}] {item.filename}{side_info} | "
                     f"Offset: +{item.stop_offset_sec:.1f}s | RTC: {item.rtc_timestamp} | Coords: {coords}"
                 )
         else:
@@ -599,6 +603,7 @@ class VehicleStopDetector:
             stop_offset_sec=offset,
             latitude=meta.get("latitude"),
             longitude=meta.get("longitude"),
+            dumping_side=meta.get("dumping_side") or meta.get("dumpingSide") or "unknown",
         )
         self.active_stop.captures.append(item)
 

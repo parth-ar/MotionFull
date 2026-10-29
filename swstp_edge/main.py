@@ -93,6 +93,13 @@ from motion import (
 )
 import motion as _motion
 
+from roi_side_classifier import (
+    classify_contour_side,
+    classify_bbox_side,
+    draw_side_split_overlay,
+    PRESET_ROIS,
+)
+
 from litter_engine import LitterEngine, cleanup_old_litter_captures
 
 from network.uploader import (
@@ -120,8 +127,9 @@ latest_stream_frame: tuple | None = None
 RE_CLEAN_FILENAME = re.compile(r"[^\w]")
 
 
-def draw_area_of_interest_overlay(frame, roi_pts, motion_detected: bool = False, on_hold: bool = False) -> None:
-    """Draw Area of Interest polygon and pointers matching original visual appearance."""
+def draw_area_of_interest_overlay(frame, roi_pts, motion_detected: bool = False,
+                                  on_hold: bool = False, side_result: dict | None = None) -> None:
+    """Draw Area of Interest polygon and middle dotted bisector line."""
     if not roi_pts or len(roi_pts) < 3:
         return
     orig_h, orig_w = frame.shape[:2]
@@ -131,10 +139,11 @@ def draw_area_of_interest_overlay(frame, roi_pts, motion_detected: bool = False,
         py = int(p[1] * orig_h) if p[1] <= 1.0 else int(p[1])
         disp_pts.append([px, py])
 
-    if len(disp_pts) >= 3 and not _motion.is_drawing_polygon:
+    if len(disp_pts) >= 3 and not (_motion.is_drawing_polygon or getattr(_motion, "is_dragging_roi", False)):
+        d_side = (side_result.get("dumping_side", "").upper() if side_result else "")
         if motion_detected:
-            poly_color = (0, 0, 255)
-            status_tag = "MOTION DETECTED"
+            status_tag = f"MOTION DETECTED [{d_side}]" if d_side in ("LEFT", "RIGHT") else "MOTION DETECTED"
+            poly_color = (0, 210, 255) if d_side == "LEFT" else ((50, 140, 255) if d_side == "RIGHT" else (0, 0, 255))
         elif on_hold:
             poly_color = (160, 160, 160)
             status_tag = "ON HOLD (VEHICLE MOVING)"
@@ -147,9 +156,12 @@ def draw_area_of_interest_overlay(frame, roi_pts, motion_detected: bool = False,
         for pt in disp_pts:
             cv2.circle(frame, tuple(pt), 4, (0, 255, 255), -1)
         cv2.putText(frame,
-                    f"AREA OF INTEREST [{status_tag}] ({len(disp_pts)} pts, press 'r' to re-plot)",
+                    f"AREA OF INTEREST [{status_tag}] ({len(disp_pts)} pts, 'r': redraw, 'd': drag box, '1'..'4': presets)",
                     (disp_pts[0][0] + 5, max(20, disp_pts[0][1] - 8)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.42, poly_color, 1, cv2.LINE_AA)
+
+        # Split device ROI in the middle with a dotted line (no opaque/colored tint)
+        draw_side_split_overlay(frame, roi_pts, side_result=side_result, show_fill=False)
 
 
 # ---------------------------------------------------------------------------
@@ -782,7 +794,8 @@ def main() -> None:
 
             roi_pts = _motion.active_polygon_roi or load_roi_polygon()
 
-            motion_detected = False
+            motion_detected    = False
+            _frame_side_result = None   # left/right classification for this frame
             total_frames_seen += 1
 
             if not motion_gate_active:
@@ -847,6 +860,7 @@ def main() -> None:
                         cnts = imutils.grab_contours(cnts)
 
                         candidate_motion = False
+                        _frame_side_votes = {"left": 0, "right": 0}
                         for c in cnts:
                             if cv2.contourArea(c) < MIN_CONTOUR_AREA:
                                 continue
@@ -854,21 +868,68 @@ def main() -> None:
                             (x, y, w, h) = cv2.boundingRect(c)
                             orig_x, orig_y   = int(x * scale_x), int(y * scale_y)
                             orig_bw, orig_bh = int(w * scale_x), int(h * scale_y)
+
+                            # ── Left/right side classification per contour ────────
+                            _c_side = "unknown"
+                            try:
+                                _sr = classify_contour_side(c, roi_pts, proc_w, proc_h)
+                                _c_side = _sr.get("dumping_side", "unknown")
+                                _frame_side_votes["left"]  += _sr.get("left_px", 0)
+                                _frame_side_votes["right"] += _sr.get("right_px", 0)
+                                _frame_side_votes["_last"] = _sr  # keep for meta
+                            except Exception:
+                                pass
+
+                            box_col = (0, 210, 255) if _c_side == "left" else ((50, 140, 255) if _c_side == "right" else (0, 255, 0))
                             cv2.rectangle(orig_frame,
                                           (orig_x, orig_y),
                                           (orig_x + orig_bw, orig_y + orig_bh),
-                                          (0, 255, 0), box_thickness)
+                                          box_col, box_thickness)
+                            if _c_side in ("left", "right"):
+                                cv2.putText(orig_frame, _c_side.upper(),
+                                            (orig_x, max(18, orig_y - 6)),
+                                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, box_col, 1, cv2.LINE_AA)
 
                         if candidate_motion:
                             consecutive_motion_frames += 1
+                            _l_votes = _frame_side_votes.get("left", 0)
+                            _r_votes = _frame_side_votes.get("right", 0)
+                            if _l_votes > 0 or _r_votes > 0:
+                                _dom_side = "left" if _l_votes >= _r_votes else "right"
+                            else:
+                                _last_sr = _frame_side_votes.get("_last", {})
+                                _dom_side = _last_sr.get("dumping_side", "unknown")
+                                if _dom_side not in ("left", "right"):
+                                    _dom_side = "unknown"
+
+                            _last_sr  = _frame_side_votes.get("_last", {})
+                            _frame_side_result = {
+                                "dumping_side": _dom_side,
+                                "is_left_side": (_dom_side == "left"),
+                                "left_px":      _l_votes,
+                                "right_px":     _r_votes,
+                                "bisector_x":   _last_sr.get("bisector_x", proc_w // 2),
+                            }
                         else:
                             consecutive_motion_frames = 0
+                            _frame_side_result = None
 
                         # Require sustained motion across consecutive frames to reject 1-frame glints/reflections
                         motion_detected = (consecutive_motion_frames >= MOTION_CONSECUTIVE_FRAMES)
 
-            # ── 6. Draw Area of Interest polygon overlay ──────────────────
-            draw_area_of_interest_overlay(orig_frame, roi_pts, motion_detected=motion_detected, on_hold=(not motion_gate_active))
+            # Update latest_sensor with real-time motion & dumping side state
+            latest_sensor["motion_detected"] = motion_detected
+            if motion_detected and _frame_side_result and _frame_side_result.get("dumping_side") in ("left", "right"):
+                latest_sensor["dumping_side"] = _frame_side_result["dumping_side"]
+                latest_sensor["is_left_side"] = _frame_side_result["is_left_side"]
+            else:
+                latest_sensor["dumping_side"] = "none"
+                latest_sensor["is_left_side"] = False
+
+            # ── 6. Draw Area of Interest polygon overlay (with middle dotted line) ──
+            _active_sr = _frame_side_result if motion_detected else None
+            draw_area_of_interest_overlay(orig_frame, roi_pts, motion_detected=motion_detected,
+                                          on_hold=(not motion_gate_active), side_result=_active_sr)
 
             # ── In-progress polygon drawing overlay ───────────────────────
             if _motion.is_drawing_polygon:
@@ -893,8 +954,18 @@ def main() -> None:
                         cv2.putText(orig_frame, "P1 (Snap/Close)", (prog_pts[0][0] + 16, prog_pts[0][1] + 4),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1, cv2.LINE_AA)
                 cv2.putText(orig_frame,
-                            f"PLOTTING AREA OF INTEREST: Click to place pointers ({len(prog_pts)} set) | Press 'r' again when done to connect & save",
+                            f"PLOTTING AREA OF INTEREST: Click to place points ({len(prog_pts)} set) | Right-click: undo | 'r'/Enter: connect & save",
                             (10, 48), cv2.FONT_HERSHEY_SIMPLEX, 0.44, (0, 255, 255), 1, cv2.LINE_AA)
+            elif getattr(_motion, "is_dragging_roi", False):
+                if _motion.roi_drag_preview:
+                    rx1, ry1, rx2, ry2 = _motion.roi_drag_preview
+                    cv2.rectangle(orig_frame, (rx1, ry1), (rx2, ry2), (0, 255, 255), 2)
+                    cv2.putText(orig_frame, f"New ROI Box: {rx2-rx1}x{ry2-ry1}", (rx1, max(24, ry1 - 8)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.52, (0, 255, 255), 2, cv2.LINE_AA)
+                else:
+                    cv2.putText(orig_frame,
+                                "DRAG ROI ACTIVE: Click & drag on video to set rectangular ROI | Press 'd' to cancel",
+                                (10, 48), cv2.FONT_HERSHEY_SIMPLEX, 0.44, (0, 255, 255), 1, cv2.LINE_AA)
 
             # ── 7. Metadata Overlay & Live Stream Buffer ──────────────────
             display_frame = overlay_metadata(orig_frame.copy(), litter_engine)
@@ -929,8 +1000,10 @@ def main() -> None:
 
             # ── 10. Motion capture & upload ───────────────────────────────
             if motion_detected:
+                side_tag = (_frame_side_result.get("dumping_side", "").upper() if _frame_side_result else "")
+                mot_text = f"MOTION DETECTED: {side_tag}" if side_tag in ("LEFT", "RIGHT") else "MOTION DETECTED"
                 text_scale = max(0.5, (orig_h / 480.0) * 0.5)
-                cv2.putText(display_frame, "MOTION DETECTED",
+                cv2.putText(display_frame, mot_text,
                             (10, int(55 * text_scale)),
                             cv2.FONT_HERSHEY_SIMPLEX, text_scale,
                             (0, 0, 255), max(1, int(orig_h / 360)), cv2.LINE_AA)
@@ -961,6 +1034,23 @@ def main() -> None:
                         cap_lat = latest_sensor.get("last_known_valid_lat") or 0.0
                         cap_lon = latest_sensor.get("last_known_valid_lon") or 0.0
 
+                    # ── Determine dumping side for this capture ────────────────
+                    _cap_side_result = None
+                    if _frame_side_result is not None and _frame_side_result.get("dumping_side") in ("left", "right"):
+                        _cap_side_result = _frame_side_result
+                    else:
+                        try:
+                            _cap_side_result = classify_bbox_side(
+                                0, 0, orig_w, orig_h, roi_pts, orig_w, orig_h
+                            )
+                        except Exception:
+                            _cap_side_result = {"dumping_side": "unknown",
+                                                "is_left_side": False,
+                                                "left_px": 0, "right_px": 0,
+                                                "bisector_x": orig_w // 2}
+
+                    d_side_str = _cap_side_result.get("dumping_side", "unknown")
+
                     item_meta = {
                         "image_file":          f"{base_name}.jpg",
                         "captured_at":         utc_iso,
@@ -980,6 +1070,13 @@ def main() -> None:
                         "motion_confidence":   0.95,
                         "saved_count":         saved_count,
                         "local_path":          local_path,
+                        # ── Dumping side classification (outbound JSON) ──────────
+                        "dumping_side":        d_side_str,
+                        "dumpingSide":         d_side_str,
+                        "is_left_side":        _cap_side_result.get("is_left_side", False),
+                        "side_left_px":        _cap_side_result.get("left_px", 0),
+                        "side_right_px":       _cap_side_result.get("right_px", 0),
+                        "roi_bisector_x":      _cap_side_result.get("bisector_x", 0),
                     }
 
                     stop_detector.record_capture(item_meta)
@@ -1003,6 +1100,7 @@ def main() -> None:
                         print(f"[OFFLINE BACKUP] Upload queue full; {base_name}.jpg retained locally.")
 
                     print(f"[MOTION #{saved_count}] {local_path} | "
+                          f"Side: {d_side_str.upper()} | "
                           f"Stop #{current_stop_id} {current_event_duration:.1f}s | "
                           f"Speed: {vehicle_speed:.1f} km/h")
                     cleanup_old_local_captures(args.save_dir, retention_days=3)
@@ -1056,6 +1154,41 @@ def main() -> None:
                             print(f"\n[ROI PLOT] Connected {len(_motion.active_polygon_roi)} pointers! Area of interest set up and saved persistently.\n")
                         else:
                             print(f"\n[ROI PLOT] Need at least 3 pointers (currently {len(_motion.drawn_polygon_pts)}). Click on video to add more, or press 'c' to clear.\n")
+                elif k == ord('d'):
+                    _motion.is_dragging_roi = not getattr(_motion, "is_dragging_roi", False)
+                    _motion.is_drawing_polygon = False
+                    _motion.roi_drag_start = None
+                    _motion.roi_drag_preview = None
+                    print(f"\n[ROI] Drag ROI mode: {'ON (click & drag rectangle)' if _motion.is_dragging_roi else 'OFF'}.")
+                elif k in (ord('1'), ord('2'), ord('3'), ord('4')):
+                    pk = chr(k)
+                    if pk in PRESET_ROIS:
+                        pname, ppts = PRESET_ROIS[pk]
+                        _motion.active_polygon_roi = [list(p) for p in ppts]
+                        save_roi_polygon(_motion.active_polygon_roi)
+                        _motion.is_drawing_polygon = False
+                        _motion.is_dragging_roi = False
+                        if litter_engine is not None:
+                            litter_engine.aod_polygon_norm = _motion.active_polygon_roi
+                        print(f"\n[PRESET] Loaded Preset [{pk}]: {pname}! ROI saved: {_motion.active_polygon_roi}\n")
+                elif k in (ord('l'), ord('L')):
+                    _new_roi = load_roi_polygon()
+                    _motion.active_polygon_roi = _new_roi
+                    if litter_engine is not None:
+                        litter_engine.aod_polygon_norm = _new_roi
+                    print(f"\n[ROI] Reloaded ROI from disk ({len(_new_roi)} vertices).\n")
+                elif k in (13, 32):  # Enter or Space
+                    if _motion.is_drawing_polygon:
+                        if len(_motion.drawn_polygon_pts) >= 3:
+                            _motion.active_polygon_roi = _motion.drawn_polygon_pts.copy()
+                            save_roi_polygon(_motion.active_polygon_roi)
+                            _motion.is_drawing_polygon = False
+                            _motion.drawn_polygon_pts  = []
+                            if litter_engine is not None:
+                                litter_engine.aod_polygon_norm = _motion.active_polygon_roi
+                            print(f"\n[ROI PLOT] Connected {len(_motion.active_polygon_roi)} pointers! Area of interest saved persistently.\n")
+                        else:
+                            print(f"\n[ROI PLOT] Need at least 3 pointers (currently {len(_motion.drawn_polygon_pts)}).\n")
                 elif k == ord('c'):
                     if _motion.is_drawing_polygon:
                         _motion.drawn_polygon_pts = []

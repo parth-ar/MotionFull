@@ -37,11 +37,18 @@ is_drawing_polygon: bool = False
 drawn_polygon_pts:  list = []
 camera_feed_active: bool = True
 
+is_dragging_roi:   bool = False
+roi_drag_start:    tuple | None = None
+roi_drag_preview:  tuple | None = None
+
 
 def reset_tracking() -> None:
-    global is_drawing_polygon, drawn_polygon_pts
+    global is_drawing_polygon, drawn_polygon_pts, is_dragging_roi, roi_drag_start, roi_drag_preview
     is_drawing_polygon = False
     drawn_polygon_pts.clear()
+    is_dragging_roi = False
+    roi_drag_start = None
+    roi_drag_preview = None
 
 
 # ---------------------------------------------------------------------------
@@ -211,6 +218,11 @@ def run_roi_setup_phase(cap, win_title: str, frame_w: int, frame_h: int) -> list
             cy = int(np.mean([p[1] for p in saved_px]))
             cv2.putText(display, "SAVED AREA OF INTEREST", (cx - 110, cy),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 255), 2, cv2.LINE_AA)
+            try:
+                from roi_side_classifier import draw_side_split_overlay
+                draw_side_split_overlay(display, active_polygon_roi, show_fill=False)
+            except Exception:
+                pass
 
         # ── Draw new polygon being placed ──
         if new_points_px:
@@ -339,11 +351,44 @@ def run_roi_setup_phase(cap, win_title: str, frame_w: int, frame_h: int) -> list
 # Mouse callback for interactive ROI plotting (runtime, during detection)
 # ---------------------------------------------------------------------------
 def on_mouse_roi(event, x: int, y: int, flags, param) -> None:
-    """Interactive mouse callback to place pointers for the Area of Interest."""
-    global drawn_polygon_pts, active_polygon_roi, is_drawing_polygon
+    """Interactive mouse callback to place pointers or drag a rectangular box for the Area of Interest."""
+    global drawn_polygon_pts, active_polygon_roi, is_drawing_polygon, is_dragging_roi, roi_drag_start, roi_drag_preview
+    frame_w = param.get("width", 640)
+    frame_h = param.get("height", 360)
+
+    # ── Mode 1: Drag Rectangle ROI Mode ('d') ──
+    if is_dragging_roi:
+        if event == cv2.EVENT_LBUTTONDOWN:
+            roi_drag_start = (x, y)
+            roi_drag_preview = None
+        elif event == cv2.EVENT_MOUSEMOVE and roi_drag_start is not None:
+            sx, sy = roi_drag_start
+            roi_drag_preview = (min(sx, x), min(sy, y), max(sx, x), max(sy, y))
+        elif event == cv2.EVENT_LBUTTONUP and roi_drag_start is not None:
+            sx, sy = roi_drag_start
+            x1, y1, x2, y2 = min(sx, x), min(sy, y), max(sx, x), max(sy, y)
+            roi_drag_start = None
+            roi_drag_preview = None
+            if (x2 - x1) >= 20 and (y2 - y1) >= 20:
+                nx1, ny1 = round(x1 / frame_w, 4), round(y1 / frame_h, 4)
+                nx2, ny2 = round(x2 / frame_w, 4), round(y2 / frame_h, 4)
+                active_polygon_roi = [
+                    [nx1, ny1],
+                    [nx2, ny1],
+                    [nx2, ny2],
+                    [nx1, ny2],
+                ]
+                save_roi_polygon(active_polygon_roi)
+                is_dragging_roi = False
+                print(f"[ROI] Applied and saved custom drag box ROI: {active_polygon_roi}")
+            else:
+                print("[ROI] Drag box was too small (<20px); cancelled.")
+        return
+
+    # ── Mode 2: Polygon Drawing Mode ('r') ──
     if not is_drawing_polygon:
         return
-    frame_w, frame_h = param.get("width", 640), param.get("height", 360)
+
     if event == cv2.EVENT_LBUTTONDOWN:
         norm_x = round(float(x) / frame_w, 4)
         norm_y = round(float(y) / frame_h, 4)
@@ -359,15 +404,11 @@ def on_mouse_roi(event, x: int, y: int, flags, param) -> None:
                 return
         drawn_polygon_pts.append([norm_x, norm_y])
         print(f"[ROI PLOT] Added P{len(drawn_polygon_pts)} at ({x},{y}) -> [{norm_x},{norm_y}].")
+
     elif event == cv2.EVENT_RBUTTONDOWN:
-        if len(drawn_polygon_pts) >= 3:
-            active_polygon_roi = drawn_polygon_pts.copy()
-            save_roi_polygon(active_polygon_roi)
-            is_drawing_polygon = False
-            drawn_polygon_pts  = []
-            print(f"[ROI PLOT] Right-click completed! Saved {len(active_polygon_roi)} pts.")
-        else:
-            print(f"[ROI PLOT] Need ≥3 pts (have {len(drawn_polygon_pts)}).")
+        if drawn_polygon_pts:
+            removed = drawn_polygon_pts.pop()
+            print(f"[ROI PLOT] Undid last vertex {removed}. Remaining: {len(drawn_polygon_pts)}")
 
 
 # ---------------------------------------------------------------------------
@@ -464,7 +505,9 @@ def overlay_metadata(frame, litter_engine=None):
     else:
         veh_badge = f"VEH:MOV({curr_spd:.1f}kph)"
 
-    hud_text = f"[SWSTP-PI] {cam_badge} | {rtc_badge} | {imu_badge} | {gps_badge} | {veh_badge} | {pwr_badge} | {net_badge}"
+    d_side = str(latest_sensor.get("dumping_side") or "none").lower()
+    side_badge = f" | SIDE:{d_side.upper()}" if d_side in ("left", "right") else ""
+    hud_text = f"[SWSTP-PI] {cam_badge} | {rtc_badge} | {imu_badge} | {gps_badge} | {veh_badge}{side_badge} | {pwr_badge} | {net_badge}"
     cv2.putText(frame, hud_text, (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (220, 220, 220), 1, cv2.LINE_AA)
 
     # Bottom Metadata Strip

@@ -46,6 +46,11 @@ import config as _cfg
 import sensors.gnss as gnss_sensor
 import sensors.leds as leds
 
+try:
+    from roi_side_classifier import classify_bbox_side as _classify_bbox_side
+except ImportError:
+    _classify_bbox_side = None
+
 
 def _haversine_distance_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     """Haversine distance between two coordinates in meters."""
@@ -138,6 +143,8 @@ def _save_worker() -> None:
                     "detection_type":       "LITTER",
                     "detection_confidence": sidecar_data.get("detection_confidence", 0.0),
                     "stop_duration_sec":    None,
+                    "dumping_side":         sidecar_data.get("dumping_side", "unknown"),
+                    "dumpingSide":          sidecar_data.get("dumping_side", "unknown"),
                 }
                 upload_queue.put_nowait(upload_item)
             except Exception as q_err:
@@ -469,13 +476,35 @@ class LitterEngine:
                     in_aod = (_polygon_overlap((x1, y1, x2, y2), aod_pts_px, frame.shape)
                               >= self.overlap_threshold)
 
+                # ── Left / right side classification ───────────────────────
+                _side_info = {"dumping_side": "unknown", "is_left_side": False,
+                              "left_px": 0, "right_px": 0}
+                if _classify_bbox_side is not None and self.aod_polygon_norm:
+                    try:
+                        _sr = _classify_bbox_side(
+                            x1, y1, x2, y2,
+                            self.aod_polygon_norm, w, h
+                        )
+                        _side_info = {
+                            "dumping_side": _sr["dumping_side"],
+                            "is_left_side": _sr["is_left_side"],
+                            "left_px":      _sr["left_px"],
+                            "right_px":     _sr["right_px"],
+                        }
+                    except Exception:
+                        pass
+
                 detected_items.append({
-                    "track_id":   track_id,
-                    "class_id":   cls_id,
-                    "class_name": cls_name,
-                    "confidence": round(conf_score, 4),
-                    "bbox":       [x1, y1, x2, y2],
-                    "in_aod":     in_aod,
+                    "track_id":    track_id,
+                    "class_id":    cls_id,
+                    "class_name":  cls_name,
+                    "confidence":  round(conf_score, 4),
+                    "bbox":        [x1, y1, x2, y2],
+                    "in_aod":      in_aod,
+                    "dumping_side":  _side_info["dumping_side"],
+                    "is_left_side":  _side_info["is_left_side"],
+                    "side_left_px":  _side_info["left_px"],
+                    "side_right_px": _side_info["right_px"],
                 })
 
                 if in_aod:
@@ -551,6 +580,17 @@ class LitterEngine:
                     max((d["confidence"] for d in detected_items if not d.get("in_aod")), default=0.0), 4
                 ),
             }
+
+            # ── Aggregate dumping side from non-AoD detections ────────────────
+            # Use pixel-area-weighted vote across all valid detections.
+            _valid_dets = [d for d in detected_items if not d.get("in_aod")]
+            _agg_left  = sum(d.get("side_left_px",  0) for d in _valid_dets)
+            _agg_right = sum(d.get("side_right_px", 0) for d in _valid_dets)
+            _agg_side  = "left" if _agg_left > _agg_right else "right"
+            if not _valid_dets:
+                _agg_side = "unknown"
+            sidecar_data["dumping_side"] = _agg_side
+            sidecar_data["is_left_side"] = (_agg_side == "left")
 
             # Async write (does not block inference thread beyond queue put)
             _save_queue.put((filename, final_frame, sidecar_fn, sidecar_data))

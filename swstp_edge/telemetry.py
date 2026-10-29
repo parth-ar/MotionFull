@@ -279,6 +279,11 @@ def build_telemetry_packet(device_id: str) -> dict:
         "rtc": rtc_data,
         "imu": imu_data,
         "gnss": gnss_data,
+        "motion": {
+            "detected":     bool(s.get("motion_detected", False)),
+            "dumping_side": s.get("dumping_side", "none"),
+            "is_left_side": bool(s.get("is_left_side", False)),
+        },
         "status": {
             "rtc":    "ACTIVE" if rtc_data.get("valid") else "FAULT",
             "imu":    "ACTIVE" if imu_data.get("valid") else "FAULT",
@@ -384,9 +389,12 @@ def build_slim_packet(full_pkt: dict) -> dict:
         "temp_c":    round(float(temp_c),  2),
         "imu_ok":    imu_ok,
         # Health & Power
-        "clk_src":   clk_src,
-        "pwr_src":   pwr_src,
-        "low_batt":  low_batt,
+        "clk_src":      clk_src,
+        "pwr_src":      pwr_src,
+        "low_batt":     low_batt,
+        # Motion & Dumping Side
+        "dumping_side": latest_sensor.get("dumping_side", "none"),
+        "dumpingSide":  latest_sensor.get("dumping_side", "none"),
     }
 
 

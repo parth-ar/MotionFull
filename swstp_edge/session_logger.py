@@ -254,6 +254,8 @@ class SessionLogger:
                 "drift_from_origin_m": meta.get("drift_from_origin_m"),
                 "image_file":          meta.get("image_file", ""),
                 "resolution":          f"{meta.get('width', 0)}x{meta.get('height', 0)}",
+                "dumping_side":        meta.get("dumping_side") or meta.get("dumpingSide") or "unknown",
+                "dumpingSide":         meta.get("dumpingSide") or meta.get("dumping_side") or "unknown",
             }
             self._data["motion_captures"].append(entry)
             self._data["session_summary"]["total_motion_captures"] = len(
@@ -265,6 +267,7 @@ class SessionLogger:
         _write_device_log(
             f"MOTION CAPTURE #{entry['capture_index']} | "
             f"stop={entry['stop_id']} | "
+            f"side={entry.get('dumping_side', 'unknown')} | "
             f"lat={entry['latitude']} lon={entry['longitude']} | "
             f"speed={entry['speed_kmh']} km/h | "
             f"file={entry['image_file']}"

@@ -427,9 +427,11 @@ def telemetry_streamer(backend_url: str, session_id_arg: int, ulb_id: str,
                     "roll":      round(float(orient.get("roll")  or 0.0), 2),
                     "pitch":     round(float(orient.get("pitch") or 0.0), 2),
                     "yaw":       round(float(orient.get("yaw")   or 0.0), 2),
-                    "temp_c":    round(float(imu_s.get("temperature_c") or 0.0), 2),
-                    "imu_ok":    bool(imu_s.get("valid")),
-                    "clk_src":   "unknown",
+                    "temp_c":       round(float(imu_s.get("temperature_c") or 0.0), 2),
+                    "imu_ok":       bool(imu_s.get("valid")),
+                    "clk_src":      "unknown",
+                    "dumping_side": s.get("dumping_side", "none"),
+                    "dumpingSide":  s.get("dumping_side", "none"),
                 })
 
 
@@ -525,6 +527,14 @@ def _upload_and_cleanup_evidence(session: requests.Session,
         "ulbId":              ulb_id,
     }
 
+    # ── Outbound dumping side: left or right ──────────────────────────────
+    dumping_side = item.get("dumping_side") or item.get("dumpingSide")
+    if dumping_side:
+        data["dumpingSide"] = dumping_side
+        data["dumping_side"] = dumping_side
+    if "is_left_side" in item:
+        data["isLeftSide"] = bool(item["is_left_side"])
+
     # ── Optional enrichment fields (litter / stop duration) ───────────────
     stop_duration_sec    = item.get("stop_duration_sec", item.get("stop_offset_sec"))
     detection_type       = item.get("detection_type") or item.get("detectionType")
@@ -603,6 +613,8 @@ def _upload_and_cleanup_evidence(session: requests.Session,
         else:
             print(f"            GPS Coordinates: ({lat:.8f}, {lon:.8f})")
         print(f"            Associated House:{house_tag}")
+        if dumping_side:
+            print(f"            Dumping Side:    {dumping_side.upper()}")
         print(f"            Access URL:      {img_url}")
         print(f"            Session ID:      #{active_sid}")
         print("=" * 65)
