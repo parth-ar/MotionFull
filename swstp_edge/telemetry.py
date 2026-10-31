@@ -59,7 +59,10 @@ import sensors.imu  as imu_sensor
 import sensors.gnss as gnss_sensor
 import sensors.leds as leds
 
-from config import TELEMETRY_RATE_HZ, TELEMETRY_INTERVAL_SEC, get_timezone_obj
+from config import (
+    TELEMETRY_RATE_HZ, TELEMETRY_INTERVAL_SEC, get_timezone_obj,
+    GNSS_DATA_TIMEOUT_SEC,
+)
 from geofence import (
     snap_coordinates_to_road, compute_heading_from_gps_history,
     track_field_events, haversine_dist_meters, is_in_safe_zone,
@@ -263,37 +266,64 @@ def build_telemetry_packet(device_id: str) -> dict:
             except Exception:
                 pass
     else:
-        # No GNSS fix or GNSS disconnected — coordinates MUST be None (no false or held locations)
-        with _lock:
-            latest_sensor["gps_valid"]                  = False
-            latest_sensor["location_source"]            = None
-            latest_sensor["lat"]                        = None
-            latest_sensor["lon"]                        = None
-            latest_sensor["raw_gps_lat"]                = None
-            latest_sensor["raw_gps_lon"]                = None
-            latest_sensor["is_inside_safe_zone"]        = False
-            latest_sensor["is_snapped"]                 = False
-            latest_sensor["road_bearing"]               = None
-            latest_sensor["heading"]                    = None
-            latest_sensor["last_known_valid_lat"]       = None
-            latest_sensor["last_known_valid_lon"]       = None
-            latest_sensor["last_known_valid_heading"]   = None
-            if not gnss_data.get("data_received"):
-                # GNSS module disconnected / no data received
-                latest_sensor["alt"]        = 0.0
-                latest_sensor["speed"]      = 0.0
-                latest_sensor["satellites"] = 0
-            else:
-                # GNSS module streaming sentences but waiting for satellite lock
-                speed_val = gnss_data.get("speed_kmh")
-                latest_sensor["speed"]      = speed_val if speed_val is not None else 0.0
-                latest_sensor["satellites"] = gnss_data.get("satellites", 0)
-                latest_sensor["alt"]        = gnss_data.get("altitude_m") or 0.0
+        # Check if the satellite fix is within the holdover window (GNSS_DATA_TIMEOUT_SEC = 10.0s).
+        # Telemetry loop runs at 20 Hz (50 ms), whereas MAX-M10S emits NMEA bursts at 1 Hz.
+        # Stabilising across the burst interval prevents false NO_FIX/Searching toggles.
+        now_mono = time.monotonic()
+        last_fix_time = latest_sensor.get("last_gnss_fix_time")
+        is_held_fix = (
+            last_fix_time is not None and
+            (now_mono - last_fix_time) < GNSS_DATA_TIMEOUT_SEC and
+            latest_sensor.get("lat") is not None
+        )
 
-        if hardware_state["gps"]["logged_fix"]:
-            hardware_state["gps"]["fix"]        = False
-            hardware_state["gps"]["logged_fix"] = False
-            _log_hardware("GPS MODULE (MAX-M10S)", "FIX LOST", "Satellite fix lost — coordinates cleared.")
+        if is_held_fix:
+            # SATELLITE FIX HOLDOVER: Hold valid position between 1 Hz bursts
+            with _lock:
+                latest_sensor["gps_valid"]       = True
+                latest_sensor["location_source"] = "gnss"
+                if gnss_data.get("data_received"):
+                    speed_val = gnss_data.get("speed_kmh")
+                    if speed_val is not None:
+                        latest_sensor["speed"] = speed_val
+                    sats = gnss_data.get("satellites", 0)
+                    if sats > 0:
+                        latest_sensor["satellites"] = sats
+                    alt_val = gnss_data.get("altitude_m")
+                    if alt_val is not None:
+                        latest_sensor["alt"] = alt_val
+        else:
+            # GNSS fix genuinely lost (> 10s silent) or no data received
+            with _lock:
+                latest_sensor["gps_valid"]                  = False
+                latest_sensor["location_source"]            = None
+                latest_sensor["lat"]                        = None
+                latest_sensor["lon"]                        = None
+                latest_sensor["raw_gps_lat"]                = None
+                latest_sensor["raw_gps_lon"]                = None
+                latest_sensor["is_inside_safe_zone"]        = False
+                latest_sensor["is_snapped"]                 = False
+                latest_sensor["road_bearing"]               = None
+                latest_sensor["heading"]                    = None
+                latest_sensor["last_known_valid_lat"]       = None
+                latest_sensor["last_known_valid_lon"]       = None
+                latest_sensor["last_known_valid_heading"]   = None
+                if not gnss_data.get("data_received"):
+                    # GNSS module disconnected / no data received
+                    latest_sensor["alt"]        = 0.0
+                    latest_sensor["speed"]      = 0.0
+                    latest_sensor["satellites"] = 0
+                else:
+                    # GNSS module streaming sentences but waiting for satellite lock
+                    speed_val = gnss_data.get("speed_kmh")
+                    latest_sensor["speed"]      = speed_val if speed_val is not None else 0.0
+                    latest_sensor["satellites"] = gnss_data.get("satellites", 0)
+                    latest_sensor["alt"]        = gnss_data.get("altitude_m") or 0.0
+
+            if hardware_state["gps"]["logged_fix"]:
+                hardware_state["gps"]["fix"]        = False
+                hardware_state["gps"]["logged_fix"] = False
+                _log_hardware("GPS MODULE (MAX-M10S)", "FIX LOST", f"Satellite fix silent/lost for > {GNSS_DATA_TIMEOUT_SEC}s — coordinates cleared.")
 
     # --- 5. Update RTC state in latest_sensor ---
     with _lock:

@@ -359,8 +359,6 @@ def _parse_gga(fields: list) -> None:
         elif (now - (_state["last_fix_time"] or 0)) >= GNSS_DATA_TIMEOUT_SEC:
             _state["fix"]       = False
             _state["status"]    = "NO_FIX"
-            _state["latitude"]  = None
-            _state["longitude"] = None
 
 
 def _parse_rmc(fields: list) -> None:
@@ -397,8 +395,6 @@ def _parse_rmc(fields: list) -> None:
         elif (now - (_state["last_fix_time"] or 0)) >= GNSS_DATA_TIMEOUT_SEC:
             _state["fix"]       = False
             _state["status"]    = "NO_FIX"
-            _state["latitude"]  = None
-            _state["longitude"] = None
 
 
 def _parse_vtg(fields: list) -> None:
@@ -521,8 +517,6 @@ def _parse_gll(fields: list) -> None:
         elif (now - (_state["last_fix_time"] or 0)) >= GNSS_DATA_TIMEOUT_SEC:
             _state["fix"]       = False
             _state["status"]    = "NO_FIX"
-            _state["latitude"]  = None
-            _state["longitude"] = None
 
 
 # ---------------------------------------------------------------------------
@@ -555,6 +549,9 @@ def _dispatch(line: str) -> bool:
         elif sentence_id.endswith("RMC"):
             _parse_rmc(fields)
             return True
+        elif sentence_id.endswith("GLL"):
+            _parse_gll(fields)
+            return True
         elif sentence_id.endswith("VTG"):
             _parse_vtg(fields)
             return True
@@ -564,7 +561,6 @@ def _dispatch(line: str) -> bool:
         elif sentence_id.endswith("GSV"):
             _parse_gsv(fields, talker)
             return True
-        # GLL omitted to avoid lower-precision / conflicting talker updates (matches test_max_m10s_gnss.py)
 
         return False
     except Exception:
@@ -607,13 +603,13 @@ def _reset_state_to_disconnected() -> None:
 
 def _serial_thread() -> None:
     """Background worker that opens the MAX-M10S hardware UART serial port directly,
-    reads NMEA sentences line-by-line, and updates module state.
+    reads NMEA sentences continuously, and updates module state.
     
     Adopts the proven architecture of test_max_m10s_gnss.py:
       - Uses auto_detect_gnss_port() to resolve /dev/serial0 first
       - Connects directly at 9600 baud without hopping or cycling
       - Avoids invasive multi-baud probing loops that interrupt the stream
-      - Stays locked onto the open stream and handles read timeouts seamlessly
+      - Stays locked onto the open stream indefinitely without closing the UART port
     """
     global gnss_ok, _active_port, _active_baud
 
@@ -639,16 +635,18 @@ def _serial_thread() -> None:
                 bytesize=serial.EIGHTBITS,
                 parity=serial.PARITY_NONE,
                 stopbits=serial.STOPBITS_ONE,
+                xonxoff=False,
+                rtscts=False,
+                dsrdtr=False,
             )
             _active_port = target_port
             _active_baud = target_baud
-            print(f"[GNSS] Serial port opened: {target_port} @ {target_baud} baud")
+            print(f"[GNSS] Serial port opened indefinitely: {target_port} @ {target_baud} baud")
         except Exception as exc:
             _active_port = None
             _stop_event.wait(RECONNECT_DELAY)
             continue
 
-        last_valid_sentence_mono = time.monotonic()
         consecutive_io_errors = 0
 
         try:
@@ -656,35 +654,40 @@ def _serial_thread() -> None:
                 try:
                     line_bytes = ser.readline()
                     if not line_bytes:
-                        # Serial read timeout (1.0s) with no bytes received
-                        now_mono = time.monotonic()
-                        if (now_mono - last_valid_sentence_mono) >= GNSS_DATA_TIMEOUT_SEC:
-                            if gnss_ok:
-                                print(f"[GNSS] Stream silent for {GNSS_DATA_TIMEOUT_SEC}s on {target_port} — disconnecting")
-                                _reset_state_to_disconnected()
+                        # Serial read timeout (1.0s) with no bytes received.
+                        # Stays open indefinitely without tearing down port.
                         continue
 
                     consecutive_io_errors = 0
+                    now_mono = time.monotonic()
+                    with _lock:
+                        _state["data_received"] = True
+                        _state["last_data_time"] = now_mono
+
                     line = line_bytes.decode("ascii", errors="replace").strip()
                     if "$" in line:
-                        idx = line.find("$")
-                        nmea_sentence = line[idx:]
-                        if _dispatch(nmea_sentence):
-                            last_valid_sentence_mono = time.monotonic()
-                            if not gnss_ok:
-                                gnss_ok = True
-                                print(f"[GNSS] Primary GNSS stream locked: u-blox MAX-M10S on {target_port} @ {target_baud} baud")
+                        # Split concatenated NMEA sentences if multiple arrived in buffer
+                        parts = line.split("$")
+                        for p in parts:
+                            p_clean = p.strip()
+                            if not p_clean:
+                                continue
+                            sentence = "$" + p_clean
+                            if _dispatch(sentence):
+                                if not gnss_ok:
+                                    gnss_ok = True
+                                    print(f"[GNSS] Primary GNSS stream locked: u-blox MAX-M10S on {target_port} @ {target_baud} baud")
 
                 except (serial.SerialException, OSError) as port_err:
                     consecutive_io_errors += 1
-                    # Only tear down connection if serial port has truly failed continuously (unplugged)
-                    if consecutive_io_errors >= 10:
+                    # Only tear down connection if serial port has truly failed continuously (unplugged for sustained duration)
+                    if consecutive_io_errors >= 15:
                         print(f"[GNSS] Serial port connection error on {target_port} (sustained): {port_err}")
                         break
                     time.sleep(0.05)
                 except Exception:
                     # Individual line decode/format glitches are safely skipped without dropping the stream
-                    pass
+                    time.sleep(0.01)
 
         except Exception as loop_err:
             print(f"[GNSS] Exception in serial reader loop: {loop_err}")
@@ -695,7 +698,8 @@ def _serial_thread() -> None:
                 except Exception:
                     pass
             _reset_state_to_disconnected()
-            _stop_event.wait(RECONNECT_DELAY)
+            if not _stop_event.is_set():
+                _stop_event.wait(RECONNECT_DELAY)
 
 
 # ---------------------------------------------------------------------------
