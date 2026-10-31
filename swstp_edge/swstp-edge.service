@@ -1,8 +1,7 @@
- [Unit]
+[Unit]
 Description=SWSTP Edge Gateway — Motion Detection & Telemetry (Raspberry Pi)
 Documentation=https://github.com/your-org/swstp_edge
-After=network-online.target time-sync.target
-Wants=network-online.target
+After=local-fs.target
 
 [Service]
 # ── Identity ────────────────────────────────────────────────────────────────

@@ -272,6 +272,7 @@ identical** to what the original `webcam_motion_detect.py` produced:
 |----------|--------|-------|
 | `/api/camera/{deviceId}/frame` | POST | JPEG, `Content-Type: image/jpeg` |
 | `/api/telemetry/ingest-batch`  | POST | JSON batch, same field names/units |
+| `/api/{vehicle_id}/live_location` | POST | Live raw un-snapped GNSS location coordinates stream |
 | `/api/evidence/upload`         | POST | multipart/form-data, same metadata fields |
 
 ---

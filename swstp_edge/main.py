@@ -76,7 +76,7 @@ import sensors.imu  as imu_sensor
 import sensors.gnss as gnss_sensor
 import sensors.leds as leds
 import sensors.power as power_sensor
-from sensors.rtc_sync import periodic_sync_loop
+from sensors.rtc_sync import periodic_sync_loop, start_background_sync
 
 import telemetry as _telemetry
 from telemetry import (
@@ -104,7 +104,7 @@ from litter_engine import LitterEngine, cleanup_old_litter_captures
 
 from network.uploader import (
     auto_detect_backend_url, sync_backend_metadata, ensure_hardware_session,
-    live_frame_streamer, telemetry_streamer, evidence_upload_worker,
+    live_frame_streamer, telemetry_streamer, raw_gnss_streamer, evidence_upload_worker,
     dynamic_session_info,
 )
 from stop_detector import VehicleStopDetector
@@ -194,6 +194,10 @@ def build_parser() -> argparse.ArgumentParser:
                         help="SWSTP Backend URL")
     parser.add_argument("--device-id", default=None,
                         help="Hardware Device Code (overrides device_config.json)")
+    parser.add_argument("--vehicle-id", default=None,
+                        help="Vehicle ID for live raw GNSS streaming (default: loaded from device_config.json or device_id)")
+    parser.add_argument("--gnss-stream-rate", type=float, default=1.0,
+                        help="Live raw GNSS streaming rate in Hz to /api/{vehicle_id}/live_location (default: 1.0 Hz)")
     parser.add_argument("--ulb-id", default=DEFAULT_ULB_ID,
                         help="ULB ID")
     parser.add_argument("--session-id", type=int, default=0,
@@ -241,10 +245,14 @@ def main() -> None:
     parser = build_parser()
     args, _ = parser.parse_known_args()
 
-    # ── Resolve device identity ──────────────────────────────────────────
+    # ── Resolve device & vehicle identity ────────────────────────────────
     device_id = (args.device_id or _cfg.load_device_id()).strip()
     if not device_id or device_id in ("", "UNPROVISIONED", "UNASSIGNED"):
         print("[INIT] WARNING: Device ID not set. Edit device_config.json to provision.")
+
+    vehicle_id = (args.vehicle_id or getattr(_cfg, "load_vehicle_id", lambda: device_id)()).strip()
+    if not vehicle_id:
+        vehicle_id = device_id
 
     effective_ulb_id = args.ulb_id if (args.ulb_id and args.ulb_id != "AUTO") else DEFAULT_ULB_ID
     enable_fallback  = False  # IP location fallback removed; MAX-M10S hardware GNSS only
@@ -252,19 +260,25 @@ def main() -> None:
     os.makedirs(args.save_dir, exist_ok=True)
     os.makedirs(LITTER_CAPTURES_DIR, exist_ok=True)
 
-    # ── Backend discovery (fast <= 1.2s) ─────────────────────────────────
-    effective_backend_url = auto_detect_backend_url(args.backend_url)
+    # ── Backend configuration (zero blocking on startup) ─────────────────
+    effective_backend_url = args.backend_url or DEFAULT_BACKEND_URL
     effective_session_id = args.session_id
     dynamic_session_info["deviceId"]   = device_id
+    dynamic_session_info["vehicleId"]  = vehicle_id
     dynamic_session_info["backendUrl"] = effective_backend_url
     dynamic_session_info["ulbId"]      = effective_ulb_id
     latest_sensor["deviceId"]          = device_id
+    latest_sensor["vehicleId"]         = vehicle_id
 
     # ── Non-blocking asynchronous backend metadata sync & session bind ───
     # Runs in a background daemon thread so camera & sensors start instantly (<1s)
     def _async_backend_startup_init():
-        nonlocal effective_session_id
+        nonlocal effective_session_id, effective_backend_url
         try:
+            detected_url = auto_detect_backend_url(effective_backend_url)
+            if detected_url and detected_url != effective_backend_url:
+                effective_backend_url = detected_url
+                dynamic_session_info["backendUrl"] = detected_url
             sync_backend_metadata(effective_backend_url, effective_ulb_id)
             if device_id and device_id not in ("UNPROVISIONED", "UNASSIGNED"):
                 sid = ensure_hardware_session(effective_backend_url, device_id)
@@ -287,6 +301,8 @@ def main() -> None:
     rtc_ok  = rtc_sensor.init()
     imu_ok  = imu_sensor.init()
     target_gnss_p = args.port or args.gnss_port
+    if target_gnss_p and target_gnss_p.startswith("/dev") and not os.path.exists(target_gnss_p):
+        target_gnss_p = None  # Fall back to auto-detect candidate ports (USB/UART/COM)
     target_gnss_b = args.baud or args.gnss_baud
     gnss_ok = gnss_sensor.init(port=target_gnss_p, baud=target_gnss_b)
 
@@ -297,20 +313,17 @@ def main() -> None:
     except Exception as exc:
         print(f"[LEDS] init skipped: {exc}")
 
-    # ── Periodic RTC re-sync thread ──────────────────────────────────────
+    # ── Asynchronous RTC Internet Calibration & Recalibration Thread ────
     resync_interval = getattr(_cfg, "RTC_RESYNC_INTERVAL_HOURS", 1.0)
-    t_rtc_resync = threading.Thread(
-        target=periodic_sync_loop,
-        args=(resync_interval,),
-        daemon=True, name="rtc-resync",
-    )
-    t_rtc_resync.start()
+    t_rtc_resync = start_background_sync(interval_hours=resync_interval)
 
     tz_name = getattr(_cfg, "load_timezone", lambda: "Asia/Kolkata")()
     print("\n========================================================")
     print(" SWSTP UNIFIED EDGE GATEWAY INITIALIZING (Raspberry Pi 4B)")
     print(f" Backend:          {effective_backend_url}")
     print(f" Device ID:        {device_id}")
+    print(f" Vehicle ID:       {vehicle_id}")
+    print(f" Raw GNSS Stream:  POST {effective_backend_url.rstrip('/')}/api/{vehicle_id}/live_location @ {args.gnss_stream_rate:.1f}Hz")
     print(f" ULB ID:           {effective_ulb_id}")
     print(f" Session ID:       {effective_session_id if effective_session_id else 'DYNAMIC HARDWARE BIND'}")
     print(f" Timezone:         {tz_name} (IST, UTC+05:30)")
@@ -437,6 +450,13 @@ def main() -> None:
         daemon=True, name="telemetry-http",
     )
     t_telemetry_http.start()
+
+    t_raw_gnss = threading.Thread(
+        target=raw_gnss_streamer,
+        args=(effective_backend_url, vehicle_id, stop_event, args.gnss_stream_rate),
+        daemon=True, name="raw-gnss-streamer",
+    )
+    t_raw_gnss.start()
 
     t_evidence = threading.Thread(
         target=evidence_upload_worker,

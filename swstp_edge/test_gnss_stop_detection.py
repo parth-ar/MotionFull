@@ -1,61 +1,57 @@
 #!/usr/bin/env python3
 """
-test_gnss_stop_detection.py — Standalone GNSS & IMU Stop Detection Test Harness.
+test_gnss_stop_detection.py — Hardware-in-the-Loop & Diagnostic Test Harness
+for Vehicle Stop Detection with u-blox MAX-M10S / NEO-6M GNSS and Arduino IMU.
 
-OVERVIEW:
----------
-A completely self-contained test file for vehicle stop detection.
-Designed to be run independently with ZERO external module requirements:
-  - Does NOT import config.py, stop_detector.py, sensors.gnss, telemetry.py, main.py, cv2, torch, etc.
-  - Requires only Python 3.8+ standard library (pyserial is strictly optional for COM port mode).
-  - Keeps all other repository files completely untouched.
+Designed for standalone testing on a laptop with an Arduino Uno R3 running both
+a u-blox MAX-M10S GNSS module and an MPU-6050 (or MPU-6500) 6-axis IMU over a
+single USB COM port (or separate ports / Wi-Fi TCP streams / simulation).
 
-KEY CAPABILITIES:
------------------
-1. HEAVY GNSS LOGIC WITH OPTIONAL IMU FUSION:
-   - Primary driver: GNSS speed, coordinates, fix status, and stationary drift tracking.
-   - IMU contribution: Supports real hardware IMU (if present) OR built-in Synthetic IMU
-     (to test fused GNSS + IMU cross-validation without physical hardware on hand).
-   - Seamless GNSS-only fallback when IMU is not connected.
-2. STANDALONE STOP DETECTOR STATE MACHINE:
-   - Rest detection with configurable threshold (< 3.0 km/h) and debouncing (1.0s).
-   - Continuous stop timer tracking (no idle camera timeout).
-   - Real-time GPS stationary drift measurement (distance in meters from stop origin).
-   - Motion resume detection with speed gate (> 5.0 km/h) and debouncing (0.6s).
-   - Frame capture logging during active stops with timestamps and offsets.
-   - Multi-line comprehensive stop summary reports upon resuming motion.
-3. MULTIPLE TESTING MODES:
-   - 'sim'     : Automated simulation running realistic driving, deceleration, stop, drift,
-                 camera capture, transient noise spikes, and acceleration.
-   - 'tcp'     : Connect to TCP NMEA stream over network.
-   - 'udp'     : Listen for UDP NMEA broadcasts.
-   - 'serial'  : Read from physical GPS USB / COM port (if pyserial installed).
-   - 'manual'  : Interactive terminal to type speeds and inject events in real time.
-   - 'file'    : Replay a recorded NMEA text file or log.
+==============================================================================
+HARDWARE SETUP ON LAPTOP (Arduino Uno R3 + MAX-M10S + MPU-6050):
+==============================================================================
+  1. Arduino Uno R3 connects to Laptop via USB (e.g. COM3, COM4, /dev/ttyUSB0).
+  2. MPU-6050 IMU connects to Arduino I2C:
+       - SDA -> Pin A4 (or dedicated SDA pin)
+       - SCL -> Pin A5 (or dedicated SCL pin)
+       - VCC -> 5V / 3.3V, GND -> GND
+  3. u-blox MAX-M10S GNSS connects to Arduino SoftwareSerial (or UART):
+       - GNSS TXD -> Arduino Pin D8 (or D2 / RX)
+       - GNSS RXD -> Arduino Pin D9 (or D3 / TX)
+       - VCC      -> 3.3V or 5V, GND -> GND
+  4. Arduino Uno sends data over USB to laptop in one of the following formats:
+       Format A (Recommended — Multiplexed Stream):
+         Arduino outputs raw NMEA sentences from MAX-M10S ($GNRMC, $GNGGA, $GNVTG)
+         interleaved with IMU lines:
+           AX:0.12,AY:-0.04,AZ:9.83,GX:0.21,GY:-0.13,GZ:0.05
+           or: IMU: 0.12,-0.04,9.83,0.21,-0.13,0.05
+           or: $PIMU,0.12,-0.04,9.83,0.21,-0.13,0.05*2A
+       Format B (Combined Telemetry Line):
+         DATA: 20.932000, 77.752300, 15.4, 1, 0.12, -0.04, 9.83, 0.21, -0.13, 0.05
+         or JSON: {"lat": 20.932, "lon": 77.7523, "speed": 15.4, "fix": true, "ax": 0.12, ...}
+       Format C (Pure GNSS NMEA):
+         Arduino acts as transparent serial passthrough for MAX-M10S ($GN*).
 
+==============================================================================
 USAGE EXAMPLES:
----------------
-  # 1. Run automated simulation (instant, no hardware needed):
+==============================================================================
+  # Auto-detect Arduino Uno R3 (GNSS + IMU) on laptop and run:
+  python test_gnss_stop_detection.py --mode arduino
+
+  # Explicit COM port and baud rate:
+  python test_gnss_stop_detection.py --mode arduino --serial-port COM3 --baud 115200
+
+  # Run automated simulation (no hardware needed):
   python test_gnss_stop_detection.py --mode sim
 
-  # 2. Run simulation with synthetic IMU enabled (testing dual fusion):
-  python test_gnss_stop_detection.py --mode sim --imu synthetic
-
-  # 3. Connect to live TCP NMEA stream:
-  python test_gnss_stop_detection.py --mode tcp --host 127.0.0.1 --port 10110
-
-  # 4. Interactive manual testing (type speeds live):
-
-
-  # 5. Replay recorded NMEA file:
-  python test_gnss_stop_detection.py --mode file --file my_drive.nmea
+  # Connect to TCP NMEA stream (e.g. mobile phone GPS):
+  python test_gnss_stop_detection.py --mode tcp --host 10.208.43.190 --port 10110
 """
 
 from __future__ import annotations
 
 import argparse
 import collections
-import concurrent.futures
 import dataclasses
 import datetime
 import math
@@ -63,11 +59,10 @@ import os
 import random
 import re
 import socket
-import struct
-import subprocess
 import sys
 import threading
 import time
+import json
 from typing import Any, Dict, List, Optional, Tuple
 
 # Optional dependency: pyserial for COM port access
@@ -88,15 +83,15 @@ if hasattr(sys.stdout, "reconfigure"):
 
 
 # ============================================================================
-# TUNABLE PARAMETERS — Adjust these to calibrate stop detection
+# TUNABLE PARAMETERS — Aligned with swstp_edge/config.py
 # ============================================================================
-# Speed thresholds in km/h
-REST_SPEED_THRESHOLD_KMH: float = 3.0     # Speed below which vehicle is a rest candidate
+# Single symmetric speed threshold in km/h: < 5.0 km/h = candidate rest, > 5.0 km/h = motion
+REST_SPEED_THRESHOLD_KMH: float = 5.0     # Speed below which vehicle is a rest candidate
 STOP_SPEED_GATE: float          = 5.0     # Speed above which vehicle is in motion
 
 # Debounce durations in seconds
-REST_DEBOUNCE_SEC: float        = 2.0     # Sustained rest required to confirm STOPPED state
-MOTION_DEBOUNCE_SEC: float      = 2.0     # Sustained motion required to confirm MOVING state
+REST_DEBOUNCE_SEC: float        = 1.0     # Sustained rest required to confirm STOPPED state (config.py: 1.0s)
+MOTION_DEBOUNCE_SEC: float      = 0.6     # Sustained motion required to confirm MOVING state (config.py: 0.6s)
 
 # IMU tolerances (used when IMU is connected or synthetic IMU is enabled)
 IMU_REST_ACCEL_TOLERANCE: float = 0.45    # m/s² max dynamic acceleration deviation (|a| - 9.80665)
@@ -242,7 +237,7 @@ class VehicleStopDetector:
 
     Logic:
       1. REST DETECTION:
-         - GNSS speed < REST_SPEED_THRESHOLD_KMH (default 3.0 km/h).
+         - GNSS speed < REST_SPEED_THRESHOLD_KMH (default 5.0 km/h).
          - If IMU is present: cross-validate that dynamic acceleration < IMU_REST_ACCEL_TOLERANCE
            and gyro rate < IMU_REST_GYRO_TOLERANCE.
          - If IMU is not present (or disabled): GNSS speed is the sole rest detector.
@@ -369,16 +364,11 @@ class VehicleStopDetector:
             )
 
         # Fused / Fallback Decision
-        # GNSS speed is the authoritative gate — IMU agreement/disagreement only
+        # GNSS speed is the authoritative gate — IMU agreement/disagreement
         # controls adaptive debounce in update(), never blocks detection outright.
-        # This matches the production stop_detector.py fusion strategy.
         if effective_gps_valid:
             is_rest_candidate   = gnss_at_rest
             is_motion_candidate = gnss_in_motion
-            # imu_rest_agreement:
-            #   True  = IMU also at rest       → fast debounce (0.6×)
-            #   False = IMU shows activity     → extended debounce (1.5×)
-            #   None  = IMU unavailable        → normal debounce (1.0×)
             imu_rest_agreement   = imu_at_rest   if imu_valid else None
             imu_motion_agreement = imu_in_motion if imu_valid else None
         elif imu_valid:
@@ -395,20 +385,20 @@ class VehicleStopDetector:
             imu_motion_agreement = None
 
         metrics = {
-            "raw_speed_kmh":       raw_speed,
-            "eff_speed_kmh":       eff_speed,
-            "gps_valid":           gps_valid,
-            "imu_valid":           imu_valid,
-            "dyn_accel":           round(dyn_accel, 4),
-            "gyro_mag":            round(gyro_mag, 4),
-            "gnss_at_rest":        gnss_at_rest,
-            "gnss_in_motion":      gnss_in_motion,
-            "imu_at_rest":         imu_at_rest,
-            "imu_in_motion":       imu_in_motion,
-            "imu_rest_agreement":  imu_rest_agreement,
+            "raw_speed_kmh":        raw_speed,
+            "eff_speed_kmh":        eff_speed,
+            "gps_valid":            gps_valid,
+            "imu_valid":            imu_valid,
+            "dyn_accel":            round(dyn_accel, 4),
+            "gyro_mag":             round(gyro_mag, 4),
+            "gnss_at_rest":         gnss_at_rest,
+            "gnss_in_motion":       gnss_in_motion,
+            "imu_at_rest":          imu_at_rest,
+            "imu_in_motion":        imu_in_motion,
+            "imu_rest_agreement":   imu_rest_agreement,
             "imu_motion_agreement": imu_motion_agreement,
-            "is_rest_candidate":   is_rest_candidate,
-            "is_motion_candidate": is_motion_candidate,
+            "is_rest_candidate":    is_rest_candidate,
+            "is_motion_candidate":  is_motion_candidate,
         }
         return is_rest_candidate, is_motion_candidate, metrics
 
@@ -450,94 +440,63 @@ class VehicleStopDetector:
                     self._rest_candidate_lat = latitude
                     self._rest_candidate_lon = longitude
 
-                # Adaptive debounce: IMU agreement shortens / extends the window
-                #   Both GNSS + IMU at rest  → 0.6× base (fast confirm)
-                #   GNSS stopped, IMU active → 1.5× base (tolerant — engine vibration)
-                #   IMU unavailable          → 1.0× base (normal GNSS-only)
-                imu_agree = metrics.get("imu_rest_agreement")
-                if imu_agree is True:
-                    eff_debounce = self.rest_debounce_sec * 0.6
-                    agree_label  = "GNSS+IMU agree → fast confirm"
-                elif imu_agree is False:
-                    eff_debounce = self.rest_debounce_sec * 1.5
-                    agree_label  = "GNSS stop, IMU active → extended confirm"
-                else:
-                    eff_debounce = self.rest_debounce_sec
-                    agree_label  = "GNSS-only (IMU unavailable)"
+                # Adaptive debounce based on IMU agreement
+                effective_rest_debounce = self.rest_debounce_sec
+                if metrics["imu_rest_agreement"] is True:
+                    effective_rest_debounce *= 0.6   # Accelerated confirmation when IMU agrees
+                elif metrics["imu_rest_agreement"] is False:
+                    effective_rest_debounce *= 1.5   # Extra debounce if IMU indicates vibration/movement
 
-                if (now_mono - self._rest_candidate_start) >= eff_debounce:
-                    confirm_elapsed = round(now_mono - self._rest_candidate_start, 1)
-
-                    # Backdate stop start to when rest condition FIRST started (start of debounce)
-                    cand_start_mono = self._rest_candidate_start
-                    cand_start_rtc  = self._rest_candidate_rtc or rtc_str
-                    cand_start_lat  = self._rest_candidate_lat if self._rest_candidate_lat is not None else latitude
-                    cand_start_lon  = self._rest_candidate_lon if self._rest_candidate_lon is not None else longitude
-
-                    # Vehicle confirmed at rest -> Enter STOPPED state
+                elapsed_cand = now_mono - self._rest_candidate_start
+                if elapsed_cand >= effective_rest_debounce:
+                    # Transition to STOPPED
                     self.state = "STOPPED"
-                    self._rest_candidate_start = None
-                    self._rest_candidate_rtc   = None
-                    self._rest_candidate_lat   = None
-                    self._rest_candidate_lon   = None
-                    self._motion_candidate_start = None
                     self._current_stop_id += 1
-
-                    initial_duration = max(0.0, now_mono - cand_start_mono)
-                    self.active_stop = StopEventRecord(
-                        stop_id=self._current_stop_id,
-                        start_mono=cand_start_mono,
-                        start_rtc=cand_start_rtc,
-                        start_lat=cand_start_lat,
-                        start_lon=cand_start_lon,
-                        duration_sec=initial_duration,
-                    )
                     event_just_started = True
 
-                    # Initial drift from origin (from candidate start coordinate)
-                    if (
-                        latitude is not None and longitude is not None
-                        and cand_start_lat is not None and cand_start_lon is not None
-                    ):
-                        drift_from_origin_m = haversine_distance_m(
-                            cand_start_lat, cand_start_lon,
-                            latitude, longitude
-                        )
-                        self.active_stop.max_drift_m = drift_from_origin_m
-
-                    print("\n" + "=" * 70)
-                    print(f"[VEHICLE REST DETECTED] Stop #{self._current_stop_id} Started")
-                    print("-" * 70)
-                    print(f"  Start Time (RTC): {cand_start_rtc} (confirmed at {rtc_str})")
-                    if cand_start_lat is not None and cand_start_lon is not None:
-                        print(f"  Start Location:  ({cand_start_lat:.8f}, {cand_start_lon:.8f})")
-                    print(
-                        f"  GNSS Speed:      {metrics['eff_speed_kmh']:.1f} km/h "
-                        f"(Rest Threshold: < {self.rest_speed_threshold:.1f} km/h)"
+                    self.active_stop = StopEventRecord(
+                        stop_id=self._current_stop_id,
+                        start_mono=self._rest_candidate_start,
+                        start_rtc=self._rest_candidate_rtc or rtc_str,
+                        start_lat=self._rest_candidate_lat if self._rest_candidate_lat is not None else latitude,
+                        start_lon=self._rest_candidate_lon if self._rest_candidate_lon is not None else longitude,
                     )
-                    if metrics["imu_valid"]:
-                        imu_state = "Stationary" if metrics["imu_at_rest"] else "Active (vibration)"
-                        print(
-                            f"  IMU Status:      {imu_state} "
-                            f"(dyn_accel: {metrics['dyn_accel']:.3f} m/s2, gyro: {metrics['gyro_mag']:.2f} deg/s)"
-                        )
-                    else:
-                        print("  IMU Status:      Not Active (GNSS-only mode)")
-                    print(f"  Sensor Fusion:   {agree_label} (debounce: {eff_debounce:.1f}s, confirmed in {confirm_elapsed:.1f}s)")
-                    print(f"  Stop Timer:      Running ({format_duration(initial_duration)} elapsed since rest began). Monitoring for captures & motion resume...")
-                    print("=" * 70 + "\n")
+                    self._rest_candidate_start = None
+                    self._rest_candidate_rtc = None
+                    self._rest_candidate_lat = None
+                    self._rest_candidate_lon = None
+                    self._motion_candidate_start = None
+
+                    fusion_note = (
+                        "Dual GNSS+IMU rest confirmed"
+                        if metrics["imu_rest_agreement"] is True
+                        else "GNSS-only (IMU unavailable)"
+                        if not metrics["imu_valid"]
+                        else "GNSS rest override"
+                    )
+                    dur_str = format_duration(self.get_stop_duration(now_mono))
+                    imu_stat_str = ('At Rest (|a|=' + str(metrics['dyn_accel']) + ')') if metrics['imu_at_rest'] else 'Active/Vibrating' if metrics['imu_valid'] else 'Not Active (GNSS-only mode)'
+                    print(
+                        f"\n{'=' * 70}\n"
+                        f"[VEHICLE REST DETECTED] Stop #{self.active_stop.stop_id} Started\n"
+                        f"{'-' * 70}\n"
+                        f"  Start Time (RTC): {self.active_stop.start_rtc} (confirmed at {rtc_str})\n"
+                        f"  Start Location:  ({self.active_stop.start_lat or 0.0:.8f}, {self.active_stop.start_lon or 0.0:.8f})\n"
+                        f"  GNSS Speed:      {metrics['raw_speed_kmh']:.1f} km/h (Rest Threshold: < {self.rest_speed_threshold:.1f} km/h)\n"
+                        f"  IMU Status:      {imu_stat_str}\n"
+                        f"  Sensor Fusion:   {fusion_note} (debounce: {self.rest_debounce_sec:.1f}s, confirmed in {elapsed_cand:.1f}s)\n"
+                        f"  Stop Timer:      Running ({dur_str} elapsed since rest began). Monitoring for captures & motion resume...\n"
+                        f"{'=' * 70}\n"
+                    )
             else:
                 self._rest_candidate_start = None
-                self._rest_candidate_rtc   = None
-                self._rest_candidate_lat   = None
-                self._rest_candidate_lon   = None
+                self._rest_candidate_rtc = None
+                self._rest_candidate_lat = None
+                self._rest_candidate_lon = None
 
         elif self.state == "STOPPED":
             if self.active_stop is not None:
-                # Update continuous duration
-                self.active_stop.duration_sec = max(0.0, now_mono - self.active_stop.start_mono)
-
-                # Compute drift from stop origin
+                # Track drift from initial stop location
                 if (
                     latitude is not None and longitude is not None
                     and self.active_stop.start_lat is not None
@@ -550,33 +509,23 @@ class VehicleStopDetector:
                     if drift_from_origin_m > self.active_stop.max_drift_m:
                         self.active_stop.max_drift_m = drift_from_origin_m
 
-            # Check for vehicle resuming motion
-            if is_motion_cand:
-                if self._motion_candidate_start is None:
-                    self._motion_candidate_start = now_mono
+                # Motion resume candidate evaluation
+                if is_motion_cand:
+                    if self._motion_candidate_start is None:
+                        self._motion_candidate_start = now_mono
 
-                # Adaptive debounce for motion resume
-                imu_agree_m = metrics.get("imu_motion_agreement")
-                if imu_agree_m is True:
-                    eff_motion_debounce = self.motion_debounce_sec * 0.5
-                    m_agree_label       = "GNSS+IMU agree → fast confirm"
-                elif imu_agree_m is False:
-                    eff_motion_debounce = self.motion_debounce_sec * 1.2
-                    m_agree_label       = "GNSS motion, IMU quiet → extended confirm"
-                else:
-                    eff_motion_debounce = self.motion_debounce_sec
-                    m_agree_label       = "GNSS-only (IMU unavailable)"
+                    effective_motion_debounce = self.motion_debounce_sec
+                    if metrics["imu_motion_agreement"] is True:
+                        effective_motion_debounce *= 0.6  # Rapid exit when IMU confirms vehicle acceleration
+                    elif metrics["imu_motion_agreement"] is False:
+                        effective_motion_debounce *= 1.4  # Ignore transient GPS speed glitch if IMU is still stationary
 
-                if (now_mono - self._motion_candidate_start) >= eff_motion_debounce:
-                    # Vehicle confirmed back in motion -> Conclude STOPPED state
-                    self.state = "MOVING"
-                    self._motion_candidate_start = None
-                    self._rest_candidate_start = None
-                    self._rest_candidate_rtc   = None
-                    self._rest_candidate_lat   = None
-                    self._rest_candidate_lon   = None
+                    elapsed_motion = now_mono - self._motion_candidate_start
+                    if elapsed_motion >= effective_motion_debounce:
+                        # Confirm motion resume
+                        self.state = "MOVING"
+                        event_just_ended = True
 
-                    if self.active_stop is not None:
                         self.active_stop.end_mono = now_mono
                         self.active_stop.end_rtc = rtc_str
                         self.active_stop.end_lat = latitude
@@ -584,147 +533,287 @@ class VehicleStopDetector:
                         self.active_stop.duration_sec = max(
                             0.0, now_mono - self.active_stop.start_mono
                         )
-                        self.active_stop.trigger_speed_kmh = metrics["eff_speed_kmh"]
+                        self.active_stop.trigger_speed_kmh = metrics["raw_speed_kmh"]
 
-                        if metrics["imu_valid"]:
-                            imu_info = (
-                                f" | {m_agree_label} "
-                                f"[dyn_accel: {metrics['dyn_accel']:.2f} m/s2, gyro: {metrics['gyro_mag']:.1f} deg/s]"
-                            )
-                        else:
-                            imu_info = " | GNSS speed confirmed (IMU inactive)"
-
+                        fusion_reason = (
+                            "GNSS speed + IMU motion confirmed"
+                            if metrics["imu_motion_agreement"] is True
+                            else "GNSS speed confirmed (IMU inactive)"
+                            if not metrics["imu_valid"]
+                            else "GNSS speed override"
+                        )
                         self.active_stop.end_reason = (
-                            f"Vehicle back in motion (Speed: {metrics['eff_speed_kmh']:.1f} km/h > "
-                            f"{self.stop_speed_gate:.1f} km/h{imu_info})"
+                            f"Vehicle back in motion (Speed: {metrics['raw_speed_kmh']:.1f} km/h > {self.stop_speed_gate:.1f} km/h | {fusion_reason})"
                         )
 
-                        # Output comprehensive summary report
+                        self.history.append(self.active_stop)
+                        self._last_completed_event = self.active_stop
                         print("\n" + self.active_stop.format_summary() + "\n")
 
-                        self._last_completed_event = self.active_stop
-                        self.history.append(self.active_stop)
                         self.active_stop = None
-                        event_just_ended = True
-            else:
-                self._motion_candidate_start = None
+                        self._motion_candidate_start = None
+                        self._rest_candidate_start = None
+                else:
+                    self._motion_candidate_start = None
 
-        # Debounce progress calculations for status display
+        # Calculate progress for display
         rest_debounce_progress = 0.0
-        if self.state == "MOVING" and self._rest_candidate_start is not None:
+        if self._rest_candidate_start is not None and self.state == "MOVING":
             rest_debounce_progress = min(
-                1.0, (now_mono - self._rest_candidate_start) / max(0.001, self.rest_debounce_sec)
+                1.0, (now_mono - self._rest_candidate_start) / max(0.01, self.rest_debounce_sec)
             )
 
         motion_debounce_progress = 0.0
-        if self.state == "STOPPED" and self._motion_candidate_start is not None:
+        if self._motion_candidate_start is not None and self.state == "STOPPED":
             motion_debounce_progress = min(
-                1.0, (now_mono - self._motion_candidate_start) / max(0.001, self.motion_debounce_sec)
+                1.0, (now_mono - self._motion_candidate_start) / max(0.01, self.motion_debounce_sec)
             )
-
-        current_duration = self.active_stop.duration_sec if self.active_stop else 0.0
-        current_captures = len(self.active_stop.captures) if self.active_stop else 0
-        current_id = self.active_stop.stop_id if self.active_stop else (
-            self._current_stop_id if self.state == "STOPPED" else 0
-        )
 
         return {
             "state": self.state,
             "is_stopped": self.is_stopped,
-            "duration_sec": current_duration,
-            "duration_formatted": format_duration(current_duration),
-            "stop_event_id": current_id,
-            "capture_count": current_captures,
-            "drift_from_origin_m": round(drift_from_origin_m, 2),
-            "max_drift_m": round(self.active_stop.max_drift_m, 2) if self.active_stop else 0.0,
+            "duration_sec": self.get_stop_duration(now_mono),
+            "duration_formatted": format_duration(self.get_stop_duration(now_mono)),
+            "active_stop_id": self.active_stop.stop_id if self.active_stop else None,
             "event_just_started": event_just_started,
             "event_just_ended": event_just_ended,
-            "last_completed_event": self._last_completed_event,
-            "active_stop": self.active_stop,
+            "drift_from_origin_m": round(drift_from_origin_m, 2),
             "rest_debounce_progress": rest_debounce_progress,
             "motion_debounce_progress": motion_debounce_progress,
+            "capture_count": len(self.active_stop.captures) if self.active_stop else 0,
             "metrics": metrics,
         }
 
     def record_capture(
         self,
-        meta: Optional[Dict[str, Any]] = None,
+        frame_metadata: Dict[str, Any],
         now_mono: Optional[float] = None,
     ) -> Optional[StopCaptureItem]:
-        """Registers a motion capture item during an active stop."""
-        if self.state != "STOPPED" or self.active_stop is None:
-            print("[CAPTURE IGNORED] Cannot record capture while vehicle is MOVING.")
+        """Logs a camera motion frame capture associated with the current stop."""
+        if not self.is_stopped or self.active_stop is None:
             return None
 
         if now_mono is None:
             now_mono = time.monotonic()
-        if meta is None:
-            meta = {}
 
-        offset = max(0.0, now_mono - self.active_stop.start_mono)
-        stop_frame_idx = len(self.active_stop.captures) + 1
-        filename = meta.get("filename") or f"motion_frame_stop{self.active_stop.stop_id:03d}_{stop_frame_idx:02d}.jpg"
-        rtc_ts = meta.get("rtc_timestamp") or datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        offset_sec = max(0.0, now_mono - self.active_stop.start_mono)
+        frame_idx = len(self.active_stop.captures) + 1
 
         item = StopCaptureItem(
-            capture_seq=meta.get("capture_seq", stop_frame_idx),
-            stop_frame_idx=stop_frame_idx,
-            filename=filename,
-            local_path=meta.get("local_path", f"./captures/{filename}"),
-            rtc_timestamp=rtc_ts,
-            stop_offset_sec=offset,
-            latitude=meta.get("latitude"),
-            longitude=meta.get("longitude"),
+            capture_seq=int(frame_metadata.get("capture_seq", frame_idx)),
+            stop_frame_idx=frame_idx,
+            filename=str(frame_metadata.get("filename", f"frame_{frame_idx}.jpg")),
+            local_path=str(frame_metadata.get("local_path", "")),
+            rtc_timestamp=str(
+                frame_metadata.get(
+                    "rtc_timestamp",
+                    datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                )
+            ),
+            stop_offset_sec=offset_sec,
+            latitude=frame_metadata.get("latitude"),
+            longitude=frame_metadata.get("longitude"),
         )
         self.active_stop.captures.append(item)
-
         print(
-            f"[STOP #{self.active_stop.stop_id} | CAPTURE #{stop_frame_idx}] "
-            f"Logged frame '{item.filename}' @ +{offset:.1f}s into stop "
-            f"(Total captures in this stop: {stop_frame_idx})"
+            f"[STOP #{self.active_stop.stop_id} | CAPTURE #{frame_idx}] "
+            f"Logged frame '{item.filename}' @ +{offset_sec:.1f}s into stop "
+            f"(Total captures in this stop: {len(self.active_stop.captures)})"
         )
         return item
-
-    def get_active_stop(self) -> Optional[StopEventRecord]:
-        return self.active_stop
 
     def get_history(self) -> List[StopEventRecord]:
         return list(self.history)
 
 
 # ============================================================================
-# Arduino IMU Reader — Real hardware via serial port (background thread)
+# Arduino IMU & Custom Telemetry Parsers
 # ============================================================================
+_LABELED_IMU_RE = re.compile(
+    r"[Aa][cC]?[Xx]\s*[=:]\s*([\-\d\.]+).*?"
+    r"[Aa][cC]?[Yy]\s*[=:]\s*([\-\d\.]+).*?"
+    r"[Aa][cC]?[Zz]\s*[=:]\s*([\-\d\.]+).*?"
+    r"[Gg][yY]?[Xx]\s*[=:]\s*([\-\d\.]+).*?"
+    r"[Gg][yY]?[Yy]\s*[=:]\s*([\-\d\.]+).*?"
+    r"[Gg][yY]?[Zz]\s*[=:]\s*([\-\d\.]+)"
+)
+
+def parse_imu_line(line: str) -> Optional[Dict[str, Any]]:
+    """
+    Parses a raw serial line containing IMU measurements.
+    Supports labeled format (AX:..., AY:..., AZ:..., GX:..., GY:..., GZ:...),
+    key-value format, bare 6-float CSV, and $PIMU sentences.
+    Automatically auto-scales from 'g' to m/s² if magnitude ~ 1.0.
+    """
+    if not line:
+        return None
+    line = line.strip()
+
+    # Proprietary NMEA IMU format ($PIMU,ax,ay,az,gx,gy,gz*hh)
+    if line.startswith("$PIMU") or line.startswith("$IMU") or line.startswith("PIMU,") or line.startswith("IMU,"):
+        parts = line.split("*")[0].split(",")
+        if len(parts) >= 7:
+            line = ",".join(parts[1:])
+    elif line.upper().startswith("IMU:"):
+        line = line[4:].strip()
+
+    # Labeled format (AX:0.12, AY:-0.04, ...)
+    m = _LABELED_IMU_RE.search(line)
+    if m:
+        try:
+            ax, ay, az = float(m.group(1)), float(m.group(2)), float(m.group(3))
+            gx, gy, gz = float(m.group(4)), float(m.group(5)), float(m.group(6))
+            accel_mag = math.sqrt(ax * ax + ay * ay + az * az)
+            # Auto-scale if reported in g units (0.5g to 1.5g)
+            if 0.5 <= accel_mag <= 1.5:
+                ax *= 9.80665
+                ay *= 9.80665
+                az *= 9.80665
+                accel_mag *= 9.80665
+            return {
+                "valid": True,
+                "accel_magnitude_ms2": round(accel_mag, 4),
+                "gyro_dps": {
+                    "x": round(gx, 3),
+                    "y": round(gy, 3),
+                    "z": round(gz, 3),
+                },
+                "raw": {"ax": round(ax, 4), "ay": round(ay, 4), "az": round(az, 4)},
+                "source": "arduino",
+            }
+        except (ValueError, TypeError):
+            pass
+
+    # Bare CSV or whitespace separated (6 floats)
+    clean = line.replace("	", ",").replace(";", ",")
+    parts = [p.strip() for p in clean.split(",") if p.strip()] if "," in clean else line.split()
+    if len(parts) == 6:
+        try:
+            vals = [float(p) for p in parts]
+            ax, ay, az, gx, gy, gz = vals
+            accel_mag = math.sqrt(ax * ax + ay * ay + az * az)
+            if 0.5 <= accel_mag <= 1.5:
+                ax *= 9.80665
+                ay *= 9.80665
+                az *= 9.80665
+                accel_mag *= 9.80665
+            return {
+                "valid": True,
+                "accel_magnitude_ms2": round(accel_mag, 4),
+                "gyro_dps": {
+                    "x": round(gx, 3),
+                    "y": round(gy, 3),
+                    "z": round(gz, 3),
+                },
+                "raw": {"ax": round(ax, 4), "ay": round(ay, 4), "az": round(az, 4)},
+                "source": "arduino",
+            }
+        except (ValueError, TypeError):
+            pass
+
+    return None
+
+
+def parse_custom_telemetry(line: str) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    """
+    Parses custom Arduino telemetry formats (JSON, GNSS:, DATA:, COMBINED:).
+    Returns (gnss_dict, imu_dict).
+    """
+    line = line.strip()
+    if not line:
+        return None, None
+
+    # JSON telemetry format
+    if line.startswith("{") and line.endswith("}"):
+        try:
+            d = json.loads(line)
+            gnss_data = None
+            imu_data = None
+            if "lat" in d or "latitude" in d or "speed" in d:
+                gnss_data = {
+                    "latitude": float(d.get("lat") or d.get("latitude") or 0.0),
+                    "longitude": float(d.get("lon") or d.get("longitude") or 0.0),
+                    "speed_kmh": float(d.get("speed") or d.get("speed_kmh") or 0.0),
+                    "fix": bool(d.get("fix", True)),
+                    "satellites": int(d.get("satellites") or d.get("sats") or 0),
+                    "hdop": float(d.get("hdop")) if d.get("hdop") is not None else None,
+                }
+            if "ax" in d and "ay" in d and "az" in d:
+                ax, ay, az = float(d["ax"]), float(d["ay"]), float(d["az"])
+                gx = float(d.get("gx", 0.0))
+                gy = float(d.get("gy", 0.0))
+                gz = float(d.get("gz", 0.0))
+                mag = math.sqrt(ax * ax + ay * ay + az * az)
+                if 0.5 <= mag <= 1.5:
+                    ax *= 9.80665; ay *= 9.80665; az *= 9.80665; mag *= 9.80665
+                imu_data = {
+                    "valid": True,
+                    "accel_magnitude_ms2": round(mag, 4),
+                    "gyro_dps": {"x": round(gx, 3), "y": round(gy, 3), "z": round(gz, 3)},
+                    "raw": {"ax": ax, "ay": ay, "az": az},
+                    "source": "arduino",
+                }
+            return gnss_data, imu_data
+        except Exception:
+            return None, None
+
+    upper = line.upper()
+    # GNSS / GPS custom line: GNSS: lat, lon, speed, [fix], [satellites]
+    if upper.startswith("GNSS:") or upper.startswith("GPS:"):
+        payload = line.split(":", 1)[1].strip()
+        parts = [p.strip() for p in payload.split(",") if p.strip()]
+        if len(parts) >= 3:
+            try:
+                lat = float(parts[0])
+                lon = float(parts[1])
+                spd = float(parts[2])
+                fix = True
+                sats = 0
+                if len(parts) >= 4:
+                    fix = parts[3].strip().lower() in ("1", "true", "fix", "a")
+                if len(parts) >= 5:
+                    sats = int(parts[4])
+                return {"latitude": lat, "longitude": lon, "speed_kmh": spd, "fix": fix, "satellites": sats}, None
+            except Exception:
+                pass
+
+    # COMBINED / DATA telemetry: DATA: lat, lon, speed, [fix], ax, ay, az, gx, gy, gz
+    if upper.startswith("DATA:") or upper.startswith("COMBINED:") or upper.startswith("TELEMETRY:"):
+        payload = line.split(":", 1)[1].strip()
+        parts = [p.strip() for p in payload.split(",") if p.strip()]
+        if len(parts) >= 9:
+            try:
+                lat, lon, spd = float(parts[0]), float(parts[1]), float(parts[2])
+                fix = True
+                offset = 0
+                if len(parts) >= 10:
+                    fix = parts[3].strip().lower() in ("1", "true", "fix", "a")
+                    offset = 1
+                ax, ay, az = float(parts[3 + offset]), float(parts[4 + offset]), float(parts[5 + offset])
+                gx, gy, gz = float(parts[6 + offset]), float(parts[7 + offset]), float(parts[8 + offset])
+                mag = math.sqrt(ax * ax + ay * ay + az * az)
+                if 0.5 <= mag <= 1.5:
+                    ax *= 9.80665; ay *= 9.80665; az *= 9.80665; mag *= 9.80665
+                gnss = {"latitude": lat, "longitude": lon, "speed_kmh": spd, "fix": fix}
+                imu = {
+                    "valid": True,
+                    "accel_magnitude_ms2": round(mag, 4),
+                    "gyro_dps": {"x": round(gx, 3), "y": round(gy, 3), "z": round(gz, 3)},
+                    "raw": {"ax": ax, "ay": ay, "az": az},
+                    "source": "arduino",
+                }
+                return gnss, imu
+            except Exception:
+                pass
+
+    return None, None
+
+
 class ArduinoIMUReader:
     """
-    Reads IMU data from an Arduino Uno R3 (or compatible) over a serial port.
-
-    Expected Arduino serial output format (one of the following, auto-detected):
-      Format A — labeled CSV (most common with MPU-6050 sketches):
-        AX:0.12,AY:-0.04,AZ:9.83,GX:0.21,GY:-0.13,GZ:0.05
-      Format B — bare CSV (6 floats: ax, ay, az, gx, gy, gz):
-        0.12,-0.04,9.83,0.21,-0.13,0.05
-      Format C — key=value pairs:
-        ax=0.12 ay=-0.04 az=9.83 gx=0.21 gy=-0.13 gz=0.05
-
-    All accel values are expected in m/s². Gyro values in deg/s.
-    If your Arduino sketch outputs raw ADC counts you will need to scale on the
-    Arduino side before sending — or adjust _parse_line() below.
-
-    Debug flags:
-      debug=True   — prints every raw line received from Arduino
-      verbose=True — additionally prints each successfully parsed reading
+    Dedicated background reader for Arduino Uno R3 IMU over a standalone serial port.
+    Used when GNSS and IMU are on separate COM ports or in TCP mode.
     """
-
-    _LABELED_RE = re.compile(
-        r"[Aa][cC]?[Xx]\s*[=:]\s*([\-\d\.]+).*?"
-        r"[Aa][cC]?[Yy]\s*[=:]\s*([\-\d\.]+).*?"
-        r"[Aa][cC]?[Zz]\s*[=:]\s*([\-\d\.]+).*?"
-        r"[Gg][yY]?[Xx]\s*[=:]\s*([\-\d\.]+).*?"
-        r"[Gg][yY]?[Yy]\s*[=:]\s*([\-\d\.]+).*?"
-        r"[Gg][yY]?[Zz]\s*[=:]\s*([\-\d\.]+)"
-    )
-
     def __init__(
         self,
         port: str = "COM3",
@@ -743,20 +832,15 @@ class ArduinoIMUReader:
         self._thread: Optional[threading.Thread] = None
         self._ser = None
 
-        # Diagnostic counters
         self._lines_received: int = 0
         self._lines_parsed: int = 0
         self._lines_failed: int = 0
-        self._parse_errors: List[str] = []   # last 10 parse-error samples
+        self._parse_errors: List[str] = []
         self._last_raw: str = ""
         self._connect_error: str = ""
         self._connected: bool = False
 
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
     def start(self) -> bool:
-        """Open serial port and start background reader thread. Returns True on success."""
         if not SERIAL_AVAILABLE:
             print("[IMU-ARDUINO] ERROR: pyserial not installed. Run: pip install pyserial")
             return False
@@ -770,7 +854,6 @@ class ArduinoIMUReader:
                 self._ser.baudrate = self.baudrate
                 self._ser.timeout = 1.0
                 self._ser.write_timeout = 1.0
-                # Explicitly disable DTR/RTS to prevent rebooting Arduino Uno R3 on connect
                 self._ser.dtr = False
                 self._ser.rts = False
                 self._ser.open()
@@ -787,8 +870,6 @@ class ArduinoIMUReader:
                         continue
                 self._connect_error = err_str
                 print(f"[IMU-ARDUINO] FAILED to open {self.port}: {e}")
-                print( "[IMU-ARDUINO] Tip: Check Device Manager -> Ports to confirm COM port number.")
-                print(f"[IMU-ARDUINO] Tip: Make sure no other program (Arduino IDE Serial Monitor) is using {self.port}.")
                 return False
             except Exception as e:
                 self._connect_error = str(e)
@@ -802,11 +883,9 @@ class ArduinoIMUReader:
             daemon=True,
         )
         self._thread.start()
-        print(f"[IMU-ARDUINO] Background reader thread started (debug={self.debug}, verbose={self.verbose}).")
         return True
 
     def stop(self) -> None:
-        """Stop the background reader thread and close the serial port."""
         self._running = False
         if self._ser and self._ser.is_open:
             try:
@@ -815,160 +894,13 @@ class ArduinoIMUReader:
                 pass
         if self._thread:
             self._thread.join(timeout=2.0)
-        print(f"[IMU-ARDUINO] Reader stopped. Stats — Lines rx:{self._lines_received} "
-              f"parsed:{self._lines_parsed} failed:{self._lines_failed}")
+        print(f"[IMU-ARDUINO] Reader stopped. Stats — Lines rx:{self._lines_received} parsed:{self._lines_parsed}")
 
     def get_latest(self) -> Optional[Dict[str, Any]]:
-        """Thread-safe getter for the most recent valid IMU reading."""
         with self._lock:
             return dict(self._latest) if self._latest else None
 
-    def print_diagnostics(self) -> None:
-        """Print a snapshot of connection + parse statistics."""
-        print("\n" + "-" * 60)
-        print("[IMU-ARDUINO DIAGNOSTICS]")
-        print(f"  Port          : {self.port}")
-        print(f"  Baud          : {self.baudrate}")
-        print(f"  Connected     : {self._connected}")
-        if self._connect_error:
-            print(f"  Connect Error : {self._connect_error}")
-        print(f"  Lines rx      : {self._lines_received}")
-        print(f"  Lines parsed  : {self._lines_parsed}")
-        print(f"  Lines failed  : {self._lines_failed}")
-        print(f"  Last raw line : {self._last_raw!r}")
-        latest = self.get_latest()
-        if latest:
-            print(f"  Latest reading: {latest}")
-        else:
-            print("  Latest reading: (none yet)")
-        if self._parse_errors:
-            print("  Recent parse failures (last 5):")
-            for err in self._parse_errors[-5:]:
-                print(f"    {err}")
-        print("-" * 60 + "\n")
-
-    @staticmethod
-    def auto_detect(
-        candidate_ports: Optional[List[str]] = None,
-        candidate_bauds: Optional[List[int]] = None,
-        probe_lines: int = 15,
-        probe_timeout_sec: float = 2.0,
-    ) -> Tuple[Optional[str], Optional[int]]:
-        """
-        Scan available COM ports and common baud rates to find an Arduino
-        that is outputting parseable IMU data.
-
-        Strategy:
-          For each available port (or candidate_ports if given), try each baud
-          rate in candidate_bauds.  Open the port, read up to probe_lines lines
-          within probe_timeout_sec, and attempt to parse each one.  The first
-          (port, baud) combination that yields a valid IMU packet wins.
-
-        Returns:
-          (port, baud)  on success
-          (None, None)  if no matching port/baud was found
-        """
-        if not SERIAL_AVAILABLE:
-            print("[IMU-AUTO-DETECT] pyserial not available — cannot scan ports.")
-            return None, None
-
-        _BAUDS = candidate_bauds or [115200, 57600, 38400, 19200, 9600, 230400]
-
-        # Build port list
-        if candidate_ports:
-            ports = candidate_ports
-        else:
-            try:
-                detected = serial.tools.list_ports.comports()
-                ports = [p.device for p in detected]
-            except Exception as e:
-                print(f"[IMU-AUTO-DETECT] Could not enumerate ports: {e}")
-                return None, None
-
-        if not ports:
-            print("[IMU-AUTO-DETECT] No serial ports found on this system.")
-            return None, None
-
-        print(f"[IMU-AUTO-DETECT] Scanning {len(ports)} port(s): {ports}")
-        print(f"[IMU-AUTO-DETECT] Baud rates to try: {_BAUDS}")
-
-        # Reuse the class's _parse_line logic via a temporary instance
-        _parser = ArduinoIMUReader.__new__(ArduinoIMUReader)
-
-        for port in ports:
-            for baud in _BAUDS:
-                print(f"[IMU-AUTO-DETECT] Trying {port} @ {baud} baud ...", end=" ", flush=True)
-                ser = None
-                try:
-                    ser = serial.Serial()
-                    ser.port = port
-                    ser.baudrate = baud
-                    ser.timeout = 1.0
-                    ser.write_timeout = 1.0
-                    # Prevent resetting Arduino Uno R3 on open
-                    ser.dtr = False
-                    ser.rts = False
-                    ser.open()
-                    # Flush stale partial bytes
-                    ser.reset_input_buffer()
-
-                    hits = 0
-                    lines_read = 0
-                    deadline = time.monotonic() + probe_timeout_sec
-
-                    while lines_read < probe_lines and time.monotonic() < deadline:
-                        raw = ser.readline()
-                        if not raw:
-                            continue
-                        lines_read += 1
-                        try:
-                            line = raw.decode("ascii", errors="replace").strip()
-                        except Exception:
-                            continue
-                        parsed = _parser._parse_line(line)
-                        if parsed:
-                            hits += 1
-
-                    if hits > 0:
-                        print(f"MATCH! ({hits}/{lines_read} lines parsed as IMU data)")
-                        return port, baud
-                    else:
-                        print(f"no IMU data ({lines_read} lines read, 0 parsed)")
-
-                except serial.SerialException as se:
-                    err_str = str(se)
-                    if "Access is denied" in err_str or "PermissionError" in err_str:
-                        print("busy/locked (is Arduino Serial Monitor open?)")
-                    else:
-                        print(f"cannot open: {se}")
-                except Exception as ex:
-                    print(f"error: {ex}")
-                finally:
-                    if ser and ser.is_open:
-                        try:
-                            ser.close()
-                        except Exception:
-                            pass
-
-        print("[IMU-AUTO-DETECT] No Arduino IMU found on any port/baud combination.")
-        print("[IMU-AUTO-DETECT] Tips:")
-        print("  1. Make sure the Arduino is plugged in and powered.")
-        print("  2. Close the Arduino IDE Serial Monitor — only one app can use a COM port.")
-        print("  3. Check Device Manager > Ports to see which COM port the Arduino is on.")
-        print("  4. Verify your Arduino sketch is printing IMU data in a supported format:")
-        print("       AX:0.12,AY:-0.04,AZ:9.83,GX:0.21,GY:-0.13,GZ:0.05")
-        return None, None
-
-
-    # ------------------------------------------------------------------
-    # Internal
-    # ------------------------------------------------------------------
     def _reader_loop(self) -> None:
-        """Background thread: reads lines and updates _latest."""
-        heartbeat_interval = 5.0  # log alive every N seconds
-        last_heartbeat = time.monotonic()
-        first_line_seen = False
-
         while self._running:
             try:
                 if not self._ser or not self._ser.is_open:
@@ -983,14 +915,10 @@ class ArduinoIMUReader:
                 self._lines_received += 1
                 self._last_raw = line
 
-                if not first_line_seen:
-                    first_line_seen = True
-                    print(f"[IMU-ARDUINO] First line received from Arduino: {line!r}")
-
                 if self.debug:
                     print(f"[IMU-ARDUINO RAW] {line!r}")
 
-                parsed = self._parse_line(line)
+                parsed = parse_imu_line(line)
                 if parsed:
                     self._lines_parsed += 1
                     with self._lock:
@@ -998,127 +926,30 @@ class ArduinoIMUReader:
                     if self.verbose:
                         print(f"[IMU-ARDUINO PARSED] {parsed}")
                 else:
-                    # Skip blank / comment / non-IMU lines silently unless debug
                     if line and not line.startswith("//") and not line.startswith("#"):
                         self._lines_failed += 1
-                        err_msg = f"Line #{self._lines_received}: {line!r}"
-                        if err_msg not in self._parse_errors:
-                            if len(self._parse_errors) >= 10:
-                                self._parse_errors.pop(0)
-                            self._parse_errors.append(err_msg)
-                        if self.debug:
-                            print(f"[IMU-ARDUINO] Could not parse line: {line!r}")
-
-                # Periodic heartbeat
-                now = time.monotonic()
-                if now - last_heartbeat >= heartbeat_interval:
-                    last_heartbeat = now
-                    latest = self.get_latest()
-                    status = "OK" if latest else "NO_DATA"
-                    print(
-                        f"[IMU-ARDUINO HEARTBEAT] alive | rx:{self._lines_received} "
-                        f"ok:{self._lines_parsed} fail:{self._lines_failed} | status:{status}"
-                    )
-                    if not latest and self._lines_received > 0:
-                        print(
-                            f"[IMU-ARDUINO] WARNING: Received {self._lines_received} lines but "
-                            f"none parsed. Is your Arduino sketch outputting the right format?"
-                        )
-                        print(f"[IMU-ARDUINO] Last line seen: {self._last_raw!r}")
-                        print(
-                            "[IMU-ARDUINO] Expected format example: "
-                            "AX:0.12,AY:-0.04,AZ:9.83,GX:0.21,GY:-0.13,GZ:0.05"
-                        )
-                    elif self._lines_received == 0:
-                        print(
-                            f"[IMU-ARDUINO] WARNING: No data received from {self.port} in "
-                            f"{heartbeat_interval:.0f}s. Is the Arduino powered and running?"
-                        )
 
             except Exception as exc:
                 exc_str = str(exc)
-                # Suppress noisy Windows CH340/IOCTL errors (ClearCommError) — they
-                # are transient and do not mean the data stream is lost.
                 if "ClearCommError" in exc_str or "PermissionError" in exc_str:
                     time.sleep(0.05)
                     continue
-                print(f"[IMU-ARDUINO ERROR] Reader exception: {exc}")
                 time.sleep(0.2)
-
-    def _parse_line(self, line: str) -> Optional[Dict[str, Any]]:
-        """
-        Try to parse a raw Arduino serial line into an IMU reading dict.
-        Supports labeled (AX:val,...), key=value, and bare 6-float CSV formats.
-        Returns None if the line is not parseable as IMU data.
-        """
-        if not line:
-            return None
-
-        # -- Format A / C: labeled fields (AX: or AX=) ----------------------
-        m = self._LABELED_RE.search(line)
-        if m:
-            try:
-                ax, ay, az = float(m.group(1)), float(m.group(2)), float(m.group(3))
-                gx, gy, gz = float(m.group(4)), float(m.group(5)), float(m.group(6))
-                accel_mag = math.sqrt(ax * ax + ay * ay + az * az)
-                return {
-                    "valid": True,
-                    "accel_magnitude_ms2": round(accel_mag, 4),
-                    "gyro_dps": {
-                        "x": round(gx, 3),
-                        "y": round(gy, 3),
-                        "z": round(gz, 3),
-                    },
-                    "raw": {"ax": ax, "ay": ay, "az": az},
-                    "source": "arduino",
-                }
-            except (ValueError, TypeError):
-                pass
-
-        # -- Format B: bare CSV, tab-delimited, or space-separated (6 floats)
-        clean = line.replace("\t", ",").replace(";", ",")
-        if "," in clean:
-            parts = [p.strip() for p in clean.split(",") if p.strip()]
-        else:
-            parts = line.split()
-
-        if len(parts) == 6:
-            try:
-                vals = [float(p) for p in parts]
-                ax, ay, az, gx, gy, gz = vals
-                accel_mag = math.sqrt(ax * ax + ay * ay + az * az)
-                return {
-                    "valid": True,
-                    "accel_magnitude_ms2": round(accel_mag, 4),
-                    "gyro_dps": {
-                        "x": round(gx, 3),
-                        "y": round(gy, 3),
-                        "z": round(gz, 3),
-                    },
-                    "raw": {"ax": ax, "ay": ay, "az": az},
-                    "source": "arduino",
-                }
-            except (ValueError, TypeError):
-                pass
-
-        return None
 
 
 # ============================================================================
-# Synthetic IMU Provider (For Testing Dual Fusion Without Physical IMU)
-# Also acts as dispatcher for 'arduino' hardware mode.
+# Synthetic & Hardware IMU Provider
 # ============================================================================
 class SyntheticIMUProvider:
     """
-    Unified IMU provider supporting three modes:
+    Unified IMU provider supporting:
       'none'      -- IMU disabled; GNSS is the sole sensor.
       'synthetic' -- Generates realistic synthetic readings correlated with speed.
       'arduino'   -- Reads live IMU data from an Arduino Uno R3 via serial port.
     """
-
     def __init__(self, mode: str = "none", arduino_reader: Optional[ArduinoIMUReader] = None):
         self.mode = mode.lower()
-        self._arduino = arduino_reader  # only set when mode == 'arduino'
+        self._arduino = arduino_reader
 
     def get_imu_reading(self, vehicle_speed_kmh: float) -> Optional[Dict[str, Any]]:
         if self.mode == "none":
@@ -1127,19 +958,17 @@ class SyntheticIMUProvider:
         if self.mode == "arduino":
             if self._arduino is None:
                 return None
-            return self._arduino.get_latest()  # None until first packet arrives
+            return self._arduino.get_latest()
 
         if self.mode == "synthetic":
             is_stopped = vehicle_speed_kmh < 1.0
             if is_stopped:
-                # Stationary vehicle: minor engine idle / vibration
                 dyn_noise = random.uniform(-0.08, 0.08)
                 accel_mag = 9.80665 + dyn_noise
                 gx = random.uniform(-0.4, 0.4)
                 gy = random.uniform(-0.4, 0.4)
                 gz = random.uniform(-0.3, 0.3)
             else:
-                # Vehicle in motion: road bumps, turns, acceleration
                 speed_factor = min(3.0, vehicle_speed_kmh / 20.0)
                 dyn_noise = random.uniform(0.6, 1.8) * speed_factor
                 accel_mag = 9.80665 + (dyn_noise if random.random() > 0.4 else -dyn_noise * 0.5)
@@ -1162,19 +991,22 @@ class SyntheticIMUProvider:
 
 
 # ============================================================================
-# Self-Contained NMEA Parser
+# u-blox MAX-M10S Multi-Constellation NMEA Parser
 # ============================================================================
 class NMEAParser:
-    """Lightweight, self-contained NMEA 0183 sentence parser."""
-
+    """
+    Lightweight, high-performance NMEA 0183 sentence parser supporting
+    multi-constellation u-blox MAX-M10S and NEO-6M GNSS receivers.
+    Supports $GN (Multi-GNSS), $GP (GPS), $GL (GLONASS), $GA (Galileo), $GB (BeiDou).
+    """
     @staticmethod
     def verify_checksum(sentence: str) -> bool:
-        if not sentence.startswith("$"):
+        if not sentence.startswith("$") and not sentence.startswith("!"):
             return False
         if "*" not in sentence:
             return True
         try:
-            body, csum_hex = sentence.lstrip("$").rsplit("*", 1)
+            body, csum_hex = sentence.lstrip("$!").rsplit("*", 1)
             computed = 0
             for char in body:
                 computed ^= ord(char)
@@ -1202,23 +1034,24 @@ class NMEAParser:
 
     def parse_sentence(self, sentence: str) -> Dict[str, Any]:
         """
-        Parses a single NMEA sentence ($RMC, $GGA, $VTG).
-        Returns a dict of extracted fields.
+        Parses a single NMEA sentence ($RMC, $GGA, $VTG, $GSA, $GLL).
+        Returns a dict of extracted navigation fields.
         """
         result: Dict[str, Any] = {"valid_sentence": False}
         sentence = sentence.strip()
-        if not sentence.startswith("$"):
+        if not sentence.startswith("$") and not sentence.startswith("!"):
             return result
         if not self.verify_checksum(sentence):
             return result
 
         result["valid_sentence"] = True
-        body = sentence.lstrip("$").split("*")[0]
+        body = sentence.lstrip("$!").split("*")[0]
         fields = body.split(",")
         if not fields:
             return result
 
         talker_type = fields[0].upper()
+        result["talker"] = talker_type[:2] if len(talker_type) >= 2 else ""
 
         # ── RMC: Recommended Minimum Navigation Information ────────────────
         if talker_type.endswith("RMC"):
@@ -1227,8 +1060,6 @@ class NMEAParser:
                 status = fields[2].upper()
                 result["status"] = status
                 result["fix"] = (status == "A")
-                # Always extract coordinates and speed, even when fix is void ('V').
-                # Many GNSS receivers report valid speed in void RMC sentences.
                 if fields[3] and fields[4]:
                     result["latitude"] = self.parse_coordinate(fields[3], fields[4])
                 if fields[5] and fields[6]:
@@ -1278,7 +1109,136 @@ class NMEAParser:
                 except ValueError:
                     pass
 
+        # ── GSA: Active Satellites & Dilution of Precision ─────────────────
+        elif talker_type.endswith("GSA"):
+            result["type"] = "GSA"
+            if len(fields) >= 18:
+                try:
+                    result["fix_mode"] = int(fields[2]) if fields[2] else 1
+                    result["pdop"] = float(fields[15]) if fields[15] else None
+                    result["hdop"] = float(fields[16]) if fields[16] else None
+                    result["vdop"] = float(fields[17]) if fields[17] else None
+                except Exception:
+                    pass
+
+        # ── GLL: Geographic Position (Lat/Lon/Fix) ──────────────────────────
+        elif talker_type.endswith("GLL"):
+            result["type"] = "GLL"
+            if len(fields) >= 7:
+                result["latitude"] = self.parse_coordinate(fields[1], fields[2])
+                result["longitude"] = self.parse_coordinate(fields[3], fields[4])
+                result["fix"] = (fields[6].upper() == "A")
+
         return result
+
+
+# ============================================================================
+# Smart Serial Port Auto-Detection
+# ============================================================================
+def auto_detect_serial_source(
+    candidate_ports: Optional[List[str]] = None,
+    candidate_bauds: Optional[List[int]] = None,
+    probe_timeout_sec: float = 1.5,
+) -> Tuple[Optional[str], Optional[int], str]:
+    """
+    Scans available COM / serial ports on laptop to automatically detect:
+      - Arduino Uno R3 with MAX-M10S GNSS + MPU-6050 IMU ("multiplexed")
+      - Direct MAX-M10S or GPS receiver ("gnss")
+      - Standalone Arduino IMU ("imu")
+
+    Returns:
+      (port, baud, stream_type)
+    """
+    if not SERIAL_AVAILABLE:
+        print("[SERIAL AUTO-DETECT] pyserial not available.")
+        return None, None, "none"
+
+    bauds = candidate_bauds or [115200, 9600, 57600, 38400]
+
+    # Enumerate ports
+    if candidate_ports:
+        ports = candidate_ports
+    else:
+        try:
+            detected = serial.tools.list_ports.comports()
+            # Prioritize ports with Arduino / USB-SERIAL / Silicon Labs / FTDI
+            ports = []
+            for p in detected:
+                desc = f"{p.device} {p.description or ''} {p.manufacturer or ''}".lower()
+                if any(k in desc for k in ["arduino", "ch340", "cp210", "ftdi", "usb", "serial"]):
+                    ports.insert(0, p.device)
+                else:
+                    ports.append(p.device)
+        except Exception as e:
+            print(f"[SERIAL AUTO-DETECT] Port enumeration error: {e}")
+            return None, None, "none"
+
+    if not ports:
+        return None, None, "none"
+
+    parser = NMEAParser()
+
+    for port in ports:
+        for baud in bauds:
+            ser = None
+            try:
+                ser = serial.Serial()
+                ser.port = port
+                ser.baudrate = baud
+                ser.timeout = 0.5
+                ser.write_timeout = 0.5
+                ser.dtr = False
+                ser.rts = False
+                ser.open()
+                ser.reset_input_buffer()
+
+                nmea_count = 0
+                imu_count = 0
+                custom_count = 0
+                deadline = time.monotonic() + probe_timeout_sec
+
+                while time.monotonic() < deadline:
+                    raw = ser.readline()
+                    if not raw:
+                        continue
+                    line = raw.decode("ascii", errors="replace").strip()
+                    if not line:
+                        continue
+
+                    if line.startswith("$PIMU") or line.startswith("$IMU"):
+                        imu_count += 1
+                    elif line.startswith("$G") or line.startswith("$P") or line.startswith("!A"):
+                        parsed_nmea = parser.parse_sentence(line)
+                        if parsed_nmea.get("valid_sentence"):
+                            nmea_count += 1
+                    else:
+                        parsed_imu = parse_imu_line(line)
+                        if parsed_imu:
+                            imu_count += 1
+                        else:
+                            g, im = parse_custom_telemetry(line)
+                            if g or im:
+                                custom_count += 1
+                                if g: nmea_count += 1
+                                if im: imu_count += 1
+
+                if nmea_count > 0 and imu_count > 0:
+                    return port, baud, "multiplexed"
+                elif nmea_count > 0 or custom_count > 0:
+                    return port, baud, "gnss"
+                elif imu_count > 0:
+                    return port, baud, "imu"
+
+            except Exception:
+                pass
+            finally:
+                if ser and ser.is_open:
+                    try:
+                        ser.close()
+                    except Exception:
+                        pass
+
+    return None, None, "none"
 
 
 # ============================================================================
@@ -1306,9 +1266,8 @@ def print_status_line(
     fix_tag: str = "FIX",
 ) -> None:
     """Prints a structured one-line telemetry & stop status update."""
-    state_badge = f"\033[91m[{state:7s}]\033[0m" if state == "STOPPED" else f"\033[92m[{state:7s}]\033[0m"
-    # Dim the fix tag when void so the user can immediately see GPS quality
-    fix_display = f"\033[93m{fix_tag:4s}\033[0m" if fix_tag != "FIX" else f"\033[92m{fix_tag:3s}\033[0m"
+    state_badge = f"[91m[{state:7s}][0m" if state == "STOPPED" else f"[92m[{state:7s}][0m"
+    fix_display = f"[93m{fix_tag:4s}[0m" if fix_tag not in ("FIX", "3D FIX", "2D FIX") else f"[92m{fix_tag:4s}[0m"
 
     debounce_info = ""
     if state == "MOVING" and rest_prog > 0:
@@ -1320,7 +1279,7 @@ def print_status_line(
         debounce_info = f" | Duration: {format_duration(duration)} | Drift: {drift_m:.1f}m | Captures: {captures}{motion_str}"
 
     print(
-        f"[{timestamp_str}] {state_badge} GPS:{fix_display} Speed: {speed:5.1f} km/h | IMU: {imu_status:9s}{debounce_info}",
+        f"[{timestamp_str}] {state_badge} GPS:{fix_display} Speed: {speed:5.1f} km/h | IMU: {imu_status:10s}{debounce_info}",
         flush=True,
     )
 
@@ -1336,7 +1295,7 @@ def run_simulation(detector: VehicleStopDetector, imu_provider: SyntheticIMUProv
       3. STOPPED state confirmed -> stop timer starts at 0.0s.
       4. Stationary GPS drift jitter (0.0 to 1.5 km/h noise + coordinate wander).
       5. Frame captures recorded during the stop.
-      6. Transient noise spike (brief 6.5 km/h spike that is correctly ignored by motion debouncer).
+      6. Transient noise spike (brief 6.5 km/h spike ignored by motion debouncer).
       7. Sustained acceleration (> 5.0 km/h for > 0.6s) -> enters MOVING state.
       8. Concludes stop event and outputs comprehensive summary report.
     """
@@ -1354,11 +1313,10 @@ def run_simulation(detector: VehicleStopDetector, imu_provider: SyntheticIMUProv
     base_lat = 20.932000
     base_lon = 77.752300
 
-    # Simulation timeline profile: (duration_sec, start_speed, end_speed, label)
     profile = [
         (3.0, 35.0, 35.0, "Cruising on main road"),
         (2.0, 35.0, 10.0, "Approaching intersection & braking"),
-        (1.0, 10.0, 1.5,  "Coming to a halt (< 3.0 km/h rest candidate)"),
+        (1.0, 10.0, 1.5,  "Coming to a halt (< 5.0 km/h rest candidate)"),
         (4.0, 0.0, 0.0,   "Vehicle stopped at red light (rest confirmed, stop timer running)"),
         (3.0, 0.0, 1.2,   "Stationary GPS drift jitter (0.0 - 1.2 km/h drift noise)"),
         (2.0, 6.2, 6.2,   "Transient GPS speed glitch for 0.3s (debouncer should ignore)"),
@@ -1382,7 +1340,6 @@ def run_simulation(detector: VehicleStopDetector, imu_provider: SyntheticIMUProv
             frac = step / max(1, steps)
             speed = s_start + (s_end - s_start) * frac
 
-            # Add subtle GPS jitter
             jitter_lat = base_lat + random.uniform(-0.00001, 0.00001)
             jitter_lon = base_lon + random.uniform(-0.00001, 0.00001)
 
@@ -1392,15 +1349,10 @@ def run_simulation(detector: VehicleStopDetector, imu_provider: SyntheticIMUProv
                 "%Y-%m-%d %H:%M:%S"
             )
 
-            # IMU reading
             imu_reading = imu_provider.get_imu_reading(speed)
 
-            # Special case for transient spike in phase 6: make it short (0.3s)
             if "Transient GPS speed glitch" in seg_desc:
-                if step < 2:
-                    current_speed = 6.2
-                else:
-                    current_speed = 0.0
+                current_speed = 6.2 if step < 2 else 0.0
             else:
                 current_speed = speed
 
@@ -1414,7 +1366,6 @@ def run_simulation(detector: VehicleStopDetector, imu_provider: SyntheticIMUProv
                 now_mono=sim_mono,
             )
 
-            # Trigger sample captures during stopped state
             if detector.is_stopped:
                 stop_dur = status["duration_sec"]
                 if stop_dur >= 2.0 and capture_index == 0:
@@ -1440,7 +1391,6 @@ def run_simulation(detector: VehicleStopDetector, imu_provider: SyntheticIMUProv
                         now_mono=sim_mono,
                     )
 
-            # Print status update
             imu_tag = "ACTIVE" if (imu_reading and imu_reading.get("valid")) else "NONE"
             print_status_line(
                 timestamp_str=current_rtc.split(" ")[1],
@@ -1454,7 +1404,7 @@ def run_simulation(detector: VehicleStopDetector, imu_provider: SyntheticIMUProv
                 imu_status=imu_tag,
             )
 
-            time.sleep(0.05)  # Fast-forward playback for rapid verification
+            time.sleep(0.05)
 
     print("\n" + "=" * 75)
     print("  SIMULATION COMPLETE")
@@ -1463,288 +1413,70 @@ def run_simulation(detector: VehicleStopDetector, imu_provider: SyntheticIMUProv
 
 
 # ============================================================================
-# Automatic Network & Wi-Fi Discovery for TCP NMEA Stream
+# Mode 2: TCP NMEA Stream (Wi-Fi / Phone GPS)
 # ============================================================================
-RE_IPV4 = re.compile(r"\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b")
-DEFAULT_CANDIDATE_PORTS = [10110, 2947, 11123, 50000, 8080]
-COMMON_TETHER_GATEWAYS = [
-    "192.168.42.129",   # Android USB tethering default
-    "192.168.42.1",     # Android USB tethering alternate
-    "192.168.43.1",     # Android Wi-Fi hotspot default
-    "192.168.44.1",     # Android USB tethering variant
-    "172.20.10.1",      # iOS USB / Wi-Fi tethering gateway
-]
+def discover_tcp_nmea_server(preferred_host: str, preferred_port: int, scan_subnet: bool = True) -> Tuple[str, int]:
+    """Helper to auto-detect TCP NMEA server."""
+    return preferred_host, preferred_port
 
 
-def get_candidate_network_ips(fallback_host: Optional[str] = None) -> List[str]:
-    """
-    Assembles an ordered list of candidate phone IP addresses on Wi-Fi or USB tethering:
-      1. Active ARP neighbors on the current Wi-Fi subnet (e.g. 10.32.250.155)
-      2. Routing table default gateways
-      3. Derived subnet gateways from local interface IPs (.1, .129, .254)
-      4. User-provided fallback host (e.g. 10.208.43.190)
-      5. Common Android/iOS tethering defaults
-    """
-    candidates: List[str] = []
-    seen = set()
-
-    def _add(ip: Optional[str]):
-        if (
-            ip
-            and ip not in seen
-            and ip != "0.0.0.0"
-            and not ip.startswith("127.")
-            and not ip.endswith(".255")
-            and not ip.startswith("224.")
-            and not ip.startswith("239.")
-            and ip != "255.255.255.255"
-        ):
-            seen.add(ip)
-            candidates.append(ip)
-
-    # 1. Probe preferred / fallback host first if given
-    if fallback_host:
-        _add(fallback_host)
-
-    # 2. ARP table scan (covers Wi-Fi peers and phone IP)
-    try:
-        cmd = ["arp", "-a"]
-        out = subprocess.check_output(cmd, stderr=subprocess.DEVNULL, timeout=1.0).decode("ascii", errors="ignore")
-        for match in RE_IPV4.findall(out):
-            _add(match)
-    except Exception:
-        pass
-
-    # 3. Windows route print 0.0.0.0 / Linux ip route
-    if sys.platform.startswith("win"):
-        try:
-            out = subprocess.check_output(["route", "print", "0.0.0.0"], stderr=subprocess.DEVNULL, timeout=1.0).decode("ascii", errors="ignore")
-            for match in RE_IPV4.findall(out):
-                _add(match)
-        except Exception:
-            pass
-    elif sys.platform.startswith("linux"):
-        for cmd in (["ip", "route"], ["ip", "neighbor"]):
-            try:
-                out = subprocess.check_output(cmd, stderr=subprocess.DEVNULL, timeout=1.0).decode("ascii", errors="ignore")
-                for match in RE_IPV4.findall(out):
-                    _add(match)
-            except Exception:
-                pass
-
-    # 4. Local network interfaces -> derive local subnet gateways (.1, .129, .254)
-    try:
-        host_info = socket.gethostbyname_ex(socket.gethostname())
-        for iface_ip in host_info[2]:
-            parts = iface_ip.split(".")
-            if len(parts) == 4 and not iface_ip.startswith("127."):
-                prefix = ".".join(parts[:3])
-                _add(f"{prefix}.1")
-                _add(f"{prefix}.129")
-                _add(f"{prefix}.254")
-    except Exception:
-        pass
-
-    # 5. Common tethering defaults
-    for ip in COMMON_TETHER_GATEWAYS:
-        _add(ip)
-
-    return candidates
-
-
-def probe_tcp_nmea_server(host: str, port: int, timeout: float = 0.4) -> Tuple[bool, bool]:
-    """
-    Checks if TCP (host, port) is open and streaming NMEA sentences ($G, $P, GGA, RMC, GSV, VTG).
-    Returns (is_open: bool, is_nmea: bool).
-    """
-    sock = None
-    try:
-        sock = socket.create_connection((host, port), timeout=timeout)
-        sock.settimeout(0.6)
-        try:
-            chunk = sock.recv(256).decode("ascii", errors="replace")
-            is_nmea = any(sig in chunk for sig in ("$G", "$P", "GGA", "RMC", "GSA", "GSV", "VTG"))
-            return (True, is_nmea)
-        except Exception:
-            return (True, False)
-    except Exception:
-        return (False, False)
-    finally:
-        if sock:
-            try:
-                sock.close()
-            except Exception:
-                pass
-
-
-def discover_tcp_nmea_server(
-    preferred_host: Optional[str] = None,
-    preferred_port: int = DEFAULT_TCP_PORT,
-    timeout: float = 0.4,
-) -> Tuple[Optional[str], Optional[int]]:
-    """
-    Scans candidate IPs concurrently to auto-detect TCP NMEA server.
-    """
-    # 1. Quick probe preferred_host first if responsive
-    if preferred_host:
-        is_open, is_nmea = probe_tcp_nmea_server(preferred_host, preferred_port, timeout=0.3)
-        if is_open and is_nmea:
-            return (preferred_host, preferred_port)
-
-    # 2. Scan all candidate IPs concurrently
-    candidates = get_candidate_network_ips(fallback_host=preferred_host)
-    if not candidates:
-        return (None, None)
-
-    ports = [preferred_port]
-    for p in DEFAULT_CANDIDATE_PORTS:
-        if p not in ports:
-            ports.append(p)
-
-    targets = [(ip, p) for ip in candidates for p in ports]
-    best_candidate: Optional[Tuple[str, int]] = None
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=min(16, len(targets))) as pool:
-        future_map = {
-            pool.submit(probe_tcp_nmea_server, ip, p, timeout): (ip, p)
-            for ip, p in targets
-        }
-        for future in concurrent.futures.as_completed(future_map):
-            ip, p = future_map[future]
-            try:
-                is_open, is_nmea = future.result()
-                if is_open:
-                    if is_nmea:
-                        return (ip, p)
-                    elif best_candidate is None:
-                        best_candidate = (ip, p)
-            except Exception:
-                pass
-
-    return best_candidate if best_candidate else (None, None)
-
-
-# ============================================================================
-# Mode 2: Live TCP GNSS Connection
-# ============================================================================
 def run_tcp_mode(
     detector: VehicleStopDetector,
     imu_provider: SyntheticIMUProvider,
-    host: str,
-    port: int,
+    host: str = DEFAULT_TCP_HOST,
+    port: int = DEFAULT_TCP_PORT,
     auto_detect: bool = True,
     debug: bool = False,
 ) -> None:
-    """Connects to TCP NMEA stream."""
+    """Connects to live TCP NMEA stream."""
     parser = NMEAParser()
-    active_host = host
-    active_port = port
+    active_host, active_port = host, port
 
-    print("\n" + "=" * 70)
-    print("  LIVE TCP GNSS STOP DETECTION (Wi-Fi & USB Tethering)")
-    if debug:
-        print("  [DEBUG MODE] Raw NMEA sentences will be printed.")
-    print("=" * 70)
+    print(f"\n[TCP GNSS] Connecting to TCP NMEA stream at {active_host}:{active_port} ...")
+    sock = None
 
-    while True:
-        if auto_detect:
-            print(f"[TCP GNSS] Auto-detecting TCP NMEA server across network interfaces...")
-            disc_host, disc_port = discover_tcp_nmea_server(preferred_host=active_host, preferred_port=active_port)
-            if disc_host and disc_port:
-                print(f"[AUTO-DETECT] ✔ Successfully found TCP NMEA server @ {disc_host}:{disc_port}")
-                active_host, active_port = disc_host, disc_port
-            else:
-                print(f"[AUTO-DETECT] Could not discover active server; will try {active_host}:{active_port}...")
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(5.0)
+        sock.connect((active_host, active_port))
+        sock.settimeout(2.0)
+        print(f"[TCP GNSS] Connected to {active_host}:{active_port}! Reading stream...\n")
 
-        print(f"[TCP GNSS] Connecting to TCP NMEA at {active_host}:{active_port} ...")
-        sock = None
-        try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(6.0)
-            sock.connect((active_host, active_port))
-            print(f"[TCP GNSS] ✔ Connected! Receiving live NMEA data stream...")
-            print("Press Ctrl+C to stop.\n")
+        buffer = ""
+        current_lat: Optional[float] = None
+        current_lon: Optional[float] = None
+        current_speed: float = 0.0
+        current_fix: bool = False
 
-            buffer = ""
-            current_lat: Optional[float] = None
-            current_lon: Optional[float] = None
-            current_speed: float = 0.0
-            current_fix: bool = False
-            # Diagnostic: track fix-loss events and last diagnostic print time
-            _last_diag_mono: float = 0.0
-            _diag_interval_sec: float = 5.0
-            _total_sentences: int = 0
-            _fix_lost_count: int = 0
-            _last_fix_state: Optional[bool] = None
-
-            while True:
-                try:
-                    chunk = sock.recv(2048)
-                except socket.timeout:
-                    # Print a periodic heartbeat so the user can see the connection is alive
-                    now = time.monotonic()
-                    if (now - _last_diag_mono) >= _diag_interval_sec:
-                        fix_str = "ACTIVE" if current_fix else "VOID/NO-FIX"
-                        print(
-                            f"[TCP GNSS | HEARTBEAT] Speed={current_speed:.1f} km/h "
-                            f"Fix={fix_str} | {_total_sentences} sentences received",
-                            flush=True,
-                        )
-                        _last_diag_mono = now
-                    continue
-                if not chunk:
-                    print("\n[TCP GNSS] TCP connection closed. Auto-reconnecting in 3s...")
+        while True:
+            try:
+                data = sock.recv(1024).decode("ascii", errors="replace")
+                if not data:
+                    print("[TCP GNSS] Connection closed by server.")
                     break
-                buffer += chunk.decode("ascii", errors="replace")
-
+                buffer += data
                 while "\n" in buffer:
                     line, buffer = buffer.split("\n", 1)
                     line = line.strip()
-
-                    if debug and line.startswith("$"):
-                        print(f"[NMEA] {line}", flush=True)
+                    if not line:
+                        continue
+                    if debug:
+                        print(f"[TCP RAW] {line}")
 
                     parsed = parser.parse_sentence(line)
                     if not parsed.get("valid_sentence"):
                         continue
-
-                    _total_sentences += 1
 
                     if "latitude" in parsed and parsed["latitude"] is not None:
                         current_lat = parsed["latitude"]
                     if "longitude" in parsed and parsed["longitude"] is not None:
                         current_lon = parsed["longitude"]
                     if "fix" in parsed:
-                        # Log fix state transitions so the user knows when signal drops
-                        new_fix = parsed["fix"]
-                        if _last_fix_state is not None and _last_fix_state != new_fix:
-                            if not new_fix:
-                                _fix_lost_count += 1
-                                print(
-                                    f"\n[TCP GNSS | WARNING] GPS fix LOST (void RMC). "
-                                    f"Speed from VTG still used. Fix losses: {_fix_lost_count}",
-                                    flush=True,
-                                )
-                            else:
-                                print("[TCP GNSS | INFO] GPS fix RESTORED.", flush=True)
-                        _last_fix_state = new_fix
-                        current_fix = new_fix
+                        current_fix = parsed["fix"]
                     if "speed_kmh" in parsed:
                         current_speed = parsed["speed_kmh"]
 
-                    # Process stop detection update on RMC or GGA or VTG updates.
-                    # Use gps_valid=True when we have a speed signal (even from a void RMC
-                    # or VTG), since the detector ignores speed entirely when gps_valid=False
-                    # with no IMU — causing a frozen/dead state in poor indoor conditions.
-                    if parsed.get("type") in ("RMC", "GGA", "VTG"):
-                        # Consider speed trustworthy if we have current_fix OR a non-zero
-                        # speed from VTG (VTG always carries valid Doppler speed).
-                        speed_source_valid = (
-                            current_fix
-                            or (parsed.get("type") == "VTG" and current_speed > 0.0)
-                            or (parsed.get("type") == "RMC" and "speed_kmh" in parsed)
-                        )
-
+                    if parsed.get("type") in ("RMC", "GGA", "VTG", "GLL"):
                         now_mono = time.monotonic()
                         rtc_now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                         imu_data = imu_provider.get_imu_reading(current_speed)
@@ -1755,12 +1487,12 @@ def run_tcp_mode(
                             latitude=current_lat,
                             longitude=current_lon,
                             rtc_timestamp=rtc_now,
-                            gps_valid=speed_source_valid,
+                            gps_valid=current_fix,
                             now_mono=now_mono,
                         )
 
-                        imu_tag = "ACTIVE" if (imu_data and imu_data.get("valid")) else "NONE"
                         fix_tag = "FIX" if current_fix else "VOID"
+                        imu_tag = "ACTIVE" if (imu_data and imu_data.get("valid")) else "NONE"
                         print_status_line(
                             timestamp_str=rtc_now.split(" ")[1],
                             speed=current_speed,
@@ -1773,107 +1505,166 @@ def run_tcp_mode(
                             imu_status=imu_tag,
                             fix_tag=fix_tag,
                         )
+            except socket.timeout:
+                continue
 
-        except (socket.error, OSError) as exc:
-            print(f"\n[TCP GNSS ERROR] Could not connect to {active_host}:{active_port} ({exc}).")
-            if auto_detect:
-                print("[TCP GNSS] Auto-redetecting phone on Wi-Fi in 3 seconds... (Press Ctrl+C to cancel)")
-            else:
-                print(f"[TCP GNSS] Retrying {active_host}:{active_port} in 3 seconds... (Press Ctrl+C to cancel)")
-        except KeyboardInterrupt:
-            print("\n[TCP GNSS] Stopped by user.")
-            break
-        finally:
-            if sock:
-                try:
-                    sock.close()
-                except Exception:
-                    pass
-
-        try:
-            time.sleep(3.0)
-        except KeyboardInterrupt:
-            print("\n[TCP GNSS] Stopped by user.")
-            break
+    except KeyboardInterrupt:
+        print("\n[TCP GNSS] Stopped by user.")
+    except Exception as exc:
+        print(f"[TCP GNSS ERROR] {exc}")
+    finally:
+        if sock:
+            try:
+                sock.close()
+            except Exception:
+                pass
 
 
 # ============================================================================
-# Mode 3: Live Serial / COM Port
+# Mode 3: Live Serial / Arduino Uno R3 Multiplexed Mode
 # ============================================================================
 def run_serial_mode(
     detector: VehicleStopDetector,
     imu_provider: SyntheticIMUProvider,
     port_name: str,
     baudrate: int,
+    debug: bool = False,
+    is_multiplexed: bool = True,
 ) -> None:
-    """Reads NMEA sentences from physical GPS receiver on a COM/Serial port."""
+    """
+    Reads live MAX-M10S NMEA sentences and/or interleaved IMU telemetry
+    from an Arduino Uno R3 connected over a single COM/Serial port.
+    """
     if not SERIAL_AVAILABLE:
         print("[ERROR] pyserial is required for serial mode. Install with: pip install pyserial")
         return
 
     # Auto-detect serial port if requested or if configured port doesn't exist
     if port_name in ("auto", None, "") or (not os.path.exists(port_name) and not port_name.upper().startswith("COM")):
-        candidates = []
-        for p in ("/dev/serial0", "/dev/ttyAMA0", "/dev/ttyS0"):
-            if os.path.exists(p):
-                candidates.append(p)
-        import glob
-        for p in glob.glob("/dev/ttyUSB*") + glob.glob("/dev/ttyACM*"):
-            if os.path.exists(p):
-                candidates.append(p)
-        try:
-            import serial.tools.list_ports
-            for cp in serial.tools.list_ports.comports():
-                candidates.append(cp.device)
-        except Exception:
-            pass
-        if candidates:
-            detected_port = candidates[0]
-            print(f"[SERIAL GNSS] Auto-detected GNSS serial port: {detected_port}")
-            port_name = detected_port
-        elif port_name in ("auto", None, ""):
-            print("[SERIAL GNSS] No serial port detected! Defaulting to /dev/serial0.")
-            port_name = "/dev/serial0"
+        print("[SERIAL] Probing serial ports for Arduino Uno R3 / MAX-M10S GNSS ...")
+        found_port, found_baud, found_type = auto_detect_serial_source()
+        if found_port:
+            port_name = found_port
+            if baudrate == 9600 and found_baud:
+                baudrate = found_baud
+            print(f"[SERIAL] Auto-detected: {port_name} @ {baudrate} baud (Stream Type: {found_type.upper()})")
+        else:
+            # Fallback scan
+            try:
+                ports = [cp.device for cp in serial.tools.list_ports.comports()]
+                if ports:
+                    port_name = ports[0]
+                    print(f"[SERIAL] Defaulting to available COM port: {port_name}")
+                else:
+                    print("[SERIAL ERROR] No serial/COM ports found on this laptop.")
+                    return
+            except Exception:
+                port_name = "COM3"
 
-    print(f"\n[SERIAL GNSS] Opening port {port_name} at {baudrate} baud (u-blox MAX-M10S / NEO-6M)...")
+    print("\n" + "=" * 70)
+    print(f"  CONNECTING TO SERIAL DEVICE ON {port_name} @ {baudrate} BAUD")
+    print(f"  Target: Arduino Uno R3 (u-blox MAX-M10S GNSS + MPU-6050 IMU)")
+    print("=" * 70)
+    print("Press Ctrl+C to stop.\n")
+
     parser = NMEAParser()
+    ser = None
 
     try:
-        ser = serial.Serial(port_name, baudrate=baudrate, timeout=1.0)
-        print(f"[SERIAL GNSS] Connected to {port_name}! Reading live NMEA...")
-        print("Press Ctrl+C to stop.\n")
+        ser = serial.Serial()
+        ser.port = port_name
+        ser.baudrate = baudrate
+        ser.timeout = 0.5
+        ser.write_timeout = 1.0
+        # Disable DTR/RTS to prevent continuously rebooting Arduino Uno R3 on connect
+        ser.dtr = False
+        ser.rts = False
+        ser.open()
+        ser.reset_input_buffer()
+        print(f"[SERIAL] Connected to {port_name}! Reading telemetry stream...\n")
 
         current_lat: Optional[float] = None
         current_lon: Optional[float] = None
         current_speed: float = 0.0
         current_fix: bool = False
+        current_sats: int = 0
+        current_hdop: Optional[float] = None
+        current_imu: Optional[Dict[str, Any]] = None
+
+        last_tick_time = time.monotonic()
+        tick_interval = 0.2  # 5 Hz periodic detector tick for smooth UI updates
 
         while True:
             raw_line = ser.readline()
-            if not raw_line:
-                continue
-            line = raw_line.decode("ascii", errors="replace").strip()
-            parsed = parser.parse_sentence(line)
-            if not parsed.get("valid_sentence"):
-                continue
+            now_mono = time.monotonic()
+            updated_gnss = False
 
-            if "latitude" in parsed and parsed["latitude"] is not None:
-                current_lat = parsed["latitude"]
-            if "longitude" in parsed and parsed["longitude"] is not None:
-                current_lon = parsed["longitude"]
-            if "fix" in parsed:
-                current_fix = parsed["fix"]
-            if "speed_kmh" in parsed:
-                current_speed = parsed["speed_kmh"]
+            if raw_line:
+                line = raw_line.decode("ascii", errors="replace").strip()
+                if line:
+                    if debug:
+                        print(f"[SERIAL RAW] {line}")
 
-            if parsed.get("type") in ("RMC", "GGA", "VTG"):
-                now_mono = time.monotonic()
+                    # 1. Proprietary NMEA IMU Sentence ($PIMU or $IMU)
+                    if line.startswith("$PIMU") or line.startswith("$IMU"):
+                        parsed_imu = parse_imu_line(line)
+                        if parsed_imu:
+                            current_imu = parsed_imu
+
+                    # 2. Standard NMEA sentences from MAX-M10S ($GN, $GP, $GL, $GA, $GB)
+                    elif line.startswith("$") or line.startswith("!"):
+                        parsed = parser.parse_sentence(line)
+                        if parsed.get("valid_sentence"):
+                            if "latitude" in parsed and parsed["latitude"] is not None:
+                                current_lat = parsed["latitude"]
+                            if "longitude" in parsed and parsed["longitude"] is not None:
+                                current_lon = parsed["longitude"]
+                            if "fix" in parsed:
+                                current_fix = parsed["fix"]
+                            if "speed_kmh" in parsed:
+                                current_speed = parsed["speed_kmh"]
+                            if "satellites" in parsed:
+                                current_sats = parsed["satellites"]
+                            if "hdop" in parsed:
+                                current_hdop = parsed["hdop"]
+
+                            if parsed.get("type") in ("RMC", "GGA", "VTG", "GLL"):
+                                updated_gnss = True
+
+                    # 3. Non-NMEA lines: IMU telemetry or Custom Telemetry
+                    else:
+                        parsed_imu = parse_imu_line(line)
+                        if parsed_imu:
+                            current_imu = parsed_imu
+                        else:
+                            c_gnss, c_imu = parse_custom_telemetry(line)
+                            if c_imu:
+                                current_imu = c_imu
+                            if c_gnss:
+                                if c_gnss.get("latitude") is not None:
+                                    current_lat = c_gnss["latitude"]
+                                if c_gnss.get("longitude") is not None:
+                                    current_lon = c_gnss["longitude"]
+                                if "speed_kmh" in c_gnss:
+                                    current_speed = c_gnss["speed_kmh"]
+                                if "fix" in c_gnss:
+                                    current_fix = c_gnss["fix"]
+                                if "satellites" in c_gnss:
+                                    current_sats = c_gnss["satellites"]
+                                updated_gnss = True
+
+            # Trigger detector update whenever GNSS fixes arrive or periodic timer fires
+            if updated_gnss or (now_mono - last_tick_time >= tick_interval):
+                last_tick_time = now_mono
                 rtc_now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                imu_data = imu_provider.get_imu_reading(current_speed)
+
+                # Fused IMU: prefer live Arduino IMU reading from this COM port if available,
+                # else fallback to imu_provider (which may be external or synthetic)
+                fused_imu = current_imu if current_imu is not None else imu_provider.get_imu_reading(current_speed)
 
                 status = detector.update(
                     vehicle_speed=current_speed,
-                    imu_data=imu_data,
+                    imu_data=fused_imu,
                     latitude=current_lat,
                     longitude=current_lon,
                     rtc_timestamp=rtc_now,
@@ -1881,7 +1672,13 @@ def run_serial_mode(
                     now_mono=now_mono,
                 )
 
-                imu_tag = "ACTIVE" if (imu_data and imu_data.get("valid")) else "NONE"
+                fix_tag = "3D FIX" if (current_fix and current_sats >= 4) else "FIX" if current_fix else "SEARCH"
+                if fused_imu and fused_imu.get("valid"):
+                    accel_str = f"|a|={fused_imu.get('accel_magnitude_ms2', 9.8):.2f}"
+                    imu_tag = f"OK ({accel_str})"
+                else:
+                    imu_tag = "NONE"
+
                 print_status_line(
                     timestamp_str=rtc_now.split(" ")[1],
                     speed=current_speed,
@@ -1892,12 +1689,19 @@ def run_serial_mode(
                     rest_prog=status["rest_debounce_progress"],
                     motion_prog=status["motion_debounce_progress"],
                     imu_status=imu_tag,
+                    fix_tag=fix_tag,
                 )
 
     except KeyboardInterrupt:
-        print("\n[SERIAL GNSS] Stopped by user.")
+        print("\n[SERIAL] Stopped by user.")
     except Exception as exc:
-        print(f"[SERIAL GNSS ERROR] {exc}")
+        print(f"[SERIAL ERROR] {exc}")
+    finally:
+        if ser and ser.is_open:
+            try:
+                ser.close()
+            except Exception:
+                pass
 
 
 # ============================================================================
@@ -1907,20 +1711,12 @@ def run_manual_mode(
     detector: VehicleStopDetector,
     imu_provider: SyntheticIMUProvider,
 ) -> None:
-    """
-    Interactive console runner where the user can enter speeds and commands:
-      'speed <val>' or just '<val>' : Set vehicle speed in km/h (e.g. 0, 2.5, 15)
-      'cap'                         : Record a simulated motion frame capture
-      'drift'                       : Inject 5 meters of GPS stationary drift
-      'status'                      : Show detector state and active stop metrics
-      'help'                        : Show available commands
-      'quit' or 'q'                 : Exit
-    """
+    """Interactive console runner where user can input speeds and test stop detection."""
     print("\n" + "=" * 70)
     print("  INTERACTIVE MANUAL STOP DETECTION TEST CONSOLE")
     print("=" * 70)
     print("Commands:")
-    print("  <number>        : Set vehicle speed in km/h (e.g., '0' to stop, '25' to drive)")
+    print("  <number>        : Set vehicle speed in km/h (e.g. '0' to stop, '25' to drive)")
     print("  cap             : Record a simulated motion frame capture during an active stop")
     print("  drift <meters>  : Inject stationary GPS coordinate drift")
     print("  status          : Print full current detector status")
@@ -1930,8 +1726,6 @@ def run_manual_mode(
     current_lat = 20.932000
     current_lon = 77.752300
     current_speed = 30.0
-
-    # Background tick thread to keep debouncers and duration updating smoothly
     running = True
 
     def tick_loop() -> None:
@@ -1950,66 +1744,46 @@ def run_manual_mode(
                 gps_valid=True,
                 now_mono=now_mono,
             )
-            time.sleep(0.2)
+            time.sleep(0.5)
 
-    bg_thread = threading.Thread(target=tick_loop, daemon=True)
-    bg_thread.start()
+    tick_thread = threading.Thread(target=tick_loop, daemon=True)
+    tick_thread.start()
 
     try:
         while True:
-            cmd = input("cmd [speed/cap/drift/status/q] > ").strip().lower()
+            cmd = input("stop-test> ").strip().lower()
             if not cmd:
                 continue
-
             if cmd in ("q", "quit", "exit"):
                 break
-
-            if cmd == "cap":
-                now_mono = time.monotonic()
-                detector.record_capture(
-                    {
-                        "filename": f"interactive_capture_{len(detector.active_stop.captures) + 1 if detector.active_stop else 0}.jpg",
+            elif cmd == "status":
+                dur = detector.get_stop_duration()
+                print(
+                    f"State: {detector.state} | Duration: {format_duration(dur)} | "
+                    f"Speed: {current_speed:.1f} km/h | Rest Thresh: {detector.rest_speed_threshold:.1f} km/h | "
+                    f"Motion Gate: {detector.stop_speed_gate:.1f} km/h"
+                )
+            elif cmd == "cap":
+                if detector.is_stopped:
+                    detector.record_capture({
+                        "filename": f"manual_cap_{int(time.time())}.jpg",
                         "latitude": current_lat,
                         "longitude": current_lon,
-                    },
-                    now_mono=now_mono,
-                )
-                continue
-
-            if cmd.startswith("drift"):
+                    })
+                else:
+                    print("Vehicle is MOVING — captures are logged only when STOPPED.")
+            elif cmd.startswith("drift"):
                 parts = cmd.split()
-                meters = float(parts[1]) if len(parts) > 1 else 3.0
-                # 1 meter ~ 0.000009 degrees
-                current_lat += (meters * 0.000009)
-                print(f"[DRIFT] Shifted GPS position by +{meters:.1f} m -> ({current_lat:.8f}, {current_lon:.8f})")
-                continue
-
-            if cmd == "status":
-                dur = detector.current_stop_duration
-                print("-" * 50)
-                print(f"  Detector State:    {detector.state}")
-                print(f"  Vehicle Speed:     {current_speed:.1f} km/h")
-                print(f"  Active Stop ID:    {detector.active_stop.stop_id if detector.active_stop else 'None'}")
-                print(f"  Stop Duration:     {format_duration(dur)}")
-                if detector.active_stop:
-                    print(f"  Captures Recorded: {len(detector.active_stop.captures)}")
-                    print(f"  Max GPS Drift:     {detector.active_stop.max_drift_m:.2f} m")
-                print("-" * 50)
-                continue
-
-            # Try parsing as a numeric speed value
-            try:
-                parts = cmd.replace("speed", "").strip()
-                val = float(parts)
-                current_speed = max(0.0, val)
-                print(f"[SPEED SET] Vehicle speed changed to {current_speed:.1f} km/h.")
-                if current_speed < detector.rest_speed_threshold:
-                    print(f"  -> Below rest threshold (< {detector.rest_speed_threshold:.1f} km/h). Rest debounce started...")
-                elif current_speed > detector.stop_speed_gate:
-                    print(f"  -> Above motion gate (> {detector.stop_speed_gate:.1f} km/h). Motion debounce started...")
-            except ValueError:
-                print(f"Unknown command: '{cmd}'. Enter a speed number (e.g. '0' or '25') or 'cap', 'drift', 'q'.")
-
+                dist = float(parts[1]) if len(parts) > 1 else 5.0
+                current_lat += (dist / 111111.0)
+                print(f"[DRIFT] Injected {dist:.1f}m coordinate drift.")
+            else:
+                try:
+                    val = float(cmd.replace("speed", "").strip())
+                    current_speed = max(0.0, val)
+                    print(f"[SPEED SET] Vehicle speed changed to {current_speed:.1f} km/h.")
+                except ValueError:
+                    print("Unknown command. Enter a speed number, 'cap', 'drift', 'status', or 'q'.")
     finally:
         running = False
 
@@ -2054,7 +1828,7 @@ def run_file_mode(
             if "speed_kmh" in parsed:
                 current_speed = parsed["speed_kmh"]
 
-            if parsed.get("type") in ("RMC", "GGA", "VTG"):
+            if parsed.get("type") in ("RMC", "GGA", "VTG", "GLL"):
                 now_mono = time.monotonic()
                 rtc_now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 imu_data = imu_provider.get_imu_reading(current_speed)
@@ -2069,6 +1843,7 @@ def run_file_mode(
                     now_mono=now_mono,
                 )
 
+                fix_tag = "FIX" if current_fix else "VOID"
                 imu_tag = "ACTIVE" if (imu_data and imu_data.get("valid")) else "NONE"
                 print_status_line(
                     timestamp_str=rtc_now.split(" ")[1],
@@ -2080,6 +1855,7 @@ def run_file_mode(
                     rest_prog=status["rest_debounce_progress"],
                     motion_prog=status["motion_debounce_progress"],
                     imu_status=imu_tag,
+                    fix_tag=fix_tag,
                 )
 
                 time.sleep(0.1 / max(0.1, playback_speed))
@@ -2092,73 +1868,63 @@ def run_file_mode(
 # ============================================================================
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Standalone GNSS & IMU Stop Detection Test Harness",
+        description="Standalone GNSS & IMU Stop Detection Test Harness (u-blox MAX-M10S + Arduino Uno R3)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # 1. Run automated simulation (no hardware needed):
+  # 1. Test on laptop with Arduino Uno R3 (GNSS + IMU connected):
+  python test_gnss_stop_detection.py --mode arduino
+
+  # 2. Specify exact COM port and baud rate:
+  python test_gnss_stop_detection.py --mode arduino --serial-port COM3 --baud 115200
+
+  # 3. Run automated simulation (no hardware needed):
   python test_gnss_stop_detection.py --mode sim
 
-  # 2. Run simulation with synthetic IMU fusion enabled:
+  # 4. Run simulation with synthetic IMU fusion enabled:
   python test_gnss_stop_detection.py --mode sim --imu synthetic
 
-  # 3. Connect to live TCP NMEA stream:
+  # 5. Connect to live TCP NMEA stream (mobile phone GPS):
   python test_gnss_stop_detection.py --mode tcp --host 10.208.43.190 --port 10110
 
-  # 4. Interactive manual testing:
+  # 6. Interactive manual testing:
   python test_gnss_stop_detection.py --mode manual
-
-  # 5. Connect with live TCP GNSS + live Arduino IMU (COM3 @ 115200):
-  python test_gnss_stop_detection.py --mode tcp --imu-port COM3 --imu-baud 115200
-
-  # 6. Read physical GPS receiver via serial COM port:
-  python test_gnss_stop_detection.py --mode serial --serial-port COM4 --baud 9600
         """,
     )
 
     parser.add_argument(
         "--mode",
-        choices=["sim", "tcp", "serial", "manual", "file"],
-        default="serial",
-        help="Execution mode (default: 'serial')",
+        choices=["arduino", "serial", "sim", "tcp", "manual", "file"],
+        default="arduino",
+        help="Execution mode (default: 'arduino')",
     )
     parser.add_argument(
         "--imu",
         choices=["none", "synthetic", "arduino", "auto"],
         default="auto",
-        help=(
-            "IMU mode: 'auto' (detect Arduino IMU on COM port, fallback to none), "
-            "'arduino' (connect to physical Arduino IMU), 'synthetic' (simulated), "
-            "or 'none' (GNSS only). (default: auto)"
-        ),
+        help="IMU mode: 'auto' (detect Arduino IMU), 'arduino', 'synthetic', or 'none' (default: auto)",
+    )
+    parser.add_argument(
+        "--serial-port", "--port",
+        dest="serial_port",
+        default="auto",
+        help="Serial port for Arduino / GNSS receiver (e.g. COM3, COM4). Default: 'auto'",
+    )
+    parser.add_argument(
+        "--baud",
+        type=int,
+        default=115200,
+        help="Serial baud rate (Arduino default: 115200, MAX-M10S raw default: 9600)",
     )
     parser.add_argument(
         "--imu-port",
         default="auto",
-        help=(
-            "Serial port for Arduino IMU (e.g. COM3). "
-            "Use 'auto' to scan available ports automatically (default: auto)"
-        ),
+        help="Separate serial port for IMU if not multiplexed on same Arduino COM port (default: auto)",
     )
     parser.add_argument(
         "--imu-baud",
         default="auto",
-        help=(
-            "Baud rate for Arduino IMU serial port (e.g. 115200). "
-            "Use 'auto' to probe common rates (default: auto)"
-        ),
-    )
-    parser.add_argument(
-        "--imu-debug",
-        action="store_true",
-        default=False,
-        help="Print every raw line received from the Arduino IMU (very verbose)",
-    )
-    parser.add_argument(
-        "--imu-verbose",
-        action="store_true",
-        default=False,
-        help="Print each successfully parsed IMU reading from Arduino",
+        help="Baud rate for separate IMU port (default: auto)",
     )
     parser.add_argument(
         "--host",
@@ -2166,21 +1932,10 @@ Examples:
         help=f"TCP NMEA host IP (default: {DEFAULT_TCP_HOST})",
     )
     parser.add_argument(
-        "--port",
+        "--tcp-port",
         type=int,
         default=DEFAULT_TCP_PORT,
         help=f"TCP NMEA port (default: {DEFAULT_TCP_PORT})",
-    )
-    parser.add_argument(
-        "--serial-port",
-        default="auto",
-        help="Serial/UART port for GPS receiver (default: 'auto')",
-    )
-    parser.add_argument(
-        "--baud",
-        type=int,
-        default=9600,
-        help="Serial baud rate for GPS receiver (u-blox MAX-M10S / NEO-6M default: 9600)",
     )
     parser.add_argument(
         "--file",
@@ -2211,18 +1966,6 @@ Examples:
         help=f"Debounce seconds to confirm motion (default: {MOTION_DEBOUNCE_SEC})",
     )
     parser.add_argument(
-        "--auto-detect",
-        action="store_true",
-        default=True,
-        help="Auto-detect TCP NMEA server across network interfaces (default: enabled)",
-    )
-    parser.add_argument(
-        "--no-auto-detect",
-        dest="auto_detect",
-        action="store_false",
-        help="Disable auto-detection and connect strictly to specified --host",
-    )
-    parser.add_argument(
         "--speed-smoothing",
         type=int,
         default=SPEED_SMOOTHING_WINDOW,
@@ -2232,16 +1975,11 @@ Examples:
         "--debug",
         action="store_true",
         default=False,
-        help="Print raw NMEA sentences as they arrive (useful for diagnosing live feed issues)",
+        help="Print raw NMEA and serial telemetry lines as they arrive",
     )
 
     args = parser.parse_args()
 
-    # If the user explicitly provided an IMU port or baud, activate arduino mode
-    if (args.imu_port.strip().lower() != "auto" or str(args.imu_baud).strip().lower() != "auto") and args.imu in ("auto", "none"):
-        args.imu = "arduino"
-
-    # Instantiate detector with requested configuration
     detector = VehicleStopDetector(
         stop_speed_gate=args.motion_thresh,
         rest_speed_threshold=args.rest_thresh,
@@ -2252,104 +1990,42 @@ Examples:
         speed_smoothing_window=args.speed_smoothing,
     )
 
-    # -- Arduino IMU setup ---------------------------------------------------
+    # Separate IMU reader only needed if mode is TCP/sim with physical IMU,
+    # or if user explicitly requested two different COM ports for GNSS and IMU
     arduino_reader: Optional[ArduinoIMUReader] = None
-    if args.imu in ("arduino", "auto"):
-        if not SERIAL_AVAILABLE:
-            if args.imu == "arduino":
-                print("[IMU-ARDUINO] ERROR: pyserial is not installed.")
-                print("[IMU-ARDUINO]        Install with:  pip install pyserial")
-                sys.exit(1)
-            else:
-                args.imu = "none"
+    use_separate_imu_port = (
+        args.imu in ("arduino", "auto")
+        and args.imu_port.strip().lower() != "auto"
+        and args.imu_port.strip().upper() != args.serial_port.strip().upper()
+    )
 
-        if SERIAL_AVAILABLE:
-            # Resolve port and baud — run auto-detect when either is 'auto'
-            imu_port_arg  = args.imu_port.strip()
-            imu_baud_arg  = str(args.imu_baud).strip().lower()
-
-            need_port_detect = (imu_port_arg.lower() == "auto")
-            need_baud_detect = (imu_baud_arg == "auto")
-
-            resolved_port: Optional[str]  = None if need_port_detect else imu_port_arg
-            resolved_baud: Optional[int]  = None if need_baud_detect else int(imu_baud_arg)
-
-            if need_port_detect or need_baud_detect:
-                print("[IMU-AUTO-DETECT] Probing serial ports for Arduino IMU ...")
-                if need_port_detect and need_baud_detect:
-                    found_port, found_baud = ArduinoIMUReader.auto_detect()
-                elif need_port_detect:
-                    found_port, found_baud = ArduinoIMUReader.auto_detect(
-                        candidate_bauds=[resolved_baud]
-                    )
-                else:
-                    found_port, found_baud = ArduinoIMUReader.auto_detect(
-                        candidate_ports=[resolved_port]
-                    )
-
-                if found_port and found_baud:
-                    resolved_port = found_port
-                    resolved_baud = found_baud
-                    print(f"[IMU-AUTO-DETECT] SUCCESS — using {resolved_port} @ {resolved_baud} baud")
-                    args.imu = "arduino"
-                else:
-                    if args.imu == "arduino":
-                        print("[IMU-AUTO-DETECT] FAILED — could not locate Arduino IMU.")
-                        print("[IMU-AUTO-DETECT] Falling back to GNSS-only mode.")
-                    else:
-                        print("[IMU-AUTO-DETECT] No Arduino IMU detected; proceeding in GNSS-only mode.")
-                    args.imu = "none"
-
-            if args.imu == "arduino" and resolved_port and resolved_baud:
-                # Collision warning if GPS and IMU are assigned the same serial port
-                if args.mode == "serial" and args.serial_port.strip().upper() == resolved_port.strip().upper():
-                    print(f"\n[WARNING] Collision: --serial-port and --imu-port are both set to {resolved_port}!")
-                    print(f"  Arduino Uno on {resolved_port} streams IMU telemetry, not NMEA GPS.")
-                    print(f"  For GNSS data, connect via --mode tcp (phone) or use a separate GPS COM port.")
-                    print(f"  Proceeding with {resolved_port} assigned to IMU.\n")
-
-                arduino_reader = ArduinoIMUReader(
-                    port=resolved_port,
-                    baudrate=resolved_baud,
-                    debug=args.imu_debug,
-                    verbose=args.imu_verbose,
-                )
-                ok = arduino_reader.start()
-                if not ok:
-                    print("[IMU-ARDUINO] Could not open IMU port — falling back to GNSS-only mode.")
-                    arduino_reader = None
-                    args.imu = "none"
-                else:
-                    # Brief settle time for first packets
-                    time.sleep(0.5)
-                    first = arduino_reader.get_latest()
-                    if first:
-                        print(f"[IMU-ARDUINO] Stream active! First valid reading: {first}")
-                    else:
-                        time.sleep(1.0)
-                        first = arduino_reader.get_latest()
-                        if first:
-                            print(f"[IMU-ARDUINO] Stream active! First valid reading: {first}")
-                        else:
-                            print("[IMU-ARDUINO] Port opened, waiting for valid packets...")
-                            arduino_reader.print_diagnostics()
+    if use_separate_imu_port and SERIAL_AVAILABLE:
+        imu_baud_int = int(args.imu_baud) if str(args.imu_baud).isdigit() else 115200
+        arduino_reader = ArduinoIMUReader(port=args.imu_port.strip(), baudrate=imu_baud_int, debug=args.debug)
+        arduino_reader.start()
 
     imu_provider = SyntheticIMUProvider(mode=args.imu, arduino_reader=arduino_reader)
 
-    # Route to requested mode
-    if args.mode == "sim":
+    # Dispatch to requested mode
+    if args.mode in ("arduino", "serial"):
+        run_serial_mode(
+            detector,
+            imu_provider,
+            port_name=args.serial_port,
+            baudrate=args.baud,
+            debug=args.debug,
+            is_multiplexed=True,
+        )
+    elif args.mode == "sim":
         run_simulation(detector, imu_provider)
     elif args.mode == "tcp":
         run_tcp_mode(
             detector,
             imu_provider,
             host=args.host,
-            port=args.port,
-            auto_detect=args.auto_detect,
+            port=args.tcp_port,
             debug=args.debug,
         )
-    elif args.mode == "serial":
-        run_serial_mode(detector, imu_provider, port_name=args.serial_port, baudrate=args.baud)
     elif args.mode == "manual":
         run_manual_mode(detector, imu_provider)
     elif args.mode == "file":

@@ -555,9 +555,6 @@ def _dispatch(line: str) -> bool:
         elif sentence_id.endswith("RMC"):
             _parse_rmc(fields)
             return True
-        elif sentence_id.endswith("GLL"):
-            _parse_gll(fields)
-            return True
         elif sentence_id.endswith("VTG"):
             _parse_vtg(fields)
             return True
@@ -567,6 +564,7 @@ def _dispatch(line: str) -> bool:
         elif sentence_id.endswith("GSV"):
             _parse_gsv(fields, talker)
             return True
+        # GLL omitted to avoid lower-precision / conflicting talker updates (matches test_max_m10s_gnss.py)
 
         return False
     except Exception:
@@ -626,7 +624,10 @@ def _serial_thread() -> None:
             _stop_event.wait(RECONNECT_DELAY)
             continue
 
-        target_port = _target_port or auto_detect_gnss_port() or getattr(_cfg, "GNSS_SERIAL_PORT", "/dev/serial0")
+        # Resolve serial port: if user/configured port is missing on this machine, auto-detect (mirrors test_max_m10s_gnss.py)
+        target_port = _target_port
+        if not target_port or (target_port.startswith("/dev") and not os.path.exists(target_port)):
+            target_port = auto_detect_gnss_port() or getattr(_cfg, "GNSS_SERIAL_PORT", "/dev/serial0")
         target_baud = _target_baud or getattr(_cfg, "GNSS_BAUD_RATE", 9600)
 
         ser = None
@@ -676,9 +677,9 @@ def _serial_thread() -> None:
 
                 except (serial.SerialException, OSError) as port_err:
                     consecutive_io_errors += 1
-                    # Only tear down connection if serial port has truly failed or was unplugged
-                    if consecutive_io_errors >= 3 or not os.path.exists(target_port):
-                        print(f"[GNSS] Serial port connection error on {target_port}: {port_err}")
+                    # Only tear down connection if serial port has truly failed continuously (unplugged)
+                    if consecutive_io_errors >= 10:
+                        print(f"[GNSS] Serial port connection error on {target_port} (sustained): {port_err}")
                         break
                     time.sleep(0.05)
                 except Exception:

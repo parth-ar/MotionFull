@@ -1,9 +1,10 @@
 """
 network/uploader.py — Backend HTTP worker threads.
 
-Verbatim port of all three HTTP upload workers from webcam_motion_detect.py:
+Verbatim port of all HTTP upload workers:
   live_frame_streamer     → POST /api/camera/{deviceId}/frame
   telemetry_streamer      → POST /api/telemetry/ingest-batch
+  raw_gnss_streamer       → POST /api/{vehicle_id}/live_location
   evidence_upload_worker  → POST /api/evidence/upload
 
 Also contains:
@@ -451,6 +452,131 @@ def telemetry_streamer(backend_url: str, session_id_arg: int, ulb_id: str,
         stop_event.wait(0.1)  # 10 Hz batch flush for ultra-smooth sequential streaming
 
     session.close()
+
+
+# ---------------------------------------------------------------------------
+# Raw GNSS Live Location Streamer (POST /api/{vehicle_id}/live_location)
+# ---------------------------------------------------------------------------
+def raw_gnss_streamer(backend_url: str, vehicle_id: str,
+                      stop_event: threading.Event,
+                      rate_hz: float = 1.0) -> None:
+    """Streams live, un-snapped raw GNSS coordinates to POST /api/{vehicle_id}/live_location.
+
+    backend_url — Base URL of the SWSTP Backend (e.g. http://192.168.1.100:5000)
+    vehicle_id  — Unique vehicle identifier (e.g. MH-27-TR-102 or SWSTP-AMRMC-001)
+    stop_event  — threading.Event to cleanly terminate the background worker
+    rate_hz     — Streaming frequency in Hertz (default: 1.0 Hz)
+    """
+    import sensors.gnss as gnss_sensor
+    import sensors.rtc as rtc_sensor
+    from telemetry import latest_sensor, hardware_state
+
+    target_hz = max(0.1, min(10.0, rate_hz))
+    interval = 1.0 / target_hz
+    stream_url = f"{backend_url.rstrip('/')}/api/{vehicle_id}/live_location"
+
+    session = requests.Session()
+    adapter = requests.adapters.HTTPAdapter(pool_connections=5, pool_maxsize=10, max_retries=0)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+
+    logged_first_ok = False
+    _last_err_log = 0.0
+    _ERR_LOG_INTERVAL = 15.0
+
+    print(f"[RAW GNSS STREAM] Worker started -> Destination: {stream_url} @ {target_hz:.1f} Hz")
+
+    while not stop_event.is_set():
+        tick_start = time.monotonic()
+
+        try:
+            # Read direct raw hardware GNSS snapshot
+            gnss_snap = gnss_sensor.read()
+            raw_lat = gnss_snap.get("latitude")
+            raw_lon = gnss_snap.get("longitude")
+            has_fix = bool(gnss_snap.get("fix"))
+            sats = gnss_snap.get("satellites", 0)
+            alt = gnss_snap.get("altitude_m")
+            spd = gnss_snap.get("speed_kmh")
+            course = gnss_snap.get("course_deg")
+            hdop = gnss_snap.get("hdop")
+            gnss_status = gnss_snap.get("status", "NO_DATA")
+
+            # Fallback to latest_sensor raw fields if gnss_snap had momentary lock contention
+            if raw_lat is None:
+                raw_lat = latest_sensor.get("raw_gps_lat")
+            if raw_lon is None:
+                raw_lon = latest_sensor.get("raw_gps_lon")
+
+            utc_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            rtc_data = rtc_sensor.read()
+            rtc_ts = rtc_data.get("timestamp") or utc_iso
+            cur_dev = latest_sensor.get("deviceId") or dynamic_session_info.get("deviceId") or "UNPROVISIONED"
+
+            payload = {
+                "vehicle_id":         vehicle_id,
+                "vehicleId":          vehicle_id,
+                "device_id":          cur_dev,
+                "deviceId":           cur_dev,
+                "latitude":           raw_lat,
+                "lat":                raw_lat,
+                "longitude":          raw_lon,
+                "lon":                raw_lon,
+                "lng":                raw_lon,
+                "altitude":           alt or 0.0,
+                "altitude_m":         alt or 0.0,
+                "speed_kmh":          spd or 0.0,
+                "speed":              spd or 0.0,
+                "heading":            course,
+                "course_deg":         course,
+                "hdop":               hdop,
+                "satellites":         sats,
+                "satellites_in_view": gnss_snap.get("satellites_in_view", sats),
+                "fix":                has_fix,
+                "status":             gnss_status,
+                "timestamp":          rtc_ts,
+                "utc_timestamp":      utc_iso,
+                "epoch_ms":           int(time.time() * 1000),
+                "location_source":    "raw_gnss",
+                "is_snapped":         False,
+            }
+
+            resp = session.post(
+                stream_url,
+                json=payload,
+                headers={"Content-Type": "application/json", "Connection": "keep-alive"},
+                timeout=3.0,
+            )
+
+            if resp.status_code in (200, 201, 204):
+                if not logged_first_ok:
+                    logged_first_ok = True
+                    print(f"\n[RAW GNSS STREAM] Connected -> Streaming live location to {stream_url} (HTTP {resp.status_code} OK)\n")
+            else:
+                now = time.monotonic()
+                if now - _last_err_log > _ERR_LOG_INTERVAL:
+                    print(f"[RAW GNSS STREAM] Destination {stream_url} returned HTTP {resp.status_code}")
+                    _last_err_log = now
+
+        except requests.RequestException as net_err:
+            now = time.monotonic()
+            if now - _last_err_log > _ERR_LOG_INTERVAL:
+                print(f"[RAW GNSS STREAM] Network note for {stream_url}: {net_err}")
+                _last_err_log = now
+        except Exception as exc:
+            now = time.monotonic()
+            if now - _last_err_log > _ERR_LOG_INTERVAL:
+                print(f"[RAW GNSS STREAM] Unexpected error: {exc}")
+                _last_err_log = now
+
+        elapsed = time.monotonic() - tick_start
+        sleep_dur = max(0.01, interval - elapsed)
+        stop_event.wait(sleep_dur)
+
+    try:
+        session.close()
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------

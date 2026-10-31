@@ -2,11 +2,11 @@
 motion.py — Motion detection, ROI polygon management, and frame overlay.
 (SWSTP Unified — adapted from swstp_edge/motion.py)
 
-No algorithm parameters have been changed:
-  DIFF_THRESHOLD   = 22
-  MIN_CONTOUR_AREA = 350
-  BG_ALPHA         = 0.04
-  WARMUP_FRAMES    = 30
+Motion detection parameters (tuned for light shock & reflection rejection):
+  DIFF_THRESHOLD    = 30
+  MIN_CONTOUR_AREA  = 700
+  BG_ALPHA          = 0.05
+  WARMUP_FRAMES     = 30
   SAVE_COOLDOWN_SEC = 5.0
 
 The ROI polygon stored in roi_polygon.json is ALSO used as the Area of

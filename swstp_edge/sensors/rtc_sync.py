@@ -66,24 +66,18 @@ _OSF_BIT       = 0x80   # bit 7 of status register
 _NTP_EPOCH_DELTA = 2208988800   # seconds between 1900-01-01 and 1970-01-01
 _NTP_PACKET_FMT  = "!12I"       # 12 unsigned 32-bit integers, big-endian
 _NTP_PORT        = 123
-_NTP_TIMEOUT_SEC = 2.5          # fast timeout to avoid delaying boot
+_NTP_TIMEOUT_SEC = 1.5          # fast timeout to avoid delaying background threads
 
-# Prioritize Indian NTP pool servers for optimal latency in Maharashtra
+# Prioritize fast, reliable Indian NTP pool servers and global anycast
 _NTP_SERVERS = [
     "0.in.pool.ntp.org",
-    "1.in.pool.ntp.org",
-    "2.in.pool.ntp.org",
-    "3.in.pool.ntp.org",
     "time.google.com",
     "time.cloudflare.com",
-    "pool.ntp.org",
-    "time.windows.com",
 ]
 
 _HTTP_TIME_URLS = [
     "https://clients3.google.com/generate_204",
     "https://www.cloudflare.com",
-    "https://www.google.com",
 ]
 
 
@@ -550,19 +544,53 @@ def recalibrate_from_internet(ntp_servers=None, dry_run: bool = False,
 
 
 # ---------------------------------------------------------------------------
-# Periodic Sync Loop (Hourly)
+# Background Async Sync & Recalibration Loop
 # ---------------------------------------------------------------------------
-def periodic_sync_loop(interval_hours: float = 1.0, stop_event=None) -> None:
+_bg_sync_thread = None
+_bg_stop_event = None
+
+def start_background_sync(interval_hours: float = 1.0, stop_event=None):
     """
-    Recalibrate the system clock and DS3231 from internet every `interval_hours` (default: 1.0 h = hourly).
-    Designed to run as a background daemon thread from main.py.
+    Start the background daemon thread that handles:
+      1. Post-boot internet time synchronization (as soon as LTE/WiFi is online).
+      2. Hourly recalibration of Linux system clock and DS3231 from NTP/HTTP.
+    Runs 100% asynchronously — zero boot latency!
     """
     import threading
+    global _bg_sync_thread, _bg_stop_event
     _stop = stop_event or threading.Event()
-    while not _stop.is_set():
-        _stop.wait(interval_hours * 3600)
-        if not _stop.is_set():
+    _bg_stop_event = _stop
+
+    def _worker():
+        # Step 1: Wait 4s after boot to allow network interfaces / cellular to settle
+        if _stop.wait(4.0):
+            return
+
+        # Attempt initial calibration with backoff retries if network is still negotiating
+        for attempt, delay in enumerate([0.0, 10.0, 25.0], 1):
+            if delay > 0 and _stop.wait(delay):
+                return
+            res = recalibrate_from_internet(verbose=True)
+            if res.success:
+                print(f"[RTC-SYNC] Background initial clock sync successful on attempt #{attempt}.")
+                break
+
+        # Step 2: Settle into regular hourly recalibration loop
+        interval_sec = max(60.0, interval_hours * 3600.0)
+        while not _stop.is_set():
+            if _stop.wait(interval_sec):
+                break
             recalibrate_from_internet(verbose=True)
+
+    _bg_sync_thread = threading.Thread(target=_worker, name="rtc-bg-sync", daemon=True)
+    _bg_sync_thread.start()
+    return _bg_sync_thread
+
+
+def periodic_sync_loop(interval_hours: float = 1.0, stop_event=None) -> None:
+    """Backward-compatible wrapper for start_background_sync."""
+    t = start_background_sync(interval_hours=interval_hours, stop_event=stop_event)
+    t.join()
 
 
 # ---------------------------------------------------------------------------

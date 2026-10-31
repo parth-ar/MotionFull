@@ -38,8 +38,7 @@ echo "[2/4] Writing /etc/systemd/system/$SERVICE_NAME..."
 sudo tee /etc/systemd/system/$SERVICE_NAME > /dev/null <<EOF
 [Unit]
 Description=SWSTP Edge Gateway — Motion & Litter Detection (Raspberry Pi 4B)
-After=network-online.target time-sync.target
-Wants=network-online.target
+After=local-fs.target
 
 [Service]
 Type=simple

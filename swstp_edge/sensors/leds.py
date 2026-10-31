@@ -126,7 +126,8 @@ def init() -> None:
         "red":        _make_led(LED_RED),
         "lte_green":  _make_led(LED_LTE_GREEN),
     }
-    _boot_splash()
+    # Run boot splash in background daemon thread to avoid delaying edge startup
+    threading.Thread(target=_boot_splash, name="led-boot-splash", daemon=True).start()
     print("[LEDS] GPIO LED driver initialised.")
 
 
