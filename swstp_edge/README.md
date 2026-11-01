@@ -210,6 +210,18 @@ pip3 install -r requirements.txt
 
 ---
 
+## Diagnostic & Calibration Tools
+
+| Script | Purpose | Usage |
+|--------|---------|-------|
+| `test_motion_thresholds.py` | Real-time motion sensitivity calibration & interactive ROI editor (Laptop & Edge) | `python test_motion_thresholds.py` |
+| `test_max_m10s_gnss.py` | Standalone u-blox MAX-M10S hardware diagnostic dashboard | `python test_max_m10s_gnss.py` |
+| `test_gnss_stop_detection.py` | Standalone stop-detection algorithm validator (with simulation and Arduino Uno support) | `python test_gnss_stop_detection.py` |
+| `test_all_sensors.py` | Comprehensive hardware diagnostic (RTC, IMU, GNSS, Camera, LEDs) | `python test_all_sensors.py` |
+| `test_raw_gnss_streamer.py` | Automated validator for `/api/{vehicle_id}/live_location` streaming | `python test_raw_gnss_streamer.py` |
+
+---
+
 ## Device Identity Provisioning
 
 Edit `device_config.json` to set the device code:

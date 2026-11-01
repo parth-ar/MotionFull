@@ -91,7 +91,8 @@ DEFAULT_BACKEND_URL = os.environ.get(
 )
 DEFAULT_ULB_ID    = "ULB_MH_AMRAVATI"
 DEFAULT_VEHICLE_ID = "UNASSIGNED"
-DEFAULT_STREAM_FPS = 30.0
+DEFAULT_STREAM_FPS = 3.0           # Live camera feed streaming FPS (reduced from 30 to protect cellular bandwidth)
+STREAM_JPEG_QUALITY = 60          # JPEG compression quality for live video stream (lightweight ~25 KB/frame)
 
 # ---------------------------------------------------------------------------
 # Camera Configuration (Raspberry Pi Camera Module 3 / IMX708 Wide NoIR)
@@ -124,6 +125,7 @@ CAMERA_TUNING_FILE       = None        # Optional path to libcamera tuning JSON 
 # ---------------------------------------------------------------------------
 TELEMETRY_RATE_HZ      = 20           # packets per second
 TELEMETRY_INTERVAL_SEC = 1.0 / TELEMETRY_RATE_HZ
+TELEMETRY_FLUSH_INTERVAL_SEC = 1.0    # seconds between /api/telemetry/ingest-batch HTTP flushes (1 Hz map rate)
 
 # ---------------------------------------------------------------------------
 # GNSS / timing thresholds
@@ -204,9 +206,10 @@ STOP_SPEED_GATE            = 5.0    # km/h: speed > 5.0 km/h ends a stop event
 REST_SPEED_THRESHOLD_KMH   = 5.0    # km/h: speed < 5.0 km/h starts a stop event
 IMU_REST_ACCEL_TOLERANCE   = 0.45   # m/s² — logged in metrics, not a gate condition
 IMU_REST_GYRO_TOLERANCE    = 4.0    # deg/s — logged in metrics, not a gate condition
-REST_DEBOUNCE_SEC          = 1.0    # seconds of sustained < 5 km/h to confirm stop
-REST_CONFIRM_SEC           = 1.0    # Alias: rest confirmation threshold in seconds
-MOTION_DEBOUNCE_SEC        = 0.6    # seconds of sustained > 5 km/h to confirm motion
+REST_DEBOUNCE_SEC          = 1.5    # seconds of sustained < 5 km/h to confirm stop
+REST_CONFIRM_SEC           = 1.5    # Alias: rest confirmation threshold in seconds
+MOTION_DEBOUNCE_SEC        = 1.0    # seconds of sustained > 5 km/h to confirm motion
+POST_REST_MOTION_HOLD_SEC  = 2.0    # seconds to hold motion capture after confirmed rest (vehicle settling window)
 
 # ---------------------------------------------------------------------------
 # Litter Detection Parameters

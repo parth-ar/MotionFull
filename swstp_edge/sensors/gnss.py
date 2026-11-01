@@ -120,6 +120,7 @@ _state = {
 # Tracking satellites grouped by talker to avoid multi-constellation GSV collisions
 _gsv_satellites_by_talker: dict[str, list[dict]] = {}
 _used_prn_set: set[int] = set()
+_used_by_sys: dict[str, set[int]] = {}   # keyed by GSA system-ID; union → _used_prn_set (Fix 3)
 
 _thread: threading.Thread | None = None
 _stop_event = threading.Event()
@@ -134,31 +135,15 @@ _target_baud: int | None = None
 # ---------------------------------------------------------------------------
 
 def auto_detect_gnss_port() -> str | None:
-    """Scan candidate serial ports for MAX-M10S on Raspberry Pi and PC.
-    Identical logic to test_max_m10s_gnss.py and test_neo6m_gnss.py.
+    """Scan Pi hardware UARTs for MAX-M10S. Only hardware UARTs are considered
+    to avoid accidentally grabbing the EC200U LTE modem's /dev/ttyUSB* ports.
+    An explicitly passed port (init(port=...)) still bypasses this function.
     """
-    candidates = []
-
-    # 1. Raspberry Pi hardware UART ports (Physical Pins 8 & 10)
-    pi_uarts = ["/dev/serial0", "/dev/ttyAMA0", "/dev/ttyS0"]
-    for p in pi_uarts:
+    # Only Raspberry Pi hardware UART paths, in priority order
+    for p in ("/dev/serial0", "/dev/ttyAMA0", "/dev/ttyS0"):
         if os.path.exists(p):
-            candidates.append(p)
-
-    # 2. USB to UART adapters (/dev/ttyUSB*, /dev/ttyACM*)
-    candidates.extend(sorted(glob.glob("/dev/ttyUSB*")))
-    candidates.extend(sorted(glob.glob("/dev/ttyACM*")))
-
-    # 3. Windows COM ports (bench/development)
-    if HAVE_PYSERIAL:
-        try:
-            ports = serial.tools.list_ports.comports()
-            for p in ports:
-                candidates.append(p.device)
-        except Exception:
-            pass
-
-    return candidates[0] if candidates else None
+            return p
+    return None
 
 
 # Backwards compatibility aliases
@@ -167,7 +152,11 @@ auto_detect_neo6m_port = auto_detect_gnss_port
 
 
 def get_candidate_ports(preferred: str | None = None) -> list[str]:
-    """Return an ordered list of candidate serial ports to probe for MAX-M10S."""
+    """Return an ordered list of candidate serial ports to probe for MAX-M10S.
+    Only Pi hardware UARTs are auto-added; USB ports are never injected here
+    to avoid the EC200U LTE modem's /dev/ttyUSB* paths. A caller-supplied
+    'preferred' port (e.g. from init(port=...)) is still honoured as-is.
+    """
     candidates = []
 
     def _add(p):
@@ -175,12 +164,12 @@ def get_candidate_ports(preferred: str | None = None) -> list[str]:
             candidates.append(p)
 
     if preferred:
-        _add(preferred)
+        _add(preferred)  # explicit port wins unconditionally (may be USB/COM)
 
     if _target_port:
         _add(_target_port)
 
-    # Auto-detected port has top priority
+    # Auto-detected Pi hardware UART
     auto_p = auto_detect_gnss_port()
     if auto_p:
         _add(auto_p)
@@ -189,24 +178,15 @@ def get_candidate_ports(preferred: str | None = None) -> list[str]:
     if cfg_port:
         _add(cfg_port)
 
+    # Remaining Pi hardware UARTs only
     for p in ("/dev/serial0", "/dev/ttyAMA0", "/dev/ttyS0"):
         if os.path.exists(p):
             _add(p)
 
-    for p in sorted(glob.glob("/dev/ttyUSB*") + glob.glob("/dev/ttyACM*")):
-        if os.path.exists(p):
-            _add(p)
-
-    if HAVE_PYSERIAL:
-        try:
-            for p in serial.tools.list_ports.comports():
-                _add(p.device)
-        except Exception:
-            pass
-
     return candidates
 
 
+# Only useful if the MAX-M10S RST pin is physically wired to BCM 16. Not called automatically.
 def hardware_reset() -> bool:
     """Pulse the active-low RST pin on MAX-M10S (Physical 36 / BCM 16) if present.
     Safely no-ops if not running on Raspberry Pi GPIO.
@@ -246,7 +226,7 @@ def _nmea_checksum_ok(sentence: str) -> bool:
     """Return True if the NMEA sentence has a valid XOR checksum."""
     try:
         if "*" not in sentence:
-            return True   # accept sentences without checksum
+            return False   # reject sentences without checksum (Fix 5)
         body, cs = sentence.rsplit("*", 1)
         body = body.lstrip("$").lstrip("!")
         computed = 0
@@ -343,8 +323,7 @@ def _parse_gga(fields: list) -> None:
     with _lock:
         _state["data_received"]  = True
         _state["last_data_time"] = now
-        if num_sats > 0:
-            _state["satellites"] = num_sats
+        _state["satellites"] = num_sats   # always update, including 0 (Fix 4)
         if hdop is not None:
             _state["hdop"]       = round(hdop, 2)
         if alt is not None:
@@ -430,8 +409,12 @@ def _parse_gsa(fields: list) -> None:
         if p > 0:
             used_prns.add(p)
 
-    global _used_prn_set
-    _used_prn_set = used_prns
+    # Fix 3: key by system-ID so parallel GNGSA sentences (one per constellation)
+    # don't overwrite each other; _used_prn_set becomes their union.
+    global _used_prn_set, _used_by_sys
+    sys_id = fields[18].split("*")[0].strip() if len(fields) > 18 else "0"
+    _used_by_sys[sys_id] = used_prns
+    _used_prn_set = set().union(*_used_by_sys.values()) if _used_by_sys else set()
 
     now = time.monotonic()
     with _lock:
@@ -439,8 +422,7 @@ def _parse_gsa(fields: list) -> None:
         _state["last_data_time"] = now
         if hdop is not None:
             _state["hdop"] = round(hdop, 2)
-        if used_prns and not _state["satellites"]:
-            _state["satellites"] = len(used_prns)
+        # Fix 4: satellite count comes from GGA only; no fallback here
 
 
 def _parse_gsv(fields: list, talker: str) -> None:
@@ -575,9 +557,11 @@ def _reset_state_to_disconnected() -> None:
     """Strictly reset all GNSS state when serial port closes or NMEA stream is disconnected.
     Ensures zero stale coordinates or false fixes are retained.
     """
-    global gnss_ok, _active_port
+    global gnss_ok, _active_port, _used_prn_set, _used_by_sys
     gnss_ok = False
     _active_port = None
+    _used_by_sys.clear()          # Fix 3: clear per-system PRN sets on disconnect
+    _used_prn_set = set()
     with _lock:
         _state["data_received"]         = False
         _state["fix"]                   = False
@@ -648,6 +632,11 @@ def _serial_thread() -> None:
             continue
 
         consecutive_io_errors = 0
+        # Fix 2: count lines that carry bytes but produce no valid NMEA sentence
+        _garbage_line_count = 0
+        _garbage_warned = False
+        # Threshold: roughly 10 s of non-NMEA bytes at 1-s readline timeout
+        _GARBAGE_THRESHOLD = int(10 / _READ_TIMEOUT_SEC)
 
         try:
             while not _stop_event.is_set():
@@ -659,12 +648,9 @@ def _serial_thread() -> None:
                         continue
 
                     consecutive_io_errors = 0
-                    now_mono = time.monotonic()
-                    with _lock:
-                        _state["data_received"] = True
-                        _state["last_data_time"] = now_mono
 
                     line = line_bytes.decode("ascii", errors="replace").strip()
+                    dispatched_any = False
                     if "$" in line:
                         # Split concatenated NMEA sentences if multiple arrived in buffer
                         parts = line.split("$")
@@ -674,9 +660,20 @@ def _serial_thread() -> None:
                                 continue
                             sentence = "$" + p_clean
                             if _dispatch(sentence):
+                                dispatched_any = True
                                 if not gnss_ok:
                                     gnss_ok = True
                                     print(f"[GNSS] Primary GNSS stream locked: u-blox MAX-M10S on {target_port} @ {target_baud} baud")
+
+                    # Fix 2: track garbage (bytes with no valid NMEA) to warn about baud/wiring
+                    if dispatched_any:
+                        _garbage_line_count = 0
+                        _garbage_warned = False
+                    else:
+                        _garbage_line_count += 1
+                        if _garbage_line_count >= _GARBAGE_THRESHOLD and not _garbage_warned:
+                            print("[GNSS] Bytes received but no valid NMEA - check baud rate / wiring")
+                            _garbage_warned = True
 
                 except (serial.SerialException, OSError) as port_err:
                     consecutive_io_errors += 1

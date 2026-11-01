@@ -128,7 +128,8 @@ RE_CLEAN_FILENAME = re.compile(r"[^\w]")
 
 
 def draw_area_of_interest_overlay(frame, roi_pts, motion_detected: bool = False,
-                                  on_hold: bool = False, side_result: dict | None = None) -> None:
+                                  on_hold: bool = False, side_result: dict | None = None,
+                                  hold_reason: str = "") -> None:
     """Draw Area of Interest polygon and middle dotted bisector line."""
     if not roi_pts or len(roi_pts) < 3:
         return
@@ -145,8 +146,13 @@ def draw_area_of_interest_overlay(frame, roi_pts, motion_detected: bool = False,
             status_tag = f"MOTION DETECTED [{d_side}]" if d_side in ("LEFT", "RIGHT") else "MOTION DETECTED"
             poly_color = (0, 210, 255) if d_side == "LEFT" else ((50, 140, 255) if d_side == "RIGHT" else (0, 0, 255))
         elif on_hold:
-            poly_color = (160, 160, 160)
-            status_tag = "ON HOLD (VEHICLE MOVING)"
+            if hold_reason:
+                is_settling = any(k in hold_reason.upper() for k in ("SETTLING", "STABILIZING", "HOLD"))
+                poly_color = (0, 165, 255) if is_settling else (160, 160, 160)
+                status_tag = f"ON HOLD ({hold_reason})"
+            else:
+                poly_color = (160, 160, 160)
+                status_tag = "ON HOLD (VEHICLE MOVING)"
         else:
             poly_color = (0, 255, 200)
             status_tag = "ACTIVE (MONITORING)"
@@ -815,8 +821,15 @@ def main() -> None:
             # Gating condition: Motion detection is ACTIVE when vehicle is stopped / stationary.
             # Active when stop detector reports STOPPED or vehicle is stationary (< 1.0 km/h or bench test).
             # When driving at road speed (>= 3.5 km/h and not stopped), motion detection is on hold.
-            motion_speed_threshold = float(getattr(_cfg, "REST_SPEED_THRESHOLD_KMH", 3.5))
-            motion_gate_active = is_vehicle_stopped or (vehicle_speed < 1.0)
+            motion_speed_threshold = float(getattr(_cfg, "REST_SPEED_THRESHOLD_KMH", 5.0))
+            post_rest_hold = stop_status.get("post_rest_hold_active", False)
+            post_rest_remaining = stop_status.get("post_rest_remaining_sec", 0.0)
+            is_vehicle_stationary = is_vehicle_stopped or (vehicle_speed < 1.0)
+            motion_capture_enabled = is_vehicle_stationary and not post_rest_hold
+
+            latest_sensor["post_rest_hold_active"]   = post_rest_hold
+            latest_sensor["post_rest_remaining_sec"] = post_rest_remaining
+            latest_sensor["motion_capture_enabled"]  = motion_capture_enabled
 
             # ── 5. Downsample for motion processing ───────────────────────
             if FRAME_SIZE is not None:
@@ -838,13 +851,13 @@ def main() -> None:
             _frame_side_result = None   # left/right classification for this frame
             total_frames_seen += 1
 
-            if not motion_gate_active:
-                # Vehicle is in motion (>= 3.5 km/h) — motion detection ON HOLD
+            if not is_vehicle_stationary:
+                # Vehicle is in motion (>= 5.0 km/h) — motion detection ON HOLD
                 bg_model                  = None   # Clear background model while moving so road scenery never contaminates it
                 stop_warmup_cnt           = 0
                 consecutive_motion_frames = 0
             else:
-                # Vehicle is STOPPED (< 3.5 km/h confirmed by GNSS & IMU) — Motion detection ACTIVE
+                # Vehicle is STOPPED (< 5.0 km/h confirmed by GNSS & IMU) — accumulate background model cleanly
                 if bg_model is None:
                     bg_model        = gray_blur.astype(np.float32)
                     stop_warmup_cnt = 1
@@ -852,9 +865,8 @@ def main() -> None:
                     cv2.accumulateWeighted(gray_blur, bg_model, BG_ALPHA)
                     stop_warmup_cnt += 1
 
-                # Allow a short settling period (4 frames ~ 0.15s) after vehicle halts,
-                # and ensure initial startup warmup has elapsed.
-                if stop_warmup_cnt >= 4 and total_frames_seen > WARMUP_FRAMES:
+                # Motion detection & capture only run AFTER the post-rest hold window (2.0s) has elapsed
+                if motion_capture_enabled and stop_warmup_cnt >= 4 and total_frames_seen > WARMUP_FRAMES:
                     bg_uint8 = cv2.convertScaleAbs(bg_model)
                     diff     = cv2.absdiff(bg_uint8, gray_blur)
                     _, thresh = cv2.threshold(diff, DIFF_THRESHOLD, 255, cv2.THRESH_BINARY)
@@ -968,8 +980,15 @@ def main() -> None:
 
             # ── 6. Draw Area of Interest polygon overlay (with middle dotted line) ──
             _active_sr = _frame_side_result if motion_detected else None
+            hold_msg = ""
+            if not is_vehicle_stationary:
+                hold_msg = "VEHICLE MOVING"
+            elif post_rest_hold:
+                hold_msg = f"SETTLING {post_rest_remaining:.1f}s"
+
             draw_area_of_interest_overlay(orig_frame, roi_pts, motion_detected=motion_detected,
-                                          on_hold=(not motion_gate_active), side_result=_active_sr)
+                                          on_hold=(not motion_capture_enabled), side_result=_active_sr,
+                                          hold_reason=hold_msg)
 
             # ── In-progress polygon drawing overlay ───────────────────────
             if _motion.is_drawing_polygon:

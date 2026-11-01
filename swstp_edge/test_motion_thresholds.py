@@ -598,15 +598,17 @@ class MotionCalibrator:
         if self.view_mode == 0:
             return canvas
         elif self.view_mode == 1:
-            # Binary Mask View
-            mask_bgr = cv2.cvtColor(dilated_img, cv2.COLOR_GRAY2BGR)
+            # Binary Mask View (scaled to display size)
+            mask_resized = cv2.resize(dilated_img, (w, h), interpolation=cv2.INTER_NEAREST)
+            mask_bgr = cv2.cvtColor(mask_resized, cv2.COLOR_GRAY2BGR)
             cv2.putText(mask_bgr, "VIEW: BINARY MOTION MASK (Dilated)", (15, 30),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 0), 2, cv2.LINE_AA)
             return mask_bgr
         elif self.view_mode == 2:
-            # Grayscale Difference View (Amplified for visual clarity)
-            diff_amp = cv2.convertScaleAbs(diff_img, alpha=2.0)
-            diff_bgr = cv2.cvtColor(diff_amp, cv2.COLOR_GRAY2BGR)
+            # Grayscale Difference View (Amplified for visual clarity, scaled to display size)
+            diff_amp = cv2.convertScaleAbs(diff_img, alpha=2.5)
+            diff_resized = cv2.resize(diff_amp, (w, h), interpolation=cv2.INTER_NEAREST)
+            diff_bgr = cv2.cvtColor(diff_resized, cv2.COLOR_GRAY2BGR)
             cv2.putText(diff_bgr, f"VIEW: RAW ABSDIFF (Diff Thresh = {self.diff_threshold})", (15, 30),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 220, 255), 2, cv2.LINE_AA)
             return diff_bgr

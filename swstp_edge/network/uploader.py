@@ -30,6 +30,7 @@ import requests
 import requests.adapters
 
 from config import DEFAULT_BACKEND_URL, DEFAULT_ULB_ID, DEFAULT_VEHICLE_ID
+import config as _cfg
 import geofence
 
 # Dynamic session metadata (shared mutable — mirrors the original globals)
@@ -283,7 +284,8 @@ def live_frame_streamer(backend_url: str, device_id: str, fps: float,
 
         if frame_to_send is not None:
             try:
-                _, enc = cv2.imencode('.jpg', frame_to_send, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+                jpeg_q = int(getattr(_cfg, "STREAM_JPEG_QUALITY", 60))
+                _, enc = cv2.imencode('.jpg', frame_to_send, [int(cv2.IMWRITE_JPEG_QUALITY), jpeg_q])
                 frame_bytes = enc.tobytes()
                 cur_dev    = latest_sensor.get("deviceId") or dynamic_session_info.get("deviceId") or device_id
                 stream_url = f"{backend_url.rstrip('/')}/api/camera/{cur_dev}/frame"
@@ -291,7 +293,7 @@ def live_frame_streamer(backend_url: str, device_id: str, fps: float,
                     stream_url,
                     data=frame_bytes,
                     headers={"Content-Type": "image/jpeg", "Connection": "keep-alive"},
-                    timeout=3.5,
+                    timeout=1.5,
                 )
                 if resp.status_code == 200:
                     hardware_state["backend"]["connected"]  = True
@@ -449,7 +451,8 @@ def telemetry_streamer(backend_url: str, session_id_arg: int, ulb_id: str,
             except Exception:
                 hardware_state["backend"]["connected"] = False
 
-        stop_event.wait(0.1)  # 10 Hz batch flush for ultra-smooth sequential streaming
+        flush_interval = float(getattr(_cfg, "TELEMETRY_FLUSH_INTERVAL_SEC", 1.0))
+        stop_event.wait(flush_interval)  # 1.0s batch cadence for smooth 1 Hz map tracking without cellular overhead
 
     session.close()
 

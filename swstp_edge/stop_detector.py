@@ -43,6 +43,10 @@ try:
         MOTION_DEBOUNCE_SEC,
     )
     try:
+        from config import POST_REST_MOTION_HOLD_SEC
+    except ImportError:
+        POST_REST_MOTION_HOLD_SEC = 2.0
+    try:
         from config import REST_CONFIRM_SEC
     except ImportError:
         REST_CONFIRM_SEC = REST_DEBOUNCE_SEC
@@ -51,9 +55,10 @@ except ImportError:
     REST_SPEED_THRESHOLD_KMH = 3.5
     IMU_REST_ACCEL_TOLERANCE = 0.45
     IMU_REST_GYRO_TOLERANCE  = 4.0
-    REST_DEBOUNCE_SEC        = 1.0
-    REST_CONFIRM_SEC         = 1.0
-    MOTION_DEBOUNCE_SEC      = 0.6
+    REST_DEBOUNCE_SEC        = 1.5
+    REST_CONFIRM_SEC         = 1.5
+    MOTION_DEBOUNCE_SEC      = 1.0
+    POST_REST_MOTION_HOLD_SEC = 2.0
 
 
 # ---------------------------------------------------------------------------
@@ -133,6 +138,7 @@ class StopEventRecord:
     trigger_speed_kmh: Optional[float] = None
     trigger_imu_summary: str = ""
     max_drift_m: float = 0.0
+    confirmed_mono: float = 0.0
 
     def get_duration_formatted(self) -> str:
         """Returns mm:ss or hh:mm:ss formatted string of duration."""
@@ -207,6 +213,7 @@ class VehicleStopDetector:
         rest_confirm_sec: Optional[float] = None,
         speed_smoothing_window: int = 1,
         require_gps_fix: bool = False,
+        post_rest_hold_sec: float = POST_REST_MOTION_HOLD_SEC,
     ):
         self.stop_speed_gate = float(stop_speed_gate)
         self.rest_speed_threshold = float(rest_speed_threshold)
@@ -217,6 +224,7 @@ class VehicleStopDetector:
         self.motion_debounce_sec = float(motion_debounce_sec)
         self.speed_smoothing_window = max(1, int(speed_smoothing_window))
         self.require_gps_fix = bool(require_gps_fix)
+        self.post_rest_hold_sec = float(post_rest_hold_sec)
 
         self.state: str = "MOVING"  # "MOVING" | "STOPPED"
         self._current_stop_id: int = 0
@@ -433,6 +441,7 @@ class VehicleStopDetector:
                         start_lat=cand_start_lat,
                         start_lon=cand_start_lon,
                         duration_sec=initial_duration,
+                        confirmed_mono=now_mono,
                     )
                     event_just_started = True
 
@@ -562,9 +571,21 @@ class VehicleStopDetector:
         else:
             pending_rest_sec = 0.0
 
+        post_rest_hold_active = False
+        post_rest_remaining_sec = 0.0
+        if self.state == "STOPPED" and self.active_stop is not None:
+            conf_m = getattr(self.active_stop, "confirmed_mono", 0.0) or self.active_stop.start_mono
+            time_since_conf = max(0.0, now_mono - conf_m)
+            if time_since_conf < self.post_rest_hold_sec:
+                post_rest_hold_active = True
+                post_rest_remaining_sec = max(0.0, self.post_rest_hold_sec - time_since_conf)
+
         return {
             "state": self.state,
             "is_stopped": self.is_stopped,
+            "post_rest_hold_active": post_rest_hold_active,
+            "post_rest_remaining_sec": round(post_rest_remaining_sec, 2),
+            "motion_capture_enabled": self.is_stopped and not post_rest_hold_active,
             "duration_sec": current_duration,
             "duration_formatted": self.active_stop.get_duration_formatted() if self.active_stop else format_duration(current_duration),
             "stop_event_id": current_stop_id,
