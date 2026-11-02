@@ -78,7 +78,7 @@ except ImportError:
 # Module-level constants
 # ---------------------------------------------------------------------------
 RECONNECT_DELAY   = 2.0    # seconds between serial reconnect attempts
-_READ_TIMEOUT_SEC = 1.0    # serial read timeout so thread can inspect _stop_event
+_READ_TIMEOUT_SEC = 0.25   # serial read timeout (250 ms) for low-latency buffer draining and responsive thread control
 
 _TALKER_CONSTELLATION = {
     "GP": "GPS",
@@ -643,43 +643,53 @@ def _serial_thread() -> None:
             _stop_event.wait(RECONNECT_DELAY)
             continue
 
-        consecutive_io_errors = 0
-
         try:
             while not _stop_event.is_set():
                 try:
                     line_bytes = ser.readline()
                     if not line_bytes:
-                        # Serial read timeout (1.0s) with no bytes received.
+                        # Serial read timeout with no bytes received.
                         # Stays open indefinitely without tearing down port.
                         continue
 
-                    consecutive_io_errors = 0
+                    # Drain any additional lines already waiting in the serial buffer
+                    # so sentences in the 1 Hz burst are processed with zero latency
+                    # (directly matches test_max_m10s_gnss.py snappy update rate).
+                    lines_to_dispatch = [line_bytes]
+                    try:
+                        while ser.in_waiting > 0 and len(lines_to_dispatch) < 20:
+                            extra = ser.readline()
+                            if extra:
+                                lines_to_dispatch.append(extra)
+                    except Exception:
+                        pass
 
-                    line = line_bytes.decode("ascii", errors="replace").strip()
-                    if "$" in line:
-                        # Split concatenated NMEA sentences if multiple arrived in buffer
-                        parts = line.split("$")
-                        for p in parts:
-                            p_clean = p.strip()
-                            if not p_clean:
-                                continue
-                            sentence = "$" + p_clean
-                            if _dispatch(sentence):
-                                if not gnss_ok:
-                                    gnss_ok = True
-                                    print(f"[GNSS] Primary GNSS stream locked: u-blox MAX-M10S on {target_port} @ {target_baud} baud")
+                    for raw_line in lines_to_dispatch:
+                        line = raw_line.decode("ascii", errors="replace").strip()
+                        if "$" in line:
+                            # Split concatenated NMEA sentences if multiple arrived in buffer
+                            parts = line.split("$")
+                            for p in parts:
+                                p_clean = p.strip()
+                                if not p_clean:
+                                    continue
+                                sentence = "$" + p_clean
+                                if _dispatch(sentence):
+                                    if not gnss_ok:
+                                        gnss_ok = True
+                                        print(f"[GNSS] Primary GNSS stream locked: u-blox MAX-M10S on {target_port} @ {target_baud} baud")
 
                 except (serial.SerialException, OSError) as port_err:
-                    consecutive_io_errors += 1
-                    # Only tear down connection if serial port has truly failed continuously (unplugged for sustained duration)
-                    if consecutive_io_errors >= 15:
-                        print(f"[GNSS] Serial port connection error on {target_port} (sustained): {port_err}")
+                    # Never tear down the hardware UART port on transient read glitches
+                    # (directly mirrors test_max_m10s_gnss.py resilient reader design).
+                    # Only break if the physical device node disappeared from the OS.
+                    if target_port.startswith("/dev") and not os.path.exists(target_port):
+                        print(f"[GNSS] Hardware port {target_port} disconnected from OS: {port_err}")
                         break
-                    time.sleep(0.05)
+                    time.sleep(0.01)
                 except Exception:
                     # Individual line decode/format glitches are safely skipped without dropping the stream
-                    time.sleep(0.01)
+                    time.sleep(0.005)
 
         except Exception as loop_err:
             print(f"[GNSS] Exception in serial reader loop: {loop_err}")
@@ -812,13 +822,20 @@ def read() -> dict:
     if last_snap is not None and (now - last_snap) < GNSS_SATELLITE_SNAP_SEC:
         detail = snap["satellites_detail"]
 
+    # Position coordinates: preserved continuously while data is streaming
+    # (directly mirrors test_max_m10s_gnss.py where coordinates never flicker to None
+    # on momentary fix status transitions). 'fix' indicates if lock is active.
+    lat = snap["latitude"] if (has_fix or (data_received and snap["latitude"] is not None)) else None
+    lon = snap["longitude"] if (has_fix or (data_received and snap["longitude"] is not None)) else None
+    loc_source = "gnss" if has_fix else ("last_known" if lat is not None else None)
+
     return {
         "data_received":      data_received,
         "fix":                has_fix,
         "status":             status,
-        "latitude":           snap["latitude"]    if has_fix else None,
-        "longitude":          snap["longitude"]   if has_fix else None,
-        "altitude_m":         snap["altitude_m"]  if has_fix else None,
+        "latitude":           lat,
+        "longitude":          lon,
+        "altitude_m":         snap["altitude_m"],
         # Speed and course are kept even without a position fix so the HUD
         # always shows live speed (including 0.0 km/h at stops) and the stop
         # detector is never starved of velocity data during brief fix blips.
@@ -829,7 +846,7 @@ def read() -> dict:
         "satellite_records":  snap["satellite_records"] if data_received else 0,
         "satellites_detail":  detail if data_received else None,
         "hdop":               snap["hdop"] if has_fix else None,
-        "location_source":    "gnss" if has_fix else None,
+        "location_source":    loc_source,
         "primary_module":     "u-blox MAX-M10S",
     }
 

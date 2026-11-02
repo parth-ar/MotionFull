@@ -84,7 +84,7 @@ _G_MS2       = 9.80665   # m/s² per g
 _INIT_RETRIES     = 3      # attempts per init stage
 _INIT_RETRY_DELAY = 0.050  # s between init retries
 _READ_RETRIES     = 3      # attempts per normal read
-_READ_RETRY_DELAY = 0.008  # s between read retries
+_READ_RETRY_DELAY = 0.002  # s between read retries (fast micro-sleep to prevent 20 Hz loop stalls)
 
 # Calibration
 _CALIB_SAMPLES     = 100
@@ -95,18 +95,23 @@ _CALIB_DELAY       = 0.010  # s between calibration samples
 # ---------------------------------------------------------------------------
 imu_ok: bool = False
 
-_lock           = threading.Lock()
-_roll_deg       = 0.0
-_pitch_deg      = 0.0
-_yaw_deg        = 0.0
-_last_ts: float = 0.0
-_bus            = None   # smbus2.SMBus — kept open after init
+_lock            = threading.Lock()
+_i2c_lock        = threading.Lock()
+_roll_deg        = 0.0
+_pitch_deg       = 0.0
+_yaw_deg         = 0.0
+_last_ts: float  = 0.0
+_bus             = None   # smbus2.SMBus — kept open after init
+_last_valid_imu: dict | None = None
+_last_valid_ts: float = 0.0
+_last_error_log_ts: float = 0.0
+_last_reinit_ts: float = 0.0
 
 # Calibration offsets (in scaled units: g for accel, °/s for gyro)
 _ax_off = _ay_off = _az_off = 0.0
 _gx_off = _gy_off = _gz_off = 0.0
 
-# Consecutive read-failure counter — triggers re-init when it reaches _READ_RETRIES
+# Consecutive read-failure counter
 _read_fail_count: int = 0
 
 
@@ -118,8 +123,10 @@ def _burst_read_14(bus) -> tuple[int, int, int, int, int, int, int]:
     Single 14-byte I²C burst starting at register 0x3B.
     Returns (ax_raw, ay_raw, az_raw, t_raw, gx_raw, gy_raw, gz_raw) as
     signed 16-bit integers.
+    Protected by _i2c_lock to prevent simultaneous bus collisions.
     """
-    raw = bus.read_i2c_block_data(_ADDR, _BURST_START, 14)
+    with _i2c_lock:
+        raw = bus.read_i2c_block_data(_ADDR, _BURST_START, 14)
     ax, ay, az, t, gx, gy, gz = struct.unpack(">hhhhhhh", bytes(raw))
     return ax, ay, az, t, gx, gy, gz
 
@@ -260,27 +267,33 @@ def _euler_to_quaternion(roll_deg: float, pitch_deg: float, yaw_deg: float) -> d
 # ---------------------------------------------------------------------------
 def _reinit_bus() -> bool:
     """
-    Attempt a lightweight re-initialisation: verify WHO_AM_I and re-apply
-    wake + config registers.  Called when repeated read failures occur.
+    Attempt a lightweight non-blocking re-initialisation: verify WHO_AM_I and re-apply
+    wake + config registers. Called when repeated read failures occur.
     Does NOT re-run full calibration — keeps existing offsets.
+    Uses micro-delays (0.01s) instead of 200 ms sleeps so the 20 Hz loop is never blocked.
     Returns True if the bus is responsive again.
     """
-    global _bus, imu_ok, _last_ts
+    global _bus, imu_ok, _last_ts, _last_reinit_ts
+    now = time.monotonic()
+    if (now - _last_reinit_ts) < 5.0:
+        return False
+    _last_reinit_ts = now
+
     try:
         bus = _bus
         if bus is None:
             return False
 
-        who = bus.read_byte_data(_ADDR, _WHO_AM_I)
-        if who not in _VALID_WHO_AM_I:
-            print(f"[IMU] Re-init: unexpected WHO_AM_I 0x{who:02X} — aborting")
-            return False
+        with _i2c_lock:
+            who = bus.read_byte_data(_ADDR, _WHO_AM_I)
+            if who not in _VALID_WHO_AM_I:
+                return False
 
-        bus.write_byte_data(_ADDR, _PWR_MGMT_1, 0x00)
-        time.sleep(0.15)
-        bus.write_byte_data(_ADDR, _ACCEL_CFG, 0x00)
-        bus.write_byte_data(_ADDR, _GYRO_CFG,  0x00)
-        time.sleep(0.05)
+            bus.write_byte_data(_ADDR, _PWR_MGMT_1, 0x00)
+            time.sleep(0.01)
+            bus.write_byte_data(_ADDR, _ACCEL_CFG, 0x00)
+            bus.write_byte_data(_ADDR, _GYRO_CFG,  0x00)
+            time.sleep(0.01)
 
         # Verify a burst read succeeds
         _burst_read_14(bus)
@@ -290,8 +303,7 @@ def _reinit_bus() -> bool:
         print(f"[IMU] Re-initialisation successful (WHO_AM_I=0x{who:02X})")
         return True
 
-    except Exception as exc:
-        print(f"[IMU] Re-initialisation failed: {exc}")
+    except Exception:
         imu_ok = False
         return False
 
@@ -432,26 +444,15 @@ def read() -> dict:
       bytes [6:7]  → temperature    (signed 16-bit, big-endian)
       bytes [8:13] → gyro   X/Y/Z  (signed 16-bit, big-endian)
 
-    Output shape:
-    {
-        "valid": bool,
-        "accel_g":             {"x": float, "y": float, "z": float},
-        "accel_ms2":           {"x": float, "y": float, "z": float},
-        "accel_magnitude_ms2": float,
-        "gyro_dps":            {"x": float, "y": float, "z": float},
-        "temperature_c":       float,
-        "orientation":         {"roll": float, "pitch": float, "yaw": float,
-                                "yaw_source": "GYRO_INTEGRATED"},
-        "quaternion":          {"w": float, "x": float, "y": float, "z": float},
-    }
-    Returns {"valid": False} if imu_ok is False.
-
     Recovery:
-      Transient I²C errors are retried up to _READ_RETRIES times.
-      After _READ_RETRIES consecutive failures across calls, a lightweight
-      re-initialisation is attempted automatically.
+      Transient I²C errors are retried up to _READ_RETRIES times silently.
+      If all retries fail on a single 50ms tick, the last valid reading is
+      held over (up to 1.0s) so the 20 Hz telemetry loop, HUD, and stop
+      detection never experience spurious drops.
+      Only after sustained silence (> 20 consecutive fails = 1.0s) is a
+      rate-limited re-init attempted.
     """
-    global _last_ts, _read_fail_count
+    global _last_ts, _read_fail_count, _last_valid_imu, _last_valid_ts, _last_error_log_ts
 
     if not imu_ok or _bus is None:
         return {"valid": False}
@@ -487,7 +488,7 @@ def read() -> dict:
             # Successful read — reset failure counter
             _read_fail_count = 0
 
-            return {
+            result = {
                 "valid":   True,
                 "accel_g": {"x": round(ax, 4), "y": round(ay, 4), "z": round(az, 4)},
                 "accel_ms2": {
@@ -506,27 +507,31 @@ def read() -> dict:
                 },
                 "quaternion": quat,
             }
+            _last_valid_imu = result
+            _last_valid_ts  = now_ts
+            return result
 
         except Exception as exc:
             last_exc = exc
-            print(
-                f"[IMU] NORMAL_READ attempt {attempt}/{_READ_RETRIES} failed: "
-                f"{type(exc).__name__} {exc}"
-            )
             if attempt < _READ_RETRIES:
                 time.sleep(_READ_RETRY_DELAY)
 
-    # All retries exhausted — increment persistent failure counter
+    # All retries exhausted in this tick
     _read_fail_count += 1
-    print(f"[IMU] Read failed after {_READ_RETRIES} attempts "
-          f"(consecutive failures: {_read_fail_count})")
+    now_mono = time.monotonic()
 
-    # Attempt lightweight re-initialisation after sustained failures
-    if _read_fail_count >= _READ_RETRIES:
-        print("[IMU] Attempting automatic re-initialisation…")
+    # Rate-limit failure logging to once every 5 seconds under sustained failure
+    if _read_fail_count >= 20 and (now_mono - _last_error_log_ts) >= 5.0:
+        _last_error_log_ts = now_mono
+        print(f"[IMU] Warning: I2C read failed continuously ({_read_fail_count} samples): {last_exc}")
+
+    # Attempt automatic lightweight re-init after 20 consecutive fails (1.0s)
+    if _read_fail_count >= 20:
         if _reinit_bus():
             _read_fail_count = 0
-        else:
-            print("[IMU] Re-initialisation unsuccessful — IMU marked not OK")
+
+    # Hold over last valid sample for up to 1.0s to smooth over transient I2C bus glitches
+    if _last_valid_imu is not None and (now_mono - _last_valid_ts) < 1.0:
+        return _last_valid_imu
 
     return {"valid": False}
