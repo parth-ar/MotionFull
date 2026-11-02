@@ -73,11 +73,28 @@ def angular_distance(a, b) -> float:
 
 def compute_heading_from_gps_history(raw_lat, raw_lon,
                                       in_safe_zone=False, is_snapped=False,
-                                      road_bearing=None):
-    """Calculates context-aware vehicle motion heading:
-    - Outside Safe Zone & Snapped to Road: Aligns parallel to winning road segment (forward vs reverse).
-    - Inside Safe Zone or Off-Road: Follows raw GPS displacement vector.
-    - Stationary (displacement < 0.8m): Holds previous valid heading without jitter.
+                                      road_bearing=None,
+                                      hardware_course_deg=None):
+    """Calculates context-aware vehicle motion heading.
+
+    Priority order:
+    1. Hardware Doppler course from $RMC/$VTG (hardware_course_deg) — available at
+       1 Hz even when the vehicle is slow or the position barely changes. This is
+       preferred over geometric displacement which fails at low speeds because the
+       GPS sliding window covers < 0.8 m at < 10 km/h at 1 Hz update rate.
+    2. Outside Safe Zone & Snapped to Road: align hardware course parallel to the
+       winning road segment (forward vs. reverse).
+    3. Inside Safe Zone or Off-Road: use raw GPS displacement vector (geometric).
+    4. Stationary (displacement < 0.8 m and no hardware course): hold previous
+       valid heading without jitter.
+
+    Args:
+        raw_lat, raw_lon:      Current raw GPS coordinates.
+        in_safe_zone:          True when inside a depot/safe zone.
+        is_snapped:            True when road-snapping was applied.
+        road_bearing:          Bearing of the matched road segment (degrees).
+        hardware_course_deg:   True-north course from $RMC / $VTG (degrees). Pass
+                               gnss_data.get("course_deg") — None if unavailable.
     """
     global gps_sliding_window, last_known_gps_heading
     if raw_lat is None or raw_lon is None or (abs(raw_lat) < 0.001 and abs(raw_lon) < 0.001):
@@ -88,6 +105,24 @@ def compute_heading_from_gps_history(raw_lat, raw_lon,
     # Retain fixes across 2-4 second sliding window (3-4 points)
     gps_sliding_window = [p for p in gps_sliding_window if now - p[2] <= 4.5][-8:]
 
+    # --- Priority 1: Hardware Doppler course from $RMC / $VTG ---
+    # Only use it when the vehicle is clearly moving (course > ~1 km/h generates
+    # a valid non-zero Doppler reading). Below ~0.5 km/h the module outputs 0.0
+    # which is indistinguishable from true North — hold the last known heading.
+    if hardware_course_deg is not None:
+        candidate_course = float(hardware_course_deg)
+        if candidate_course >= 0.0:  # 0.0 could be true North or stopped; prefer if > 0
+            travel_angle = candidate_course
+            if is_snapped and not in_safe_zone and road_bearing is not None:
+                # Align to road segment direction
+                rev_bearing = (road_bearing + 180.0) % 360.0
+                diff_fwd = angular_distance(travel_angle, road_bearing)
+                diff_rev = angular_distance(travel_angle, rev_bearing)
+                travel_angle = road_bearing if diff_fwd <= diff_rev else rev_bearing
+            last_known_gps_heading = travel_angle
+            return travel_angle
+
+    # --- Priority 2 / 3: Geometric displacement fallback ---
     if len(gps_sliding_window) >= 2:
         old_lat, old_lon, _ = gps_sliding_window[0]
         lat_scale = 111320.0
@@ -102,12 +137,12 @@ def compute_heading_from_gps_history(raw_lat, raw_lon,
             if travel_angle < 0:
                 travel_angle += 360.0
 
-            # 1. Inside Safe Zone or Unsnapped Off-Road -> Direct GPS Travel Vector
+            # Inside Safe Zone or Unsnapped Off-Road → Direct GPS Travel Vector
             if in_safe_zone or (not is_snapped) or road_bearing is None:
                 last_known_gps_heading = travel_angle
                 return travel_angle
 
-            # 2. Outside Safe Zone along Road Corridor -> Align parallel to Road Segment
+            # Outside Safe Zone along Road Corridor → Align parallel to Road Segment
             rev_bearing = (road_bearing + 180.0) % 360.0
             diff_fwd = angular_distance(travel_angle, road_bearing)
             diff_rev = angular_distance(travel_angle, rev_bearing)

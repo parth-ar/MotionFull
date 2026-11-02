@@ -225,7 +225,7 @@ LITTER_GNSS_LOST_TIMEOUT_SEC = 5.0
 LITTER_TIME_FALLBACK_SEC     = 30.0
 
 # YOLO inference confidence threshold
-LITTER_CONF_THRESHOLD        = 0.60
+LITTER_CONF_THRESHOLD        = 0.65
 
 # Fraction of detection bounding box that must overlap the AoD polygon to be ignored
 LITTER_OVERLAP_THRESHOLD     = 0.50

@@ -353,9 +353,22 @@ def live_frame_streamer(backend_url: str, device_id: str, fps: float,
 # ---------------------------------------------------------------------------
 def telemetry_streamer(backend_url: str, session_id_arg: int, ulb_id: str,
                         stop_event: threading.Event) -> None:
-    """Sends sequential telemetry batches to backend with HTTP keep-alive connection pooling."""
+    """Sends sequential telemetry batches to POST /api/telemetry/ingest-batch.
+
+    GNSS location data is embedded in every packet; this thread must never be
+    starved by camera capture or YOLO inference. OS scheduling priority is raised
+    to match the raw_gnss_streamer — both are higher priority than motion/frame threads.
+    """
     from telemetry import latest_sensor, hardware_state, telemetry_queue
     import datetime
+
+    # Elevate scheduling priority — ingest-batch carries GNSS fix data and is a
+    # higher-priority stream than camera frame upload or motion capture.
+    try:
+        import os as _os
+        _os.nice(-5)
+    except Exception:
+        pass
 
     url = f"{backend_url.rstrip('/')}/api/telemetry/ingest-batch"
     active_session_query_url = f"{backend_url.rstrip('/')}/api/officer/sessions?ulbId={ulb_id}&status=ACTIVE"
@@ -469,10 +482,20 @@ def raw_gnss_streamer(backend_url: str, vehicle_id: str,
     vehicle_id  — Unique vehicle identifier (e.g. MH-27-TR-102 or SWSTP-AMRMC-001)
     stop_event  — threading.Event to cleanly terminate the background worker
     rate_hz     — Streaming frequency in Hertz (default: 1.0 Hz)
+
+    Thread priority is elevated above camera/motion threads: GNSS location streaming
+    to the ingest endpoint must never be starved by OpenCV/YOLO CPU load.
     """
     import sensors.gnss as gnss_sensor
     import sensors.rtc as rtc_sensor
     from telemetry import latest_sensor, hardware_state
+
+    # Raise scheduling priority — location streaming > motion capture / frame streaming
+    try:
+        import os as _os
+        _os.nice(-5)
+    except Exception:
+        pass
 
     target_hz = max(0.1, min(10.0, rate_hz))
     interval = 1.0 / target_hz

@@ -517,10 +517,10 @@ def overlay_metadata(frame, litter_engine=None):
     curr_spd         = float(latest_sensor.get("speed") or 0.0)
     mins, s = divmod(stop_sec, 60)
     if is_veh_stopped:
-        veh_badge = f"VEH:STOP({mins:02d}:{s:02d}|{stop_caps}c)"
+        veh_badge = f"VEH:STOP({curr_spd:.1f}kph|{mins:02d}:{s:02d}|{stop_caps}c)"
     elif pending_rest_sec > 0.0:
         # Actively confirming a rest — show progress toward confirm threshold
-        veh_badge = f"VEH:CONFIRMING({pending_rest_sec:.1f}/{rest_confirm_sec:.0f}s)"
+        veh_badge = f"VEH:CONFIRMING({curr_spd:.1f}kph|{pending_rest_sec:.1f}/{rest_confirm_sec:.0f}s)"
     else:
         veh_badge = f"VEH:MOV({curr_spd:.1f}kph)"
 
@@ -534,7 +534,11 @@ def overlay_metadata(frame, litter_engine=None):
     cv2.convertScaleAbs(banner_slice, banner_slice, alpha=0.25, beta=0)
 
     if is_veh_stopped:
-        stop_info_text = f" | [STOP #{latest_sensor.get('stop_event_id', 1)}: {mins:02d}m {s:02d}s | Caps: {stop_caps}]"
+        stop_id = latest_sensor.get('stop_event_id', 1)
+        post_rest_hold = bool(latest_sensor.get("post_rest_hold_active"))
+        post_rest_rem = float(latest_sensor.get("post_rest_remaining_sec") or 0.0)
+        dur_str = f"settling {post_rest_rem:.1f}s" if post_rest_hold else f"{mins:02d}m {s:02d}s"
+        stop_info_text = f"  |  [STOP #{stop_id} — {curr_spd:.1f} km/h ({dur_str}) | Caps: {stop_caps}]"
         full_ts_text = f"{ts_text}{stop_info_text}"
     elif pending_rest_sec > 0.0:
         # Vehicle is in the rest-confirmation window — show countdown progress

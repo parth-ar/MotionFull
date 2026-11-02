@@ -749,8 +749,8 @@ def main() -> None:
                         pass
                     continue
 
+            raw_frame        = frame.copy()
             orig_frame       = frame
-            raw_frame        = frame
             last_known_frame = frame
             orig_h, orig_w   = orig_frame.shape[:2]
 
@@ -1043,8 +1043,8 @@ def main() -> None:
                     _loc_src = latest_sensor.get("location_source")
                     _gnss_hw_fix = bool(gps_valid and _loc_src == "gnss")
                     if litter_engine.update_gnss(cap_lat, cap_lon, gnss_hardware_fix=_gnss_hw_fix):
-                        # Grab a clean copy of the original (unprocessed) frame
-                        litter_frame = frame.copy()
+                        # Grab a clean copy of the pristine raw (unprocessed) frame
+                        litter_frame = raw_frame.copy()
                         litter_engine.try_trigger(
                             frame    = litter_frame,
                             lat      = cap_lat,

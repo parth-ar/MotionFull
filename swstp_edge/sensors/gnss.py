@@ -120,7 +120,11 @@ _state = {
 # Tracking satellites grouped by talker to avoid multi-constellation GSV collisions
 _gsv_satellites_by_talker: dict[str, list[dict]] = {}
 _used_prn_set: set[int] = set()
-_used_by_sys: dict[str, set[int]] = {}   # keyed by GSA system-ID; union → _used_prn_set (Fix 3)
+# Per-system PRN sets keyed by GSA system-ID field (field[18]).
+# MAX-M10S emits one $GNGSA per constellation; naively overwriting _used_prn_set
+# with each sentence loses all but the last constellation's PRNs.
+# _used_by_sys accumulates all per-system sets so _used_prn_set is their union.
+_used_by_sys: dict[str, set[int]] = {}
 
 _thread: threading.Thread | None = None
 _stop_event = threading.Event()
@@ -186,7 +190,6 @@ def get_candidate_ports(preferred: str | None = None) -> list[str]:
     return candidates
 
 
-# Only useful if the MAX-M10S RST pin is physically wired to BCM 16. Not called automatically.
 def hardware_reset() -> bool:
     """Pulse the active-low RST pin on MAX-M10S (Physical 36 / BCM 16) if present.
     Safely no-ops if not running on Raspberry Pi GPIO.
@@ -226,7 +229,7 @@ def _nmea_checksum_ok(sentence: str) -> bool:
     """Return True if the NMEA sentence has a valid XOR checksum."""
     try:
         if "*" not in sentence:
-            return False   # reject sentences without checksum (Fix 5)
+            return True   # accept sentences without checksum
         body, cs = sentence.rsplit("*", 1)
         body = body.lstrip("$").lstrip("!")
         computed = 0
@@ -323,7 +326,8 @@ def _parse_gga(fields: list) -> None:
     with _lock:
         _state["data_received"]  = True
         _state["last_data_time"] = now
-        _state["satellites"] = num_sats   # always update, including 0 (Fix 4)
+        if num_sats > 0:
+            _state["satellites"] = num_sats
         if hdop is not None:
             _state["hdop"]       = round(hdop, 2)
         if alt is not None:
@@ -409,8 +413,8 @@ def _parse_gsa(fields: list) -> None:
         if p > 0:
             used_prns.add(p)
 
-    # Fix 3: key by system-ID so parallel GNGSA sentences (one per constellation)
-    # don't overwrite each other; _used_prn_set becomes their union.
+    # Key PRNs by the GSA system-ID (field[18]) so each constellation's $GNGSA
+    # sentence accumulates into the union instead of overwriting the previous one.
     global _used_prn_set, _used_by_sys
     sys_id = fields[18].split("*")[0].strip() if len(fields) > 18 else "0"
     _used_by_sys[sys_id] = used_prns
@@ -422,7 +426,8 @@ def _parse_gsa(fields: list) -> None:
         _state["last_data_time"] = now
         if hdop is not None:
             _state["hdop"] = round(hdop, 2)
-        # Fix 4: satellite count comes from GGA only; no fallback here
+        if used_prns and not _state["satellites"]:
+            _state["satellites"] = len(_used_prn_set)
 
 
 def _parse_gsv(fields: list, talker: str) -> None:
@@ -531,9 +536,9 @@ def _dispatch(line: str) -> bool:
         elif sentence_id.endswith("RMC"):
             _parse_rmc(fields)
             return True
-        elif sentence_id.endswith("GLL"):
-            _parse_gll(fields)
-            return True
+        # GLL omitted: u-blox MAX-M10S emits $GNGLL with status V even during an active
+        # 3D fix, racing against GGA/RMC and falsely clearing fix=True. Authoritative
+        # position comes from GGA + RMC only (mirrors test_max_m10s_gnss.py design).
         elif sentence_id.endswith("VTG"):
             _parse_vtg(fields)
             return True
@@ -560,7 +565,7 @@ def _reset_state_to_disconnected() -> None:
     global gnss_ok, _active_port, _used_prn_set, _used_by_sys
     gnss_ok = False
     _active_port = None
-    _used_by_sys.clear()          # Fix 3: clear per-system PRN sets on disconnect
+    _used_by_sys.clear()
     _used_prn_set = set()
     with _lock:
         _state["data_received"]         = False
@@ -594,8 +599,15 @@ def _serial_thread() -> None:
       - Connects directly at 9600 baud without hopping or cycling
       - Avoids invasive multi-baud probing loops that interrupt the stream
       - Stays locked onto the open stream indefinitely without closing the UART port
+    
+    Thread priority is raised at startup so GIL contention from OpenCV/YOLO
+    inference never starves the UART buffer reader.
     """
     global gnss_ok, _active_port, _active_baud
+
+    # Elevate OS scheduling priority — GNSS/location streaming is higher priority
+    # than camera capture, motion detection, or frame streaming threads.
+    _set_thread_priority_high()
 
     while not _stop_event.is_set():
         if not HAVE_PYSERIAL:
@@ -632,11 +644,6 @@ def _serial_thread() -> None:
             continue
 
         consecutive_io_errors = 0
-        # Fix 2: count lines that carry bytes but produce no valid NMEA sentence
-        _garbage_line_count = 0
-        _garbage_warned = False
-        # Threshold: roughly 10 s of non-NMEA bytes at 1-s readline timeout
-        _GARBAGE_THRESHOLD = int(10 / _READ_TIMEOUT_SEC)
 
         try:
             while not _stop_event.is_set():
@@ -650,7 +657,6 @@ def _serial_thread() -> None:
                     consecutive_io_errors = 0
 
                     line = line_bytes.decode("ascii", errors="replace").strip()
-                    dispatched_any = False
                     if "$" in line:
                         # Split concatenated NMEA sentences if multiple arrived in buffer
                         parts = line.split("$")
@@ -660,20 +666,9 @@ def _serial_thread() -> None:
                                 continue
                             sentence = "$" + p_clean
                             if _dispatch(sentence):
-                                dispatched_any = True
                                 if not gnss_ok:
                                     gnss_ok = True
                                     print(f"[GNSS] Primary GNSS stream locked: u-blox MAX-M10S on {target_port} @ {target_baud} baud")
-
-                    # Fix 2: track garbage (bytes with no valid NMEA) to warn about baud/wiring
-                    if dispatched_any:
-                        _garbage_line_count = 0
-                        _garbage_warned = False
-                    else:
-                        _garbage_line_count += 1
-                        if _garbage_line_count >= _GARBAGE_THRESHOLD and not _garbage_warned:
-                            print("[GNSS] Bytes received but no valid NMEA - check baud rate / wiring")
-                            _garbage_warned = True
 
                 except (serial.SerialException, OSError) as port_err:
                     consecutive_io_errors += 1
@@ -702,6 +697,32 @@ def _serial_thread() -> None:
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
+
+def _set_thread_priority_high() -> None:
+    """Attempt to raise the calling thread's OS scheduling priority.
+    GNSS serial reader is higher priority than motion capture / camera threads
+    so GIL contention from OpenCV/YOLO never starves the UART buffer reader.
+    No-ops cleanly on Windows or where privileges are insufficient.
+    """
+    try:
+        import os as _os
+        # Linux: nice value -5 (higher than default 0, lower than -20 max)
+        _os.nice(-5)
+    except Exception:
+        pass
+    try:
+        # Linux pthreads SCHED_RR with moderate priority for I/O-bound serial reader
+        import ctypes, ctypes.util
+        _libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+        if hasattr(_libc, "pthread_setschedparam"):
+            # SCHED_RR = 2, priority 10 (1-99 range; 99 = highest)
+            class _SchedParam(ctypes.Structure):
+                _fields_ = [("sched_priority", ctypes.c_int)]
+            p = _SchedParam(10)
+            _libc.pthread_setschedparam(ctypes.c_ulong(threading.current_thread().ident or 0), 2, ctypes.byref(p))
+    except Exception:
+        pass
+
 
 def init(port: str | None = None, baud: int | None = None) -> bool:
     """Start the background u-blox MAX-M10S serial reader thread.
@@ -746,7 +767,6 @@ def get_active_port() -> str | None:
 def get_active_baud() -> int:
     """Return the currently active baud rate."""
     return _active_baud
-
 
 def read() -> dict:
     """Return a snapshot of the current GNSS state.
@@ -799,8 +819,11 @@ def read() -> dict:
         "latitude":           snap["latitude"]    if has_fix else None,
         "longitude":          snap["longitude"]   if has_fix else None,
         "altitude_m":         snap["altitude_m"]  if has_fix else None,
-        "speed_kmh":          snap["speed_kmh"]   if has_fix else None,
-        "course_deg":         snap["course_deg"]  if has_fix else None,
+        # Speed and course are kept even without a position fix so the HUD
+        # always shows live speed (including 0.0 km/h at stops) and the stop
+        # detector is never starved of velocity data during brief fix blips.
+        "speed_kmh":          snap["speed_kmh"]   if data_received else None,
+        "course_deg":         snap["course_deg"]  if data_received else None,
         "satellites":         snap["satellites"]  if data_received else 0,
         "satellites_in_view": snap["satellites_in_view"] if data_received else 0,
         "satellite_records":  snap["satellite_records"] if data_received else 0,

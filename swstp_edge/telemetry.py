@@ -173,6 +173,15 @@ telemetry_queue = queue.Queue(maxsize=3000)
 _boot_time = time.time()
 _lock = threading.Lock()
 
+# Road-snap result cache — reused across 20 Hz ticks when coordinates haven't
+# changed. The MAX-M10S emits NMEA at 1 Hz, so the raw lat/lon is identical for
+# ~19 out of every 20 telemetry ticks. snap_coordinates_to_road() involves
+# iterating road geometry with trigonometry; caching eliminates ~95% of that
+# compute overhead, freeing CPU for GNSS serial reader and YOLO inference.
+_snap_cache_lat: float | None = None
+_snap_cache_lon: float | None = None
+_snap_cache_result: tuple = (None, None, False, False, None)  # (slat, slon, in_sz, is_snapped, road_bearing)
+
 
 # ---------------------------------------------------------------------------
 # Packet builder
@@ -195,6 +204,9 @@ def build_telemetry_packet(device_id: str) -> dict:
     gnss_fix  = gnss_data.get("fix", False)
     lat_raw   = gnss_data.get("latitude")
     lon_raw   = gnss_data.get("longitude")
+    # Hardware Doppler course from $RMC / $VTG — always available when data_received,
+    # even at stops. Used as the primary heading source in compute_heading_from_gps_history.
+    hw_course = gnss_data.get("course_deg")
 
     # --- 4. Update latest_sensor state (GNSS path) ---
     if gnss_data.get("data_received"):
@@ -210,11 +222,18 @@ def build_telemetry_packet(device_id: str) -> dict:
 
     if gnss_fix and lat_raw is not None and lon_raw is not None:
         if abs(lat_raw) > 0.001 and abs(lon_raw) > 0.001:
-            try:
-                snapped_lat, snapped_lon, in_sz, is_snapped, road_bearing = snap_coordinates_to_road(lat_raw, lon_raw)
-            except Exception as snap_err:
-                snapped_lat, snapped_lon = lat_raw, lon_raw
-                in_sz, is_snapped, road_bearing = False, False, None
+            # Road-snap cache: only recompute when raw coordinates actually changed
+            # (MAX-M10S updates at 1 Hz; telemetry runs at 20 Hz → saves ~95% CPU).
+            global _snap_cache_lat, _snap_cache_lon, _snap_cache_result
+            if lat_raw != _snap_cache_lat or lon_raw != _snap_cache_lon:
+                try:
+                    _snap_cache_result = snap_coordinates_to_road(lat_raw, lon_raw)
+                except Exception:
+                    _snap_cache_result = (lat_raw, lon_raw, False, False, None)
+                _snap_cache_lat = lat_raw
+                _snap_cache_lon = lon_raw
+
+            snapped_lat, snapped_lon, in_sz, is_snapped, road_bearing = _snap_cache_result
 
             drift_m = haversine_dist_meters(lat_raw, lon_raw, snapped_lat, snapped_lon)
 
@@ -245,13 +264,14 @@ def build_telemetry_packet(device_id: str) -> dict:
                 latest_sensor["last_known_valid_lon"]       = snapped_lon
                 latest_sensor["last_known_valid_timestamp"] = time.time()
 
-            # Compute heading
+            # Compute heading — hardware Doppler course is passed as primary source
             try:
                 heading = compute_heading_from_gps_history(
                     lat_raw, lon_raw,
                     in_safe_zone=in_sz,
                     is_snapped=is_snapped,
                     road_bearing=road_bearing,
+                    hardware_course_deg=hw_course,
                 )
                 if heading is not None:
                     with _lock:
@@ -278,20 +298,21 @@ def build_telemetry_packet(device_id: str) -> dict:
         )
 
         if is_held_fix:
-            # SATELLITE FIX HOLDOVER: Hold valid position between 1 Hz bursts
+            # SATELLITE FIX HOLDOVER: Hold valid position between 1 Hz bursts.
+            # speed_kmh is now always present when data_received (even without position fix).
             with _lock:
                 latest_sensor["gps_valid"]       = True
                 latest_sensor["location_source"] = "gnss"
-                if gnss_data.get("data_received"):
-                    speed_val = gnss_data.get("speed_kmh")
-                    if speed_val is not None:
-                        latest_sensor["speed"] = speed_val
-                    sats = gnss_data.get("satellites", 0)
-                    if sats > 0:
-                        latest_sensor["satellites"] = sats
-                    alt_val = gnss_data.get("altitude_m")
-                    if alt_val is not None:
-                        latest_sensor["alt"] = alt_val
+                # Always refresh speed/sats/alt from live NMEA even during holdover
+                speed_val = gnss_data.get("speed_kmh")
+                if speed_val is not None:
+                    latest_sensor["speed"] = speed_val
+                sats = gnss_data.get("satellites", 0)
+                if sats > 0:
+                    latest_sensor["satellites"] = sats
+                alt_val = gnss_data.get("altitude_m")
+                if alt_val is not None:
+                    latest_sensor["alt"] = alt_val
         else:
             # GNSS fix genuinely lost (> 10s silent) or no data received
             with _lock:
