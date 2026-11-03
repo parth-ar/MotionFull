@@ -149,6 +149,17 @@ print('Reset to default polygon.')
     # Automated sensor diagnostic tool (RTC + IMU + GNSS + PiCam + LTE):
     python3 /home/pi/swstp_unified/test_all_sensors.py
 
+    # GNSS Fix Loss Isolation Test (Camera stream + Ingest batch location stream ONLY):
+    # Runs ONLY the two live streams (POST /api/camera/.. and POST /api/telemetry/ingest-batch)
+    # with ZERO motion capture or YOLO CPU load to isolate if fix loss is hardware vs compute:
+    python3 /home/pi/swstp_unified/test_camera_location_stream.py --headless
+
+    # Run stream isolation test with CSV logging and 10-minute duration:
+    python3 /home/pi/swstp_unified/test_camera_location_stream.py --headless --duration 600 --log-csv /home/pi/gnss_isolation.csv
+
+    # Run automated self-test (mock backend & simulated GPS):
+    python3 /home/pi/swstp_unified/test_camera_location_stream.py --self-test
+
     # Check if IMX708 is detected on the CSI bus by libcamera:
     rpicam-hello --list-cameras
     # (or on older OS: libcamera-hello --list-cameras)
