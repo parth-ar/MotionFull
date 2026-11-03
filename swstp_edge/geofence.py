@@ -180,101 +180,23 @@ def is_in_safe_zone(lat, lon) -> bool:
 
 
 def snap_coordinates_to_road(lat, lon):
-    """Projects raw or drifted GPS coordinates directly onto the road centerline so all stored
-    telemetry and collection circles are 100% on the road, UNLESS the vehicle is inside a safe zone.
-    Returns: (display_lat, display_lon, is_inside_safe_zone, is_snapped, road_bearing)
-    """
-    if lat is None or lon is None or not dynamic_roads:
+    """Road snapping permanently disabled: raw GNSS coordinates returned untouched."""
+    if lat is None or lon is None:
         return lat, lon, False, False, None
-
-    # Safe Zone Exemption: Do NOT snap to road if vehicle is inside a safe zone (depot / yard)
     in_sz = is_in_safe_zone(lat, lon)
-    if in_sz:
-        return lat, lon, True, False, None
-
-    best_lat, best_lon = lat, lon
-    best_road_bearing = None
-    min_dist = float("inf")
-
-    ref_lat = dynamic_roads[0]["coordinates"][0][0]
-    ref_lon = dynamic_roads[0]["coordinates"][0][1]
-    lat_scale = 111320.0
-    lon_scale = 111320.0 * math.cos(math.radians(ref_lat))
-
-    px = (lon - ref_lon) * lon_scale
-    py = (lat - ref_lat) * lat_scale
-
-    for road in dynamic_roads:
-        coords = road.get("coordinates") or []
-        for i in range(len(coords) - 1):
-            a_lat, a_lon = coords[i]
-            b_lat, b_lon = coords[i + 1]
-
-            ax = (a_lon - ref_lon) * lon_scale
-            ay = (a_lat - ref_lat) * lat_scale
-            bx = (b_lon - ref_lon) * lon_scale
-            by = (b_lat - ref_lat) * lat_scale
-
-            dx, dy = bx - ax, by - ay
-            l2 = dx * dx + dy * dy
-            if l2 < 1e-6:
-                t = 0.0
-            else:
-                t = max(0.0, min(1.0, ((px - ax) * dx + (py - ay) * dy) / l2))
-
-            proj_x = ax + t * dx
-            proj_y = ay + t * dy
-            dist = math.hypot(px - proj_x, py - proj_y)
-
-            if dist < min_dist:
-                min_dist = dist
-                best_lat = round(ref_lat + proj_y / lat_scale, 8)
-                best_lon = round(ref_lon + proj_x / lon_scale, 8)
-                seg_bearing = (math.degrees(math.atan2(dx, dy)) + 360.0) % 360.0
-                best_road_bearing = seg_bearing
-
-    # If within 80m corridor of the road, snap permanently to centerline
-    if min_dist <= 80.0:
-        is_snapped = (abs(best_lat - lat) > 1e-8 or abs(best_lon - lon) > 1e-8)
-        return best_lat, best_lon, False, is_snapped, best_road_bearing
-
-    return round(lat, 8), round(lon, 8), False, False, None
+    return round(float(lat), 8), round(float(lon), 8), in_sz, False, None
 
 
 def track_field_events(lat, lon, speed, heading) -> None:
     if lat is None or lon is None or (abs(lat) < 0.001 and abs(lon) < 0.001):
         return
 
-    now = time.monotonic()
-
-    # Dynamic Vehicle Stop / House Proximity & 10m Collection Zone
+    # Dynamic Vehicle Stop detection
     is_stopped = (speed <= 3.5)
-    near_house, house_dist = get_nearest_house(lat, lon)
-
-    # Import here to avoid circular import; latest_sensor lives in telemetry.py
-    from telemetry import latest_sensor
-    active_sid = latest_sensor.get("active_session_id", 0)
 
     if field_state["is_stopped"] != is_stopped:
         field_state["is_stopped"] = is_stopped
         if is_stopped:
-            if near_house and house_dist <= 15.0:
-                # Log proximity — do NOT mark green yet; that gate is in uploader.py
-                # after a camera evidence frame is confirmed by the backend (HTTP 200/201).
-                print("\n" + "=" * 65)
-                print(f"[FIELD LOG] 🛑 VEHICLE STOP NEAR HOUSE: {near_house['id']} - {near_house['name']}")
-                print(f"            Proximity Dist: {house_dist:.1f}m (Threshold <= 15m) | Speed: {speed:.1f} km/h")
-                print(f"            📷 Awaiting camera frame — house status unchanged until evidence confirmed.")
-                print(f"            Active Session: #{active_sid}")
-                print("=" * 65 + "\n")
-            else:
-                print(f"\n[FIELD LOG] 🛑 VEHICLE STOPPED at ({lat:.6f}, {lon:.6f}) | Speed: {speed:.1f} km/h\n")
+            print(f"\n[FIELD LOG] 🛑 VEHICLE STOPPED at ({lat:.6f}, {lon:.6f}) | Speed: {speed:.1f} km/h\n")
         else:
             print(f"\n[FIELD LOG] 🚚 LEAVING STOP / MOVING: Resumed motion at {speed:.1f} km/h (Heading: {heading:.0f}°)\n")
-
-    # Periodic proximity heartbeat when near registered building (5s when moving, 30s when stopped)
-    elif near_house and house_dist <= 25.0:
-        heartbeat_interval = 30.0 if is_stopped else 5.0
-        if (now - field_state["last_dist_log_time"]) >= heartbeat_interval:
-            field_state["last_dist_log_time"] = now
-            print(f"[FIELD PROXIMITY] Nearest House: {near_house['id']} ({near_house['name']}) @ {house_dist:.1f}m | Speed: {speed:.1f} km/h")

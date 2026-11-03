@@ -435,7 +435,7 @@ def telemetry_streamer(backend_url: str, session_id_arg: int, ulb_id: str,
                     "sats":      s.get("satellites") or 0,
                     "hdop":      None,
                     "fix":       bool(s.get("gps_valid")),
-                    "snapped":   bool(s.get("is_snapped")),
+                    "snapped":   False,
                     "safe_zone": bool(s.get("is_inside_safe_zone")),
                     "loc_src":   s.get("location_source"),
                     "accel_mag": round(float(imu_s.get("accel_magnitude_ms2") or 0.0), 3),
@@ -475,7 +475,7 @@ def telemetry_streamer(backend_url: str, session_id_arg: int, ulb_id: str,
 # ---------------------------------------------------------------------------
 def raw_gnss_streamer(backend_url: str, vehicle_id: str,
                       stop_event: threading.Event,
-                      rate_hz: float = 1.0) -> None:
+                      rate_hz: float = 5.0) -> None:
     """Streams live, un-snapped raw GNSS coordinates to POST /api/{vehicle_id}/live_location.
 
     backend_url — Base URL of the SWSTP Backend (e.g. http://192.168.1.100:5000)
@@ -528,11 +528,10 @@ def raw_gnss_streamer(backend_url: str, vehicle_id: str,
             hdop = gnss_snap.get("hdop")
             gnss_status = gnss_snap.get("status", "NO_DATA")
 
-            # Fallback to latest_sensor raw fields if gnss_snap had momentary lock contention
-            if raw_lat is None:
-                raw_lat = latest_sensor.get("raw_gps_lat")
-            if raw_lon is None:
-                raw_lon = latest_sensor.get("raw_gps_lon")
+            # Strictly stream live raw coordinates when fix is active; do not retransmit stale coords
+            if not has_fix:
+                raw_lat = None
+                raw_lon = None
 
             utc_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
             rtc_data = rtc_sensor.read()

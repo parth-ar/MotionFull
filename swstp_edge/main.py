@@ -202,7 +202,7 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Hardware Device Code (overrides device_config.json)")
     parser.add_argument("--vehicle-id", default=None,
                         help="Vehicle ID for live raw GNSS streaming (default: loaded from device_config.json or device_id)")
-    parser.add_argument("--gnss-stream-rate", type=float, default=1.0,
+    parser.add_argument("--gnss-stream-rate", type=float, default=getattr(_cfg, "GNSS_STREAM_RATE_HZ", 5.0),
                         help="Live raw GNSS streaming rate in Hz to /api/{vehicle_id}/live_location (default: 1.0 Hz)")
     parser.add_argument("--ulb-id", default=DEFAULT_ULB_ID,
                         help="ULB ID")

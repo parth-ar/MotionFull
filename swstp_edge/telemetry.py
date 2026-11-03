@@ -64,7 +64,7 @@ from config import (
     GNSS_DATA_TIMEOUT_SEC,
 )
 from geofence import (
-    snap_coordinates_to_road, compute_heading_from_gps_history,
+    compute_heading_from_gps_history,
     track_field_events, haversine_dist_meters, is_in_safe_zone,
 )
 
@@ -173,14 +173,7 @@ telemetry_queue = queue.Queue(maxsize=3000)
 _boot_time = time.time()
 _lock = threading.Lock()
 
-# Road-snap result cache — reused across 20 Hz ticks when coordinates haven't
-# changed. The MAX-M10S emits NMEA at 1 Hz, so the raw lat/lon is identical for
-# ~19 out of every 20 telemetry ticks. snap_coordinates_to_road() involves
-# iterating road geometry with trigonometry; caching eliminates ~95% of that
-# compute overhead, freeing CPU for GNSS serial reader and YOLO inference.
-_snap_cache_lat: float | None = None
-_snap_cache_lon: float | None = None
-_snap_cache_result: tuple = (None, None, False, False, None)  # (slat, slon, in_sz, is_snapped, road_bearing)
+# (Road-snap cache removed: database and pipeline use raw, unsnapped GNSS coordinates exclusively)
 
 
 # ---------------------------------------------------------------------------
@@ -222,46 +215,32 @@ def build_telemetry_packet(device_id: str) -> dict:
 
     if gnss_fix and lat_raw is not None and lon_raw is not None:
         if abs(lat_raw) > 0.001 and abs(lon_raw) > 0.001:
-            # Road-snap cache: only recompute when raw coordinates actually changed
-            # (MAX-M10S updates at 1 Hz; telemetry runs at 20 Hz → saves ~95% CPU).
-            global _snap_cache_lat, _snap_cache_lon, _snap_cache_result
-            if lat_raw != _snap_cache_lat or lon_raw != _snap_cache_lon:
-                try:
-                    _snap_cache_result = snap_coordinates_to_road(lat_raw, lon_raw)
-                except Exception:
-                    _snap_cache_result = (lat_raw, lon_raw, False, False, None)
-                _snap_cache_lat = lat_raw
-                _snap_cache_lon = lon_raw
-
-            snapped_lat, snapped_lon, in_sz, is_snapped, road_bearing = _snap_cache_result
-
-            drift_m = haversine_dist_meters(lat_raw, lon_raw, snapped_lat, snapped_lon)
+            in_sz = is_in_safe_zone(lat_raw, lon_raw)
 
             if not hardware_state["gps"]["logged_fix"]:
                 hardware_state["gps"]["fix"]        = True
                 hardware_state["gps"]["logged_fix"] = True
                 _log_hardware(
-                    "GPS MODULE (MAX-M10S)", "SATELLITE FIX & ROAD SNAP",
-                    f"Raw GPS: ({lat_raw:.6f}, {lon_raw:.6f}) -> Road: ({snapped_lat:.6f}, {snapped_lon:.6f}) "
-                    f"[Drift: {drift_m:.1f}m | SafeZone: {in_sz} | Snapped: {is_snapped}]"
+                    "GPS MODULE (MAX-M10S)", "SATELLITE FIX (RAW GNSS)",
+                    f"Raw GNSS Coordinates: ({lat_raw:.8f}, {lon_raw:.8f}) [SafeZone: {in_sz}]"
                 )
 
             with _lock:
                 latest_sensor["raw_gps_lat"]          = lat_raw
                 latest_sensor["raw_gps_lon"]          = lon_raw
-                latest_sensor["lat"]                  = snapped_lat
-                latest_sensor["lon"]                  = snapped_lon
+                latest_sensor["lat"]                  = lat_raw
+                latest_sensor["lon"]                  = lon_raw
                 latest_sensor["is_inside_safe_zone"]  = in_sz
-                latest_sensor["is_snapped"]           = is_snapped
-                latest_sensor["road_bearing"]         = road_bearing
+                latest_sensor["is_snapped"]           = False
+                latest_sensor["road_bearing"]         = None
                 latest_sensor["alt"]                  = gnss_data.get("altitude_m") or 0.0
                 latest_sensor["speed"]                = gnss_data.get("speed_kmh")  or 0.0
                 latest_sensor["satellites"]           = gnss_data.get("satellites", 0)
                 latest_sensor["gps_valid"]            = True
                 latest_sensor["location_source"]      = "gnss"
                 latest_sensor["last_gnss_fix_time"]   = time.monotonic()
-                latest_sensor["last_known_valid_lat"]       = snapped_lat
-                latest_sensor["last_known_valid_lon"]       = snapped_lon
+                latest_sensor["last_known_valid_lat"]       = lat_raw
+                latest_sensor["last_known_valid_lon"]       = lon_raw
                 latest_sensor["last_known_valid_timestamp"] = time.time()
 
             # Compute heading — hardware Doppler course is passed as primary source
@@ -269,8 +248,8 @@ def build_telemetry_packet(device_id: str) -> dict:
                 heading = compute_heading_from_gps_history(
                     lat_raw, lon_raw,
                     in_safe_zone=in_sz,
-                    is_snapped=is_snapped,
-                    road_bearing=road_bearing,
+                    is_snapped=False,
+                    road_bearing=None,
                     hardware_course_deg=hw_course,
                 )
                 if heading is not None:
@@ -281,7 +260,7 @@ def build_telemetry_packet(device_id: str) -> dict:
                 pass
 
             try:
-                track_field_events(snapped_lat, snapped_lon,
+                track_field_events(lat_raw, lon_raw,
                                    latest_sensor["speed"], latest_sensor.get("heading") or 0.0)
             except Exception:
                 pass
@@ -523,7 +502,7 @@ def build_slim_packet(full_pkt: dict) -> dict:
         "sats":      gnss_blk.get("satellites"),
         "hdop":      gnss_blk.get("hdop"),
         "fix":       gnss_blk.get("fix", False),
-        "snapped":   gnss_blk.get("isSnapped", False),
+        "snapped":   False,
         "safe_zone": gnss_blk.get("isInsideSafeZone", False),
         "loc_src":   gnss_blk.get("source"),
         # IMU — processed outputs only

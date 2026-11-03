@@ -44,15 +44,15 @@ Output shape (identical to the application contract):
 }
 """
 
-import glob
-import math
+
+
 import os
 import threading
 import time
 
 try:
     import serial
-    import serial.tools.list_ports
+
     HAVE_PYSERIAL = True
 except ImportError:
     HAVE_PYSERIAL = False
@@ -69,16 +69,11 @@ try:
 except ImportError:
     GNSS_AUTO_DETECT = True
 
-try:
-    from config import GNSS_RESET_PIN
-except ImportError:
-    GNSS_RESET_PIN = 16
-
 # ---------------------------------------------------------------------------
 # Module-level constants
 # ---------------------------------------------------------------------------
 RECONNECT_DELAY   = 2.0    # seconds between serial reconnect attempts
-_READ_TIMEOUT_SEC = 0.25   # serial read timeout (250 ms) for low-latency buffer draining and responsive thread control
+_READ_TIMEOUT_SEC = 0.05   # serial read timeout (50 ms) for 5 Hz low-latency buffer draining
 
 _TALKER_CONSTELLATION = {
     "GP": "GPS",
@@ -149,81 +144,6 @@ def auto_detect_gnss_port() -> str | None:
             return p
     return None
 
-
-# Backwards compatibility aliases
-find_gnss_port = auto_detect_gnss_port
-auto_detect_neo6m_port = auto_detect_gnss_port
-
-
-def get_candidate_ports(preferred: str | None = None) -> list[str]:
-    """Return an ordered list of candidate serial ports to probe for MAX-M10S.
-    Only Pi hardware UARTs are auto-added; USB ports are never injected here
-    to avoid the EC200U LTE modem's /dev/ttyUSB* paths. A caller-supplied
-    'preferred' port (e.g. from init(port=...)) is still honoured as-is.
-    """
-    candidates = []
-
-    def _add(p):
-        if p and p not in candidates and p != "Pi-native":
-            candidates.append(p)
-
-    if preferred:
-        _add(preferred)  # explicit port wins unconditionally (may be USB/COM)
-
-    if _target_port:
-        _add(_target_port)
-
-    # Auto-detected Pi hardware UART
-    auto_p = auto_detect_gnss_port()
-    if auto_p:
-        _add(auto_p)
-
-    cfg_port = getattr(_cfg, "GNSS_SERIAL_PORT", "/dev/serial0")
-    if cfg_port:
-        _add(cfg_port)
-
-    # Remaining Pi hardware UARTs only
-    for p in ("/dev/serial0", "/dev/ttyAMA0", "/dev/ttyS0"):
-        if os.path.exists(p):
-            _add(p)
-
-    return candidates
-
-
-def hardware_reset() -> bool:
-    """Pulse the active-low RST pin on MAX-M10S (Physical 36 / BCM 16) if present.
-    Safely no-ops if not running on Raspberry Pi GPIO.
-    """
-    if GNSS_RESET_PIN is None:
-        return False
-    try:
-        import RPi.GPIO as GPIO
-        GPIO.setwarnings(False)
-        GPIO.setmode(GPIO.BCM)
-        GPIO.setup(GNSS_RESET_PIN, GPIO.OUT, initial=GPIO.HIGH)
-        time.sleep(0.01)
-        GPIO.output(GNSS_RESET_PIN, GPIO.LOW)
-        time.sleep(0.1)
-        GPIO.output(GNSS_RESET_PIN, GPIO.HIGH)
-        return True
-    except Exception:
-        pass
-
-    try:
-        from gpiozero import OutputDevice
-        dev = OutputDevice(GNSS_RESET_PIN, active_high=True, initial_value=True)
-        dev.off()  # Pull LOW
-        time.sleep(0.1)
-        dev.on()   # Release HIGH
-        dev.close()
-        return True
-    except Exception:
-        return False
-
-
-# ---------------------------------------------------------------------------
-# NMEA helpers
-# ---------------------------------------------------------------------------
 
 def _nmea_checksum_ok(sentence: str) -> bool:
     """Return True if the NMEA sentence has a valid XOR checksum."""
@@ -482,34 +402,6 @@ def _parse_gsv(fields: list, talker: str) -> None:
         _state["last_detail_snap_time"] = now
 
 
-def _parse_gll(fields: list) -> None:
-    """Parse $GLL / $GNGLL / $GPGLL — Geographic Position (Latitude/Longitude)."""
-    if len(fields) < 5:
-        return
-    now = time.monotonic()
-    status = fields[6].strip().upper() if len(fields) > 6 and fields[6] else "V"
-    active = (status == "A")
-    lat = _parse_lat(fields[1], fields[2])
-    lon = _parse_lon(fields[3], fields[4])
-
-    with _lock:
-        _state["data_received"]  = True
-        _state["last_data_time"] = now
-        if active and lat is not None and lon is not None:
-            _state["fix"]           = True
-            _state["status"]        = "FIX"
-            _state["latitude"]      = lat
-            _state["longitude"]     = lon
-            _state["last_fix_time"] = now
-        elif (now - (_state["last_fix_time"] or 0)) >= GNSS_DATA_TIMEOUT_SEC:
-            _state["fix"]       = False
-            _state["status"]    = "NO_FIX"
-
-
-# ---------------------------------------------------------------------------
-# Sentence dispatcher
-# ---------------------------------------------------------------------------
-
 def _dispatch(line: str) -> bool:
     """Validate checksum and dispatch a single NMEA sentence. Returns True on valid sentence."""
     try:
@@ -590,13 +482,32 @@ def _reset_state_to_disconnected() -> None:
 # Background Serial Reader Thread (Mirrors test_max_m10s_gnss.py connection)
 # ---------------------------------------------------------------------------
 
+
+def configure_ubx_5hz(ser) -> bool:
+    """Send UBX-CFG-RATE command to set u-blox measurement rate to 5 Hz (200 ms).
+    UBX-CFG-RATE: msg class 0x06, id 0x08, length 6
+    measRate = 200 ms (0x00C8) -> 5 Hz
+    navRate = 1 cycle
+    timeRef = 1 (GPS time)
+    Checksum = 0xDE, 0x6A
+    """
+    try:
+        cmd = bytes([0xB5, 0x62, 0x06, 0x08, 0x06, 0x00, 0xC8, 0x00, 0x01, 0x00, 0x01, 0x00, 0xDE, 0x6A])
+        ser.write(cmd)
+        ser.flush()
+        print("[GNSS] Configured u-blox receiver measurement rate: 5 Hz (200 ms)")
+        return True
+    except Exception as exc:
+        print(f"[GNSS] Note: 5 Hz UBX config skipped ({exc})")
+        return False
+
 def _serial_thread() -> None:
     """Background worker that opens the MAX-M10S hardware UART serial port directly,
     reads NMEA sentences continuously, and updates module state.
     
     Adopts the proven architecture of test_max_m10s_gnss.py:
       - Uses auto_detect_gnss_port() to resolve /dev/serial0 first
-      - Connects directly at 9600 baud without hopping or cycling
+      - Connects directly at 115200 baud without hopping or cycling
       - Avoids invasive multi-baud probing loops that interrupt the stream
       - Stays locked onto the open stream indefinitely without closing the UART port
     
@@ -620,7 +531,7 @@ def _serial_thread() -> None:
         target_port = _target_port
         if not target_port or (target_port.startswith("/dev") and not os.path.exists(target_port)):
             target_port = auto_detect_gnss_port() or getattr(_cfg, "GNSS_SERIAL_PORT", "/dev/serial0")
-        target_baud = _target_baud or getattr(_cfg, "GNSS_BAUD_RATE", 9600)
+        target_baud = _target_baud or getattr(_cfg, "GNSS_BAUD_RATE", 115200)
 
         ser = None
         try:
@@ -637,7 +548,8 @@ def _serial_thread() -> None:
             )
             _active_port = target_port
             _active_baud = target_baud
-            print(f"[GNSS] Serial port opened indefinitely: {target_port} @ {target_baud} baud")
+            print(f"[GNSS] Serial port opened: {target_port} @ {target_baud} baud (5 Hz rate)")
+            configure_ubx_5hz(ser)
         except Exception as exc:
             _active_port = None
             _stop_event.wait(RECONNECT_DELAY)
@@ -738,7 +650,7 @@ def init(port: str | None = None, baud: int | None = None) -> bool:
     """Start the background u-blox MAX-M10S serial reader thread.
     Args:
         port: Serial port override (e.g. /dev/serial0, /dev/ttyUSB0, COM3).
-        baud: Baud rate override (default: 9600).
+        baud: Baud rate override (default: 115200).
     Returns True immediately.
     """
     global _thread, _target_port, _target_baud
@@ -825,9 +737,11 @@ def read() -> dict:
     # Position coordinates: preserved continuously while data is streaming
     # (directly mirrors test_max_m10s_gnss.py where coordinates never flicker to None
     # on momentary fix status transitions). 'fix' indicates if lock is active.
-    lat = snap["latitude"] if (has_fix or (data_received and snap["latitude"] is not None)) else None
-    lon = snap["longitude"] if (has_fix or (data_received and snap["longitude"] is not None)) else None
-    loc_source = "gnss" if has_fix else ("last_known" if lat is not None else None)
+    # Live position coordinates: strictly returned ONLY when active fix is valid.
+    # Prevents broadcasting stale identical coordinates back-to-back when satellite lock drops.
+    lat = snap["latitude"] if has_fix else None
+    lon = snap["longitude"] if has_fix else None
+    loc_source = "gnss" if has_fix else None
 
     return {
         "data_received":      data_received,
@@ -849,17 +763,3 @@ def read() -> dict:
         "location_source":    loc_source,
         "primary_module":     "u-blox MAX-M10S",
     }
-
-
-def haversine_distance_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    """Calculate the great-circle distance between two GPS coordinates in meters.
-    Uses the Haversine formula with mean Earth radius R = 6,371,000 m.
-    """
-    if lat1 is None or lon1 is None or lat2 is None or lon2 is None:
-        return 0.0
-    R = 6371000.0
-    p1, p2 = math.radians(float(lat1)), math.radians(float(lat2))
-    dp = math.radians(float(lat2) - float(lat1))
-    dl = math.radians(float(lon2) - float(lon1))
-    a = math.sin(dp / 2.0)**2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2.0)**2
-    return R * 2.0 * math.atan2(math.sqrt(a), math.sqrt(max(0.0, 1.0 - a)))

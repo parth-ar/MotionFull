@@ -125,12 +125,14 @@ CAMERA_TUNING_FILE       = None        # Optional path to libcamera tuning JSON 
 # ---------------------------------------------------------------------------
 TELEMETRY_RATE_HZ      = 20           # packets per second
 TELEMETRY_INTERVAL_SEC = 1.0 / TELEMETRY_RATE_HZ
-TELEMETRY_FLUSH_INTERVAL_SEC = 1.0    # seconds between /api/telemetry/ingest-batch HTTP flushes (1 Hz map rate)
+TELEMETRY_FLUSH_INTERVAL_SEC = 0.2    # seconds between /api/telemetry/ingest-batch HTTP flushes (5 Hz rate)
+GNSS_RATE_HZ                  = 5.0    # Hardware GNSS measurement rate (5 Hz = 200 ms)
+GNSS_STREAM_RATE_HZ           = 5.0    # Live raw GNSS stream rate to backend (5 Hz)
 
 # ---------------------------------------------------------------------------
 # GNSS / timing thresholds
 # ---------------------------------------------------------------------------
-GNSS_DATA_TIMEOUT_SEC    = 10.0
+GNSS_DATA_TIMEOUT_SEC    = 3.0
 GNSS_DETAIL_INTERVAL_SEC = 1.0
 GNSS_SATELLITE_SNAP_SEC  = 5.0
 
@@ -144,7 +146,7 @@ GNSS_SATELLITE_SNAP_SEC  = 5.0
 #   RST (Opt)  -> Raspberry Pi Physical 36 / BCM 16 (GNSS_RESET_PIN)
 # ---------------------------------------------------------------------------
 GNSS_SERIAL_PORT    = "/dev/serial0"   # Default hardware UART on Raspberry Pi
-GNSS_BAUD_RATE      = 9600             # Standard NMEA default baud rate for MAX-M10S / NEO-6M
+GNSS_BAUD_RATE      = 115200             # Standard NMEA default baud rate for MAX-M10S / NEO-6M
 GNSS_AUTO_DETECT    = True             # Auto-scan candidate serial ports if default fails
 
 # ---------------------------------------------------------------------------
