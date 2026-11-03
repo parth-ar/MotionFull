@@ -190,8 +190,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Enable hardware HDR mode on Sony IMX708 sensor")
     parser.add_argument("--gnss-port", default=getattr(_cfg, "GNSS_SERIAL_PORT", "/dev/serial0"),
                         help="Serial port for u-blox MAX-M10S primary GNSS (default: /dev/serial0 or auto-detect)")
-    parser.add_argument("--gnss-baud", type=int, default=getattr(_cfg, "GNSS_BAUD_RATE", 9600),
-                        help="Baud rate for u-blox MAX-M10S GNSS (default: 9600)")
+    parser.add_argument("--gnss-baud", type=int, default=getattr(_cfg, "GNSS_BAUD_RATE", 115200),
+                        help="Baud rate for u-blox MAX-M10S GNSS (default: 115200)")
     parser.add_argument("--port", "-p", default=None,
                         help="Alias for --gnss-port")
     parser.add_argument("--baud", "-b", type=int, default=None,
@@ -336,11 +336,11 @@ def main() -> None:
     print(f" Motion Captures:  {os.path.abspath(args.save_dir)}")
     print(f" Litter Captures:  {os.path.abspath(LITTER_CAPTURES_DIR)}")
     print(f" Litter Weights:   {args.litter_weights}")
-    print(f" Litter Trigger:   every {args.litter_distance:.1f}m (GNSS) | 30s fallback")
+    print(f" Litter Trigger:   every {args.litter_distance:.1f}m (GNSS only)")
     print(f" Litter Detection: {'ENABLED' if not args.no_litter else 'DISABLED (--no-litter)'}")
     print(f" RTC:              {'OK (DS3231)' if rtc_ok else 'FALLBACK (system clock)'} [{rtc_sensor.sync_source.upper()}]")
     print(f" IMU:              {'OK (MPU-6500 @ 0x69)' if imu_ok else 'FAULT'}")
-    print(f" GNSS:             u-blox MAX-M10S reader started ({getattr(_cfg, 'GNSS_SERIAL_PORT', '/dev/serial0')} @ {getattr(_cfg, 'GNSS_BAUD_RATE', 9600)} baud)")
+    print(f" GNSS:             u-blox MAX-M10S reader started ({getattr(_cfg, 'GNSS_SERIAL_PORT', '/dev/serial0')} @ {getattr(_cfg, 'GNSS_BAUD_RATE', 115200)} baud)")
     print("========================================================\n")
 
     # ── Session logger (initialised after sensors and session ID) ─────────
@@ -420,7 +420,7 @@ def main() -> None:
         save_dir             = args.save_dir,
         gnss_module          = "u-blox MAX-M10S",
         gnss_port            = getattr(_cfg, "GNSS_SERIAL_PORT", "/dev/serial0"),
-        gnss_baud            = getattr(_cfg, "GNSS_BAUD_RATE", 9600),
+        gnss_baud            = getattr(_cfg, "GNSS_BAUD_RATE", 115200),
     )
 
     stop_event = threading.Event()

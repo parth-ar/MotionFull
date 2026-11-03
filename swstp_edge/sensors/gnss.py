@@ -123,6 +123,7 @@ _used_by_sys: dict[str, set[int]] = {}
 
 _thread: threading.Thread | None = None
 _stop_event = threading.Event()
+_init_done_event = threading.Event()
 _active_port: str | None = None
 _active_baud: int = GNSS_BAUD_RATE
 _target_port: str | None = None
@@ -149,7 +150,7 @@ def _nmea_checksum_ok(sentence: str) -> bool:
     """Return True if the NMEA sentence has a valid XOR checksum."""
     try:
         if "*" not in sentence:
-            return True   # accept sentences without checksum
+            return False  # reject sentences without checksum or truncated
         body, cs = sentence.rsplit("*", 1)
         body = body.lstrip("$").lstrip("!")
         computed = 0
@@ -483,6 +484,237 @@ def _reset_state_to_disconnected() -> None:
 # ---------------------------------------------------------------------------
 
 
+
+# ---------------------------------------------------------------------------
+# u-blox MAX-M10S UBX Protocol & Baud Rate Auto-Configuration (115200 Baud)
+# ---------------------------------------------------------------------------
+# UBX-CFG-VALSET command configuring UART1 to 115200 baud (CFG-UART1-BAUDRATE = 0x40520001).
+# Targets RAM + BBR layers (0x03) for clean runtime speed and battery-backed persistence.
+UBX_CFG_VALSET_115200 = bytes.fromhex(
+    "B5 62 06 8A 0C 00 "
+    "00 03 00 00 "
+    "01 00 52 40 "
+    "00 C2 01 00 "
+    "F5 BB"
+)
+
+# UBX-MON-VER poll (Class 0x0A, ID 0x04) - harmless read query to elicit immediate response
+UBX_POLL_MON_VER = bytes.fromhex("B5 62 0A 04 00 00 0E 34")
+
+
+def _ubx_checksum(data: bytes) -> tuple[int, int]:
+    """Calculate 8-bit Fletcher checksum over UBX data (class, id, len, payload)."""
+    ck_a = 0
+    ck_b = 0
+    for b in data:
+        ck_a = (ck_a + b) & 0xFF
+        ck_b = (ck_b + ck_a) & 0xFF
+    return ck_a, ck_b
+
+
+def _read_ubx_ack(ser, expected_cls: int = 0x06, expected_msg: int = 0x8A, timeout_sec: float = 0.4) -> bool | None:
+    """Read incoming bytes from serial, looking for a valid UBX ACK-ACK or ACK-NAK response.
+    Validates Fletcher checksum over the response header and payload.
+    Returns:
+        True  if ACK-ACK (0x05, 0x01) received with valid checksum for expected message.
+        False if ACK-NAK (0x05, 0x00) received with valid checksum for expected message.
+        None  if timed out without receiving a valid ACK/NAK frame.
+    """
+    deadline = time.monotonic() + timeout_sec
+    buf = bytearray()
+    while time.monotonic() < deadline:
+        try:
+            n = getattr(ser, "in_waiting", 0) or 1
+            chunk = ser.read(min(n, 128))
+        except Exception:
+            break
+        if not chunk:
+            time.sleep(0.01)
+            continue
+        buf.extend(chunk)
+
+        while len(buf) >= 10:
+            idx = buf.find(b"\xb5\x62")
+            if idx < 0:
+                buf = buf[-1:]
+                break
+            if idx > 0:
+                del buf[:idx]
+            if len(buf) < 10:
+                break
+
+            msg_cls = buf[2]
+            msg_id = buf[3]
+            payload_len = buf[4] | (buf[5] << 8)
+
+            if msg_cls == 0x05 and (msg_id in (0x00, 0x01)) and payload_len == 2:
+                ck_a, ck_b = _ubx_checksum(buf[2:8])
+                if ck_a == buf[8] and ck_b == buf[9]:
+                    acked_cls = buf[6]
+                    acked_msg = buf[7]
+                    if acked_cls == expected_cls and acked_msg == expected_msg:
+                        return (msg_id == 0x01)
+                del buf[:2]
+            else:
+                del buf[:2]
+    return None
+
+
+def _check_communication(ser, timeout_sec: float = 0.9) -> bool:
+    """Check whether valid GNSS data (NMEA sentence with valid checksum or UBX frame)
+    is actively received from the receiver at the current baud rate.
+    """
+    try:
+        ser.write(UBX_POLL_MON_VER)
+        if hasattr(ser, "flush"):
+            ser.flush()
+    except Exception:
+        pass
+
+    deadline = time.monotonic() + timeout_sec
+    buf = bytearray()
+    while time.monotonic() < deadline:
+        try:
+            n = getattr(ser, "in_waiting", 0) or 1
+            chunk = ser.read(min(n, 256))
+        except Exception:
+            return False
+
+        if not chunk:
+            time.sleep(0.01)
+            continue
+        buf.extend(chunk)
+
+        # Check for valid UBX response header and frame
+        if b"\xb5\x62" in buf:
+            idx = buf.find(b"\xb5\x62")
+            if len(buf) >= idx + 8:
+                payload_len = buf[idx + 4] | (buf[idx + 5] << 8)
+                total_len = idx + 6 + payload_len + 2
+                if len(buf) >= total_len:
+                    ck_a, ck_b = _ubx_checksum(buf[idx + 2 : idx + 6 + payload_len])
+                    if ck_a == buf[total_len - 2] and ck_b == buf[total_len - 1]:
+                        return True
+
+        # Check for valid NMEA sentence with verified checksum
+        while b"\n" in buf:
+            nl_idx = buf.find(b"\n")
+            raw_line = bytes(buf[:nl_idx + 1])
+            del buf[:nl_idx + 1]
+            try:
+                line_str = raw_line.decode("ascii", errors="replace").strip()
+            except Exception:
+                continue
+            if "$" in line_str:
+                line_str = line_str[line_str.find("$"):]
+                if _nmea_checksum_ok(line_str) and len(line_str) > 6:
+                    return True
+
+    return False
+
+
+def _open_serial_port(port: str, baud: int, timeout: float = _READ_TIMEOUT_SEC):
+    """Safely open serial port at specified baud rate without raising exceptions."""
+    try:
+        return serial.Serial(
+            port=port,
+            baudrate=baud,
+            timeout=timeout,
+            bytesize=serial.EIGHTBITS,
+            parity=serial.PARITY_NONE,
+            stopbits=serial.STOPBITS_ONE,
+            xonxoff=False,
+            rtscts=False,
+            dsrdtr=False,
+        )
+    except Exception:
+        return None
+
+
+def _connect_and_configure_baud(target_port: str):
+    """Automatically detect receiver baud rate, configure MAX-M10S to 115200 baud
+    if operating at 9600, verify communication, and return the open serial connection.
+    Preserves connection at 115200 baud for normal operation without double-opening.
+    """
+    print("[GNSS] Initializing receiver...")
+    print("[GNSS] Checking communication at 115200 baud...")
+
+    # Step 1: Check communication at 115200 baud
+    ser = _open_serial_port(target_port, 115200, timeout=0.1)
+    if ser is not None:
+        if _check_communication(ser, timeout_sec=0.8):
+            ser.timeout = _READ_TIMEOUT_SEC
+            print("[GNSS] Receiver detected at 115200 baud.")
+            print("[GNSS] Baud rate configuration already correct.")
+            print("[GNSS] GNSS initialization successful.")
+            return ser
+        try:
+            ser.close()
+        except Exception:
+            pass
+
+    print("[GNSS] No response at 115200 baud.")
+
+    # Step 2: Check communication at 9600 baud
+    print("[GNSS] Checking communication at 9600 baud...")
+    ser = _open_serial_port(target_port, 9600, timeout=0.1)
+    if ser is not None:
+        if _check_communication(ser, timeout_sec=0.9):
+            print("[GNSS] Receiver detected at 9600 baud.")
+            print("[GNSS] Configuring UART1 to 115200 baud...")
+
+            # Send UBX-CFG-VALSET command for 115200 baud (RAM + BBR)
+            try:
+                ser.write(UBX_CFG_VALSET_115200)
+                if hasattr(ser, "flush"):
+                    ser.flush()
+            except Exception as write_err:
+                print(f"[GNSS] Failed to send configuration command: {write_err}")
+                try:
+                    ser.close()
+                except Exception:
+                    pass
+                return None
+
+            # Read UBX ACK-ACK or ACK-NAK response at 9600 baud if emitted before switch
+            ack = _read_ubx_ack(ser, expected_cls=0x06, expected_msg=0x8A, timeout_sec=0.3)
+
+            # Wait briefly for receiver to process configuration and update UART hardware
+            time.sleep(0.1)
+            try:
+                ser.close()
+            except Exception:
+                pass
+
+            # Step 3: Reopen at 115200 baud and verify communication
+            print("[GNSS] Verifying new baud rate...")
+            ser_new = _open_serial_port(target_port, 115200, timeout=0.1)
+            if ser_new is not None:
+                # If ACK was not received on 9600, check if receiver sent it on 115200
+                if ack is None:
+                    ack = _read_ubx_ack(ser_new, expected_cls=0x06, expected_msg=0x8A, timeout_sec=0.2)
+
+                if _check_communication(ser_new, timeout_sec=1.2) or (ack is True):
+                    ser_new.timeout = _READ_TIMEOUT_SEC
+                    print("[GNSS] Receiver responding at 115200 baud.")
+                    print("[GNSS] GNSS initialization successful.")
+                    return ser_new
+                try:
+                    ser_new.close()
+                except Exception:
+                    pass
+            print(f"[GNSS] Receiver failed verification at 115200 baud on {target_port}.")
+            return None
+        try:
+            ser.close()
+        except Exception:
+            pass
+
+    print("[GNSS] No response at 9600 baud.")
+    print(f"[GNSS] GNSS receiver not detected on {target_port}.")
+    return None
+
+
 def configure_ubx_5hz(ser) -> bool:
     """Send UBX-CFG-RATE command to set u-blox measurement rate to 5 Hz (200 ms).
     UBX-CFG-RATE: msg class 0x06, id 0x08, length 6
@@ -524,36 +756,27 @@ def _serial_thread() -> None:
         if not HAVE_PYSERIAL:
             print("[GNSS] CRITICAL: 'pyserial' package is not installed.")
             print("[GNSS] Please install with: pip install pyserial")
+            _init_done_event.set()
             _stop_event.wait(RECONNECT_DELAY)
             continue
 
-        # Resolve serial port: if user/configured port is missing on this machine, auto-detect (mirrors test_max_m10s_gnss.py)
+        # Resolve serial port: if user/configured port is missing on this machine, auto-detect
         target_port = _target_port
         if not target_port or (target_port.startswith("/dev") and not os.path.exists(target_port)):
             target_port = auto_detect_gnss_port() or getattr(_cfg, "GNSS_SERIAL_PORT", "/dev/serial0")
-        target_baud = _target_baud or getattr(_cfg, "GNSS_BAUD_RATE", 115200)
 
-        ser = None
-        try:
-            ser = serial.Serial(
-                port=target_port,
-                baudrate=target_baud,
-                timeout=_READ_TIMEOUT_SEC,
-                bytesize=serial.EIGHTBITS,
-                parity=serial.PARITY_NONE,
-                stopbits=serial.STOPBITS_ONE,
-                xonxoff=False,
-                rtscts=False,
-                dsrdtr=False,
-            )
-            _active_port = target_port
-            _active_baud = target_baud
-            print(f"[GNSS] Serial port opened: {target_port} @ {target_baud} baud (5 Hz rate)")
-            configure_ubx_5hz(ser)
-        except Exception as exc:
+        ser = _connect_and_configure_baud(target_port)
+        _init_done_event.set()
+
+        if ser is None:
             _active_port = None
-            _stop_event.wait(RECONNECT_DELAY)
+            if not _stop_event.is_set():
+                _stop_event.wait(RECONNECT_DELAY)
             continue
+
+        _active_port = target_port
+        _active_baud = 115200
+        configure_ubx_5hz(ser)
 
         try:
             while not _stop_event.is_set():
@@ -666,11 +889,12 @@ def init(port: str | None = None, baud: int | None = None) -> bool:
         return True
 
     _stop_event.clear()
+    _init_done_event.clear()
     _thread = threading.Thread(target=_serial_thread, name="gnss-max-m10s", daemon=True)
     _thread.start()
-    target_p = _target_port or auto_detect_gnss_port() or GNSS_SERIAL_PORT
-    target_b = _target_baud or GNSS_BAUD_RATE
-    print(f"[GNSS] Primary u-blox MAX-M10S reader initiated ({target_p} @ {target_b} baud)")
+    # Wait briefly for receiver auto-baud detection & configuration sequence to run
+    # Avoids blocking main gateway startup indefinitely (times out after 3.5s if hardware missing)
+    _init_done_event.wait(timeout=3.5)
     return True
 
 

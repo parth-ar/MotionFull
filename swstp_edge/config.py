@@ -224,7 +224,8 @@ LITTER_DISTANCE_INTERVAL_M   = 5.0
 LITTER_GNSS_LOST_TIMEOUT_SEC = 5.0
 
 # Clock fallback interval (seconds) when no GNSS fix available
-LITTER_TIME_FALLBACK_SEC     = 30.0
+# Clock fallback on GNSS loss: DISABLED (triggers exclusively on GNSS distance)
+LITTER_TIME_FALLBACK_SEC     = None
 
 # YOLO inference confidence threshold
 LITTER_CONF_THRESHOLD        = 0.65

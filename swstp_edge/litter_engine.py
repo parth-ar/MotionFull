@@ -7,8 +7,7 @@ a second camera. Frames are passed in from the already-read main loop frame.
 Trigger logic:
   - Every LITTER_DISTANCE_INTERVAL_M meters (default: 5 m) of GNSS travel,
     the current live frame is queued for YOLO inference.
-  - If GNSS is lost for > LITTER_GNSS_LOST_TIMEOUT_SEC (default: 5 s),
-    falls back to a clock-based trigger every LITTER_TIME_FALLBACK_SEC (default: 30 s).
+  - If GNSS is lost, triggers are paused entirely (clock fallback disabled).
   - On GNSS recovery, re-anchors to current position and resumes distance mode.
 
 Inference:
@@ -245,9 +244,7 @@ class LitterEngine:
         self._infer_thread.start()
 
         print(f"[LITTER] Engine initializing — weights: {weights_path}")
-        print(f"[LITTER] Distance trigger: {distance_interval_m:.1f}m | "
-              f"GNSS timeout: {gnss_lost_timeout_sec:.0f}s | "
-              f"Clock fallback: {time_fallback_sec:.0f}s | "
+        print(f"[LITTER] Distance trigger: {distance_interval_m:.1f}m (GNSS only | clock fallback disabled) | "
               f"Output: {output_dir}")
 
     # -------------------------------------------------------------------------
@@ -270,17 +267,15 @@ class LitterEngine:
         Call once per main loop iteration with current GNSS coordinates.
 
         Args:
-            lat, lon:          Current coordinates (may be last-known if GNSS is out).
+            lat, lon:          Current coordinates.
             gnss_hardware_fix: Pass the actual hardware fix flag from latest_sensor
-                               (gps_valid AND location_source == 'gnss').  When False
-                               the engine treats the fix as lost even if lat/lon have
-                               valid-looking values (e.g. held from location_fallback).
+                               (gps_valid AND location_source == 'gnss'). When False
+                               the engine treats the fix as lost.
 
-        Returns True when the distance threshold (default: 5 m) is crossed OR the clock fallback
-        timer fires.  Handles GNSS loss / recovery and TIME_FALLBACK automatically.
+        Returns True when the distance threshold (default: 5 m) is crossed.
+        When GNSS fix is lost, triggers are paused entirely (clock fallback disabled).
         """
         now = time.monotonic()
-        # has_fix requires BOTH valid coordinates AND confirmed hardware fix flag
         coord_valid = (lat is not None and lon is not None
                        and not (abs(lat) < 0.001 and abs(lon) < 0.001))
         has_fix = coord_valid and gnss_hardware_fix
@@ -296,74 +291,42 @@ class LitterEngine:
                 self._gnss_loss_start  = None
                 print(f"[LITTER TRIGGER] ✅ GNSS distance mode anchored at "
                       f"({lat:.8f}, {lon:.8f}). Trigger every {self.distance_interval_m:.1f}m.")
-            elif self._op_mode == "TIME_FALLBACK":
-                # Regained fix — re-anchor at current position
+            elif self._gnss_loss_start is not None:
+                # GNSS fix REGAINED — re-anchor at current position so distance isn't falsely jumped
                 self._last_trigger_lat = lat
                 self._last_trigger_lon = lon
                 self._op_mode          = "GNSS_DISTANCE"
                 self._gnss_loss_start  = None
                 print(f"[LITTER TRIGGER] ✅ GNSS fix REGAINED @ ({lat:.8f}, {lon:.8f}). "
-                      f"Re-anchoring — resuming {self.distance_interval_m:.1f}m distance mode.")
-            elif self._gnss_loss_start is not None:
-                # Recovered within grace period — cancel the countdown
-                elapsed = now - self._gnss_loss_start
-                self._gnss_loss_start = None
-                print(f"[LITTER TRIGGER] ✅ GNSS fix recovered within grace period ({elapsed:.1f}s). "
-                      f"Continuing distance mode.")
+                      f"Re-anchored — resuming {self.distance_interval_m:.1f}m distance mode.")
+
+            # ── Evaluate distance trigger condition ────────────────────────
+            if self._last_trigger_lat is not None:
+                dist = _haversine_distance_m(
+                    self._last_trigger_lat, self._last_trigger_lon, lat, lon
+                )
+                self._distance_since_trig = dist
+                if dist >= self.distance_interval_m:
+                    self._total_distance_m  += dist
+                    self._last_trigger_lat   = lat
+                    self._last_trigger_lon   = lon
+                    self._distance_since_trig = 0.0
+                    print(f"[LITTER TRIGGER] 🔴 Distance: {dist:.2f}m >= {self.distance_interval_m:.1f}m "
+                          f"— queuing inference #{self._trigger_count + 1} "
+                          f"@ ({lat:.8f}, {lon:.8f})")
+                    return True
         else:
-            # No hardware fix
-            if self._op_mode == "GNSS_DISTANCE":
-                if self._gnss_loss_start is None:
-                    self._gnss_loss_start = now
-                    print(f"[LITTER TRIGGER] ⚠️  GNSS hardware fix lost. "
-                          f"Grace period: {self.gnss_lost_timeout_sec:.0f}s before clock fallback ...")
-                elif (now - self._gnss_loss_start) >= self.gnss_lost_timeout_sec:
-                    # Grace expired — switch to TIME_FALLBACK
-                    # Set _last_fallback_time so the FIRST fallback trigger fires in ~5s
-                    # (not after a full 30s wait), minimising missed litter frames.
-                    _FIRST_FIRE_DELAY_SEC = 5.0
-                    self._op_mode           = "TIME_FALLBACK"
-                    self._last_fallback_time = now - (self.time_fallback_sec - _FIRST_FIRE_DELAY_SEC)
-                    self._gnss_loss_start   = None
-                    print(f"[LITTER TRIGGER] ⏱  GNSS lost >{self.gnss_lost_timeout_sec:.0f}s. "
-                          f"Switching to clock fallback (every {self.time_fallback_sec:.0f}s). "
-                          f"First trigger in ~{_FIRST_FIRE_DELAY_SEC:.0f}s.")
+            # No hardware fix — pause triggers (no clock fallback)
+            if self._gnss_loss_start is None:
+                self._gnss_loss_start = now
+                self._op_mode = "GNSS_LOST"
+                print(f"[LITTER TRIGGER] ⚠️  GNSS hardware fix lost. "
+                      f"Distance trigger paused (clock fallback disabled).")
 
-        # ── Evaluate trigger condition ─────────────────────────────────────
-        trigger = False
-
-        if self._op_mode == "GNSS_DISTANCE" and has_fix and self._last_trigger_lat is not None:
-            dist = _haversine_distance_m(
-                self._last_trigger_lat, self._last_trigger_lon, lat, lon
-            )
-            self._distance_since_trig = dist
-            if dist >= self.distance_interval_m:
-                self._total_distance_m  += dist
-                self._last_trigger_lat   = lat
-                self._last_trigger_lon   = lon
-                self._distance_since_trig = 0.0
-                trigger = True
-                print(f"[LITTER TRIGGER] 🔴 Distance: {dist:.2f}m >= {self.distance_interval_m:.1f}m "
-                      f"— queuing inference #{self._trigger_count + 1} "
-                      f"@ ({lat:.8f}, {lon:.8f})")
-
-        elif self._op_mode == "TIME_FALLBACK":
-            elapsed = now - self._last_fallback_time
-            remaining = max(0.0, self.time_fallback_sec - elapsed)
-            if elapsed >= self.time_fallback_sec:
-                self._last_fallback_time = now
-                trigger = True
-                print(f"[LITTER TRIGGER] ⏱  TIME FALLBACK — queuing inference #{self._trigger_count + 1} "
-                      f"(no GNSS, clock-based every {self.time_fallback_sec:.0f}s)")
-            else:
-                # Periodic status log every ~10s so operators can see the fallback is alive
-                if int(elapsed) % 10 == 0 and elapsed > 0.5:
-                    print(f"[LITTER TRIGGER] ⏱  TIME FALLBACK active — next trigger in {remaining:.0f}s")
-
-        return trigger
+        return False
 
     # -------------------------------------------------------------------------
-    # Non-blocking trigger
+        # Non-blocking trigger
     # -------------------------------------------------------------------------
     def try_trigger(self, frame, lat, lon, gnss_data: dict, rtc_ts: str | None) -> None:
         """
@@ -540,11 +503,8 @@ class LitterEngine:
             if has_fix and lat is not None and lon is not None:
                 gps_text = f"GNSS: {float(lat):.8f}, {float(lon):.8f}"
                 gps_col  = (0, 255, 0)
-            elif op_mode == "TIME_FALLBACK":
-                gps_text = "GNSS: NO FIX (CLOCK TRIGGER)"
-                gps_col  = (0, 165, 255)
             else:
-                gps_text = "GNSS: NO FIX / DISCONNECTED"
+                gps_text = "GNSS: NO FIX / PAUSED"
                 gps_col  = (0, 0, 255)
             cv2.putText(banner, gps_text,
                         (14, 54), cv2.FONT_HERSHEY_SIMPLEX, 0.65, gps_col, 2, cv2.LINE_AA)
