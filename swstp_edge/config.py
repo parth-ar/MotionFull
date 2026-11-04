@@ -119,6 +119,8 @@ CAMERA_SWAP_RB           = True        # Convert Picamera2 [R,G,B] array to Open
 CAMERA_AWB_MODE          = "auto"      # Default White Balance: "auto" (standard dynamic ISP, matches rpicam-hello).
                                        # Options: "auto", "daylight", "cloudy", "indoor", "tungsten", "fluorescent"
 CAMERA_TUNING_FILE       = None        # Optional path to libcamera tuning JSON file (None = native auto-detection like rpicam-hello)
+CAMERA_DAYLIGHT_FILTER   = False       # Outdoor daylight filter: boosts vegetation greens & suppresses harsh sunlight glare
+CAMERA_GREEN_BOOST       = 1.35        # Green channel boost multiplier for outdoor vegetation (1.0 = normal, 1.35 = rich green)
 
 # ---------------------------------------------------------------------------
 # Telemetry rate
