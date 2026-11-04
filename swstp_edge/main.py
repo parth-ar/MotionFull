@@ -304,8 +304,18 @@ def main() -> None:
 
     # ── Sensor initialisation ─────────────────────────────────────────────
     print("\n=== SWSTP UNIFIED SENSOR INIT ===")
-    rtc_ok  = rtc_sensor.init()
-    imu_ok  = imu_sensor.init()
+    try:
+        rtc_ok  = rtc_sensor.init()
+    except Exception as exc:
+        rtc_ok = False
+        print(f"[RTC] Init fault: {exc}")
+
+    try:
+        imu_ok  = imu_sensor.init()
+    except Exception as exc:
+        imu_ok = False
+        print(f"[IMU] Init fault: {exc}")
+
     target_gnss_p = args.port or args.gnss_port
     if target_gnss_p and target_gnss_p.startswith("/dev") and not os.path.exists(target_gnss_p):
         target_gnss_p = None  # Fall back to auto-detect candidate ports (USB/UART/COM)

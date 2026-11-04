@@ -631,37 +631,37 @@ def _open_serial_port(port: str, baud: int, timeout: float = _READ_TIMEOUT_SEC):
         return None
 
 
-def _connect_and_configure_baud(target_port: str):
+def _connect_and_configure_baud(target_port: str, verbose: bool = True):
     """Automatically detect receiver baud rate, configure MAX-M10S to 115200 baud
     if operating at 9600, verify communication, and return the open serial connection.
     Preserves connection at 115200 baud for normal operation without double-opening.
     """
-    print("[GNSS] Initializing receiver...")
-    print("[GNSS] Checking communication at 115200 baud...")
+    if verbose:
+        print("[GNSS] Initializing receiver...", flush=True)
+        print("[GNSS] Checking communication at 115200 baud...", flush=True)
 
     # Step 1: Check communication at 115200 baud
     ser = _open_serial_port(target_port, 115200, timeout=0.1)
     if ser is not None:
         if _check_communication(ser, timeout_sec=0.8):
             ser.timeout = _READ_TIMEOUT_SEC
-            print("[GNSS] Receiver detected at 115200 baud.")
-            print("[GNSS] Baud rate configuration already correct.")
-            print("[GNSS] GNSS initialization successful.")
+            print("[GNSS] Receiver detected at 115200 baud.", flush=True)
+            print("[GNSS] Baud rate configuration already correct.", flush=True)
+            print("[GNSS] GNSS initialization successful.", flush=True)
             return ser
         try:
             ser.close()
         except Exception:
             pass
 
-    print("[GNSS] No response at 115200 baud.")
-
-    # Step 2: Check communication at 9600 baud
-    print("[GNSS] Checking communication at 9600 baud...")
+    if verbose:
+        print("[GNSS] No response at 115200 baud.", flush=True)
+        print("[GNSS] Checking communication at 9600 baud...", flush=True)
     ser = _open_serial_port(target_port, 9600, timeout=0.1)
     if ser is not None:
         if _check_communication(ser, timeout_sec=0.9):
-            print("[GNSS] Receiver detected at 9600 baud.")
-            print("[GNSS] Configuring UART1 to 115200 baud...")
+            print("[GNSS] Receiver detected at 9600 baud.", flush=True)
+            print("[GNSS] Configuring UART1 to 115200 baud...", flush=True)
 
             # Send UBX-CFG-VALSET command for 115200 baud (RAM + BBR)
             try:
@@ -669,7 +669,7 @@ def _connect_and_configure_baud(target_port: str):
                 if hasattr(ser, "flush"):
                     ser.flush()
             except Exception as write_err:
-                print(f"[GNSS] Failed to send configuration command: {write_err}")
+                print(f"[GNSS] Failed to send configuration command: {write_err}", flush=True)
                 try:
                     ser.close()
                 except Exception:
@@ -687,7 +687,7 @@ def _connect_and_configure_baud(target_port: str):
                 pass
 
             # Step 3: Reopen at 115200 baud and verify communication
-            print("[GNSS] Verifying new baud rate...")
+            print("[GNSS] Verifying new baud rate...", flush=True)
             ser_new = _open_serial_port(target_port, 115200, timeout=0.1)
             if ser_new is not None:
                 # If ACK was not received on 9600, check if receiver sent it on 115200
@@ -696,22 +696,23 @@ def _connect_and_configure_baud(target_port: str):
 
                 if _check_communication(ser_new, timeout_sec=1.2) or (ack is True):
                     ser_new.timeout = _READ_TIMEOUT_SEC
-                    print("[GNSS] Receiver responding at 115200 baud.")
-                    print("[GNSS] GNSS initialization successful.")
+                    print("[GNSS] Receiver responding at 115200 baud.", flush=True)
+                    print("[GNSS] GNSS initialization successful.", flush=True)
                     return ser_new
                 try:
                     ser_new.close()
                 except Exception:
                     pass
-            print(f"[GNSS] Receiver failed verification at 115200 baud on {target_port}.")
+            print(f"[GNSS] Receiver failed verification at 115200 baud on {target_port}.", flush=True)
             return None
         try:
             ser.close()
         except Exception:
             pass
 
-    print("[GNSS] No response at 9600 baud.")
-    print(f"[GNSS] GNSS receiver not detected on {target_port}.")
+    if verbose:
+        print("[GNSS] No response at 9600 baud.", flush=True)
+        print(f"[GNSS] GNSS receiver not detected on {target_port}.", flush=True)
     return None
 
 
@@ -727,7 +728,7 @@ def configure_ubx_5hz(ser) -> bool:
         cmd = bytes([0xB5, 0x62, 0x06, 0x08, 0x06, 0x00, 0xC8, 0x00, 0x01, 0x00, 0x01, 0x00, 0xDE, 0x6A])
         ser.write(cmd)
         ser.flush()
-        print("[GNSS] Configured u-blox receiver measurement rate: 5 Hz (200 ms)")
+        print("[GNSS] Configured u-blox receiver measurement rate: 5 Hz (200 ms)", flush=True)
         return True
     except Exception as exc:
         print(f"[GNSS] Note: 5 Hz UBX config skipped ({exc})")
@@ -751,6 +752,7 @@ def _serial_thread() -> None:
     # Elevate OS scheduling priority — GNSS/location streaming is higher priority
     # than camera capture, motion detection, or frame streaming threads.
     _set_thread_priority_high()
+    first_run = True
 
     while not _stop_event.is_set():
         if not HAVE_PYSERIAL:
@@ -765,7 +767,8 @@ def _serial_thread() -> None:
         if not target_port or (target_port.startswith("/dev") and not os.path.exists(target_port)):
             target_port = auto_detect_gnss_port() or getattr(_cfg, "GNSS_SERIAL_PORT", "/dev/serial0")
 
-        ser = _connect_and_configure_baud(target_port)
+        ser = _connect_and_configure_baud(target_port, verbose=first_run)
+        first_run = False
         _init_done_event.set()
 
         if ser is None:

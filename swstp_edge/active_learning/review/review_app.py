@@ -131,12 +131,17 @@ def resolve_default_paths():
     """Resolve standard directory locations across swstp_edge layout."""
     today_str = datetime.date.today().strftime("%Y_%m_%d")
 
+    retrain_imgs    = os.path.join(_ACTIVE_LEARNING_DIR, "images for retrainning")
     raw_dataset     = os.path.join(_ACTIVE_LEARNING_DIR, "dataset", "raw")
     litter_captures = os.path.join(_SWSTP_EDGE_DIR, "captures", "litter")
     test_imgs       = os.path.join(_SWSTP_EDGE_DIR, "test images")
 
     images_dir = raw_dataset
-    if not os.path.isdir(images_dir) or not any(
+    if os.path.isdir(retrain_imgs) and any(
+        f.lower().endswith(tuple(IMG_EXTS)) for f in os.listdir(retrain_imgs)
+    ):
+        images_dir = retrain_imgs
+    elif not os.path.isdir(images_dir) or not any(
         f.lower().endswith(tuple(IMG_EXTS)) for f in os.listdir(images_dir)
     ):
         if os.path.isdir(litter_captures) and any(
@@ -146,7 +151,7 @@ def resolve_default_paths():
         elif os.path.isdir(test_imgs):
             images_dir = test_imgs
 
-    weights_pt = os.path.join(_SWSTP_EDGE_DIR, "weights", "best.pt")
+    weights_pt = os.path.join(_SWSTP_EDGE_DIR, "weights", "best.onnx")
     output_dir = os.path.join(_ACTIVE_LEARNING_DIR, "dataset", "reviewed", f"batch_{today_str}")
     return images_dir, weights_pt, output_dir
 

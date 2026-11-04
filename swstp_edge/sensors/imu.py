@@ -323,7 +323,12 @@ def init() -> bool:
     """
     global imu_ok, _bus, _last_ts, _read_fail_count
 
-    import smbus2  # type: ignore
+    try:
+        import smbus2  # type: ignore
+    except (ImportError, Exception) as exc:
+        imu_ok = False
+        print(f"[IMU] smbus2 unavailable ({exc}) — operating in bench/offline mode")
+        return False
 
     bus = None
 
