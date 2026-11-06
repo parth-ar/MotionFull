@@ -222,6 +222,9 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Disable background power & low-battery monitoring")
     parser.add_argument("--simulate-low-batt-sec", type=float, default=0,
                         help="Simulate low battery alert after N seconds (testing)")
+    parser.add_argument("--max-captures-per-stop", type=int,
+                        default=getattr(_cfg, "MAX_CAPTURES_PER_STOP", 2),
+                        help="Maximum motion frames captured per vehicle stop event (default: 2)")
     # Litter detection overrides
     parser.add_argument("--litter-weights", default=LITTER_WEIGHTS,
                         help=f"Path to YOLO ONNX weights for litter detection (default: {LITTER_WEIGHTS})")
@@ -569,7 +572,7 @@ def main() -> None:
     except Exception:
         pass
 
-    stop_detector = VehicleStopDetector()
+    stop_detector = VehicleStopDetector(max_captures_per_stop=args.max_captures_per_stop)
 
     print("[INIT] Unified Edge Gateway running.")
     print("  Controls: [t] Toggle Camera | [r] Plot ROI/AoD | [v] Toggle Colors | [c] Clear | [q] Quit\n")
@@ -1077,8 +1080,17 @@ def main() -> None:
                             cv2.FONT_HERSHEY_SIMPLEX, text_scale,
                             (0, 0, 255), max(1, int(orig_h / 360)), cv2.LINE_AA)
 
+                current_stop_captures = len(stop_detector.active_stop.captures) if (stop_detector.active_stop is not None) else 0
+
                 if not is_vehicle_stopped:
                     pass  # Vehicle moving — skip capture
+                elif current_stop_captures >= args.max_captures_per_stop:
+                    # Capture quota reached for this stop (maximum 2 frames per stop)
+                    quota_text = f"STOP #{current_stop_id} CAPTURE QUOTA REACHED ({current_stop_captures}/{args.max_captures_per_stop})"
+                    cv2.putText(display_frame, quota_text,
+                                (10, int(85 * text_scale)),
+                                cv2.FONT_HERSHEY_SIMPLEX, text_scale * 0.8,
+                                (0, 165, 255), max(1, int(orig_h / 360)), cv2.LINE_AA)
                 elif now_mono - last_save_time >= SAVE_COOLDOWN_SEC:
                     saved_count   += 1
                     last_save_time = now_mono

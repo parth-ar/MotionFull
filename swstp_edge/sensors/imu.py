@@ -1,231 +1,285 @@
 """
-sensors/imu.py — MPU-6500 IMU driver for Raspberry Pi via smbus2.
+sensors/imu.py — MPU-6500 / MPU-6050 6-Axis IMU Hardware Driver for Raspberry Pi via smbus2.
 
-DESIGN
-------
-Reads the MPU-6500 at I2C address 0x69 (AD0 pin pulled HIGH) using smbus2
-for direct register access.  Ports the complementary filter and Euler →
-quaternion conversion from the Arduino firmware (updateOrientation /
-printQuaternion) as closely as possible.
+DATA ORIGINS & HARDWARE SPECIFICATION
+-------------------------------------
+Communicates with the InvenSense MPU-6500 (or MPU-6050) over the Raspberry Pi hardware
+I2C bus (I2C-1, physical pins 3/5: SDA=BCM 2, SCL=BCM 3).
+Auto-probes primary I2C address 0x69 (AD0 pin pulled HIGH) with automatic fallback
+to 0x68 (AD0 pulled LOW/GND) to guarantee rock-solid initialization across all breakout boards.
 
-Register map (MPU-6500 matches MPU-6050 for the used registers):
-  0x6B  PWR_MGMT_1     — wake from sleep
-  0x1B  GYRO_CONFIG    — ±250 °/s  → value 0x00
-  0x1C  ACCEL_CONFIG   — ±2 g      → value 0x00
-  0x3B  ACCEL_XOUT_H   — start of 14-byte burst block:
-                          [0:5]   AX_H AX_L AY_H AY_L AZ_H AZ_L  (accel)
-                          [6:7]   T_H  T_L                         (temp)
-                          [8:13]  GX_H GX_L GY_H GY_L GZ_H GZ_L  (gyro)
-  0x75  WHO_AM_I       — 0x70 for MPU-6500
+Register Map (MPU-6500 / MPU-6050):
+  0x6B  PWR_MGMT_1         — Power management (Device reset: 0x80, Wake + PLL Clock: 0x01)
+  0x68  SIGNAL_PATH_RESET  — Reset gyro/accel/temp digital signal paths (0x07)
+  0x1A  CONFIG             — Digital Low Pass Filter (DLPF = 42 Hz: 0x03)
+  0x1B  GYRO_CONFIG        — Full-scale range ±250 °/s (0x00)
+  0x1C  ACCEL_CONFIG       — Full-scale range ±2 g (0x00)
+  0x3B  ACCEL_XOUT_H       — Start of 14-byte continuous burst readout:
+                             [0:1]   AX_H AX_L  (16-bit signed, big-endian)
+                             [2:3]   AY_H AY_L  (16-bit signed, big-endian)
+                             [4:5]   AZ_H AZ_L  (16-bit signed, big-endian)
+                             [6:7]   T_H  T_L   (16-bit signed, die temperature)
+                             [8:9]   GX_H GX_L  (16-bit signed, big-endian)
+                             [10:11] GY_H GY_L  (16-bit signed, big-endian)
+                             [12:13] GZ_H GZ_L  (16-bit signed, big-endian)
+  0x75  WHO_AM_I           — Returns 0x70 (MPU-6500), 0x68 (MPU-6050), 0x71 (MPU-9250), 0x19 (ICM-20600/20602)
 
-Scale factors:
-  Accel ±2 g   → 16384 LSB/g
-  Gyro  ±250 °/s → 131 LSB/(°/s)
-  Temp  → T_C = raw / 333.87 + 21.0  (MPU-6500 datasheet §4.18)
+Physical Scale Conversions:
+  - Accelerometer: ±2 g full scale → 16384 LSB/g (raw / 16384.0 = g; g * 9.80665 = m/s²)
+  - Gyroscope:     ±250 °/s scale   → 131.0 LSB/(°/s) (raw / 131.0 = °/s)
+  - Temperature:   T_C = raw / 333.87 + 21.0 °C (per InvenSense MPU-6500 Register Map §4.18)
 
-Complementary filter (identical to .ino):
-  α = 0.98
-  roll  = α * (roll  + gx * dt) + (1-α) * accel_roll
-  pitch = α * (pitch + gy * dt) + (1-α) * accel_pitch
-  yaw   = normalise(yaw + gz * dt)   ← gyro-only, no magnetometer
-
-Gravity-axis calibration:
-  During calibration the axis with the largest absolute mean is inferred as
-  the gravity axis.  Only that axis gets a 1 g offset removed; all other
-  axes are zeroed on their measured mean.  This handles arbitrary board
-  orientation without hard-coding "Z is always +1 g".
-
-Initialization sequence (staged, with per-stage retries):
-  BUS_OPEN → WHO_AM_I → WAKE → CONFIG_ACCEL → CONFIG_GYRO →
-  FIRST_READ → CALIBRATION → READY
-
-Retry policy:
-  Init stages   : 3 attempts, 50 ms between attempts
-  Normal reads  : 3 attempts,  8 ms between attempts; triggers re-init on
-                  repeated failure
-
-VOLTAGE CAUTION ⚠️
-------------------
-Most GY-6500 / GY-521 breakout boards have an onboard 3.3 V regulator so
-the chip itself runs at 3.3 V.  The I2C logic levels on those boards are
-therefore 3.3 V — safe for direct connection to Pi GPIO 2/3 (SDA/SCL).
-If you have a bare MPU-6500 module wired to 5 V, insert a bidirectional
-level-shifter before connecting to the Pi.  Check your specific module's
-schematic.
-
-I2C address: 0x69 (AD0 pulled HIGH — mirrors .ino MPU6500_WE mpu(0x69))
+Orientation Estimation:
+  - Complementary Filter (α = 0.98, matches firmware updateOrientation):
+      roll  = α * (roll  + gx * dt) + (1 - α) * accel_roll
+      pitch = α * (pitch + gy * dt) + (1 - α) * accel_pitch
+      yaw   = normalise(yaw + gz * dt)  [gyro integration]
+  - Tait-Bryan Z-Y-X rotation transformed to unit quaternion [w, x, y, z].
 """
 
 import math
 import struct
 import threading
 import time
+from typing import Optional, Tuple, Dict, Any
+
 from config import COMPLEMENTARY_ALPHA, TELEMETRY_INTERVAL_SEC
 
 # ---------------------------------------------------------------------------
-# MPU-6500 register addresses
+# MPU-6500 / MPU-6050 Registers
 # ---------------------------------------------------------------------------
-_ADDR        = 0x69
-_PWR_MGMT_1  = 0x6B
-_ACCEL_CFG   = 0x1C
-_GYRO_CFG    = 0x1B
-_BURST_START = 0x3B   # start of 14-byte block: accel(6) + temp(2) + gyro(6)
-_WHO_AM_I    = 0x75
+_PRIMARY_ADDR = 0x69      # AD0 pulled HIGH (default for SWSTP)
+_BACKUP_ADDR  = 0x68      # AD0 pulled LOW / GND
 
-# Known valid WHO_AM_I values
-_VALID_WHO_AM_I = frozenset({0x70, 0x68, 0x71, 0x19})
+_SMPLRT_DIV   = 0x19
+_CONFIG       = 0x1A      # DLPF config (0x03 = 42 Hz filter)
+_GYRO_CFG     = 0x1B      # ±250 °/s (0x00)
+_ACCEL_CFG    = 0x1C      # ±2 g (0x00)
+_BURST_START  = 0x3B      # 14-byte block: accel(6) + temp(2) + gyro(6)
+_SIG_RESET    = 0x68      # Signal path reset
+_PWR_MGMT_1   = 0x6B      # Power management 1: reset (0x80), wake+PLL (0x01)
+_WHO_AM_I     = 0x75
 
-# Scale factors
-_ACCEL_SCALE = 16384.0   # LSB/g  for ±2 g
-_GYRO_SCALE  = 131.0     # LSB/(°/s) for ±250 °/s
-_G_MS2       = 9.80665   # m/s² per g
+# Valid WHO_AM_I signatures:
+#   0x70 = MPU-6500
+#   0x68 = MPU-6050
+#   0x71 = MPU-9250
+#   0x73 = MPU-9255
+#   0x19 = ICM-20600
+#   0x11 = ICM-20602
+_VALID_WHO_AM_I = frozenset({0x70, 0x68, 0x71, 0x73, 0x19, 0x11})
 
-# Retry / timing parameters
-_INIT_RETRIES     = 3      # attempts per init stage
-_INIT_RETRY_DELAY = 0.050  # s between init retries
-_READ_RETRIES     = 3      # attempts per normal read
-_READ_RETRY_DELAY = 0.002  # s between read retries (fast micro-sleep to prevent 20 Hz loop stalls)
+# Scale Factors
+_ACCEL_SCALE = 16384.0    # LSB/g for ±2 g
+_GYRO_SCALE  = 131.0      # LSB/(°/s) for ±250 °/s
+_G_MS2       = 9.80665    # m/s² per g
 
-# Calibration
-_CALIB_SAMPLES     = 100
-_CALIB_DELAY       = 0.010  # s between calibration samples
+# Retries & Timing
+_INIT_RETRIES     = 3
+_INIT_RETRY_DELAY = 0.050 # s
+_READ_RETRIES     = 3
+_READ_RETRY_DELAY = 0.005 # s
+_CALIB_SAMPLES    = 100
+_CALIB_DELAY      = 0.010 # s
 
 # ---------------------------------------------------------------------------
-# Module state (thread-safe via lock)
+# Module State (Thread-Safe)
 # ---------------------------------------------------------------------------
 imu_ok: bool = False
 
 _lock            = threading.Lock()
 _i2c_lock        = threading.Lock()
-_roll_deg        = 0.0
-_pitch_deg       = 0.0
-_yaw_deg         = 0.0
-_last_ts: float  = 0.0
-_bus             = None   # smbus2.SMBus — kept open after init
-_last_valid_imu: dict | None = None
+_bus             = None   # smbus2.SMBus instance
+_active_addr: int = _PRIMARY_ADDR
+
+_roll_deg: float  = 0.0
+_pitch_deg: float = 0.0
+_yaw_deg: float   = 0.0
+_last_ts: float   = 0.0
+
+_last_valid_imu: Optional[dict] = None
 _last_valid_ts: float = 0.0
 _last_error_log_ts: float = 0.0
 _last_reinit_ts: float = 0.0
-
-# Calibration offsets (in scaled units: g for accel, °/s for gyro)
-_ax_off = _ay_off = _az_off = 0.0
-_gx_off = _gy_off = _gz_off = 0.0
-
-# Consecutive read-failure counter
 _read_fail_count: int = 0
 
+# Calibration offsets (in physical units: g for accel, °/s for gyro)
+_offsets = {
+    "ax": 0.0, "ay": 0.0, "az": 0.0,
+    "gx": 0.0, "gy": 0.0, "gz": 0.0,
+}
+
 
 # ---------------------------------------------------------------------------
-# Low-level 14-byte burst read
+# Low-Level I2C Helpers
 # ---------------------------------------------------------------------------
-def _burst_read_14(bus) -> tuple[int, int, int, int, int, int, int]:
+
+def _write_reg(bus, addr: int, reg: int, val: int, retries: int = 3) -> bool:
+    """Safely write an 8-bit register with retries and lock."""
+    with _i2c_lock:
+        for attempt in range(1, retries + 1):
+            try:
+                bus.write_byte_data(addr, reg, val)
+                return True
+            except OSError:
+                if attempt < retries:
+                    time.sleep(0.005)
+        return False
+
+
+def _read_reg(bus, addr: int, reg: int, retries: int = 3) -> Optional[int]:
+    """Safely read an 8-bit register with retries and lock."""
+    with _i2c_lock:
+        for attempt in range(1, retries + 1):
+            try:
+                return bus.read_byte_data(addr, reg)
+            except OSError:
+                if attempt < retries:
+                    time.sleep(0.005)
+        return None
+
+
+def _burst_read_14(bus, addr: int) -> Tuple[int, int, int, int, int, int, int]:
     """
-    Single 14-byte I²C burst starting at register 0x3B.
-    Returns (ax_raw, ay_raw, az_raw, t_raw, gx_raw, gy_raw, gz_raw) as
-    signed 16-bit integers.
-    Protected by _i2c_lock to prevent simultaneous bus collisions.
+    Read 14 contiguous bytes starting at register 0x3B.
+    Returns: (ax_raw, ay_raw, az_raw, t_raw, gx_raw, gy_raw, gz_raw)
+    Protected by _i2c_lock against concurrent I2C bus contention.
     """
     with _i2c_lock:
-        raw = bus.read_i2c_block_data(_ADDR, _BURST_START, 14)
-    ax, ay, az, t, gx, gy, gz = struct.unpack(">hhhhhhh", bytes(raw))
-    return ax, ay, az, t, gx, gy, gz
+        raw = bus.read_i2c_block_data(addr, _BURST_START, 14)
+    return struct.unpack(">hhhhhhh", bytes(raw))
 
 
 # ---------------------------------------------------------------------------
-# Staged init helper — retry wrapper
+# Chip Reset & Configuration Sequence
 # ---------------------------------------------------------------------------
-def _stage(name: str, fn, retries: int = _INIT_RETRIES, delay: float = _INIT_RETRY_DELAY):
+
+def _probe_and_configure_chip(bus) -> Optional[Tuple[int, int]]:
     """
-    Call fn() up to `retries` times.  Prints stage-level diagnostics.
-    Returns the return value of fn() on success, raises the last exception
-    on total failure.
+    Probe candidate I2C addresses (0x69, then 0x68).
+    Issues a hardware DEVICE_RESET (0x80 to PWR_MGMT_1), wakes the chip with
+    gyro PLL clock source (0x01), and configures DLPF, accel (±2g), and gyro (±250°/s).
+    Returns (active_address, who_am_i) on success, or None on failure.
     """
-    last_exc = None
-    for attempt in range(1, retries + 1):
+    candidate_addrs = (_PRIMARY_ADDR, _BACKUP_ADDR)
+
+    for addr in candidate_addrs:
         try:
-            result = fn()
-            print(f"[IMU] {name} — OK")
-            return result
-        except Exception as exc:
-            last_exc = exc
-            print(
-                f"[IMU] INIT FAILED\n"
-                f"      Stage  : {name}\n"
-                f"      Attempt: {attempt}/{retries}\n"
-                f"      Error  : {type(exc).__name__} {exc}"
-            )
-            if attempt < retries:
-                time.sleep(delay)
-    raise last_exc
+            # 1. Hardware device reset: write 0x80 to PWR_MGMT_1 (bit 7 = H_RESET)
+            # Clears any bad internal state from power hiccups or previous unclean script shutdowns.
+            if not _write_reg(bus, addr, _PWR_MGMT_1, 0x80, retries=2):
+                continue
+            time.sleep(0.100)  # Wait 100 ms for reset sequence to settle
+
+            # 2. Wake chip & select PLL clock: write 0x01 to PWR_MGMT_1
+            # (CLKSEL=1: Auto-selects gyro PLL clock for maximum timing stability per datasheet §4.3)
+            if not _write_reg(bus, addr, _PWR_MGMT_1, 0x01, retries=3):
+                continue
+            time.sleep(0.030)  # Wait for PLL clock to lock
+
+            # 3. Read WHO_AM_I register (0x75)
+            who = _read_reg(bus, addr, _WHO_AM_I, retries=3)
+            if who is None or who not in _VALID_WHO_AM_I:
+                continue
+
+            # 4. Configure Digital Low-Pass Filter (DLPF): 0x03 (~42 Hz cutoff for vehicle vibration rejection)
+            _write_reg(bus, addr, _CONFIG, 0x03, retries=2)
+
+            # 5. Configure Accelerometer: ±2 g (16384 LSB/g)
+            _write_reg(bus, addr, _ACCEL_CFG, 0x00, retries=2)
+
+            # 6. Configure Gyroscope: ±250 °/s (131 LSB/(°/s))
+            _write_reg(bus, addr, _GYRO_CFG, 0x00, retries=2)
+            time.sleep(0.020)
+
+            # 7. Test burst read to verify data pipeline
+            _burst_read_14(bus, addr)
+
+            return addr, who
+        except Exception:
+            continue
+
+    return None
 
 
 # ---------------------------------------------------------------------------
-# Calibration — 14-byte burst, gravity-direction-aware
+# Calibration — Gravity-Direction-Aware Zeroing
 # ---------------------------------------------------------------------------
-def _calibrate(bus) -> None:
-    """
-    Collect _CALIB_SAMPLES burst reads at rest and compute per-axis offsets.
 
-    Gravity axis determination:
-      The axis (X, Y, or Z) with the largest absolute mean accelerometer
-      value is inferred as the gravity axis.  A 1 g offset is removed from
-      that axis in the direction of the mean (handles ±Z, ±X, ±Y mounting).
-      All other accel axes are zeroed to their measured mean.
-      Gyroscope offsets are the raw means (gyro should read 0 at rest).
-
-    This correctly handles the confirmed mounting where Z ≈ -1.11 g.
+def _calibrate(bus, addr: int) -> bool:
     """
-    global _ax_off, _ay_off, _az_off, _gx_off, _gy_off, _gz_off
-    print(f"[IMU] Calibrating ({_CALIB_SAMPLES} samples) — hold still…")
+    Collect _CALIB_SAMPLES at rest to determine stationary zero offsets.
+    Identifies the gravity axis automatically (axis with largest absolute mean)
+    and removes 1.0 g, zeroing all other axes.
+    """
+    global _offsets
+    print(f"[IMU] Calibrating ({_CALIB_SAMPLES} samples) at address 0x{addr:02X} — hold still…")
+
     ax_acc = ay_acc = az_acc = 0.0
     gx_acc = gy_acc = gz_acc = 0.0
+    valid_samples = 0
+
     for _ in range(_CALIB_SAMPLES):
-        ax, ay, az, _t, gx, gy, gz = _burst_read_14(bus)
-        ax_acc += ax; ay_acc += ay; az_acc += az
-        gx_acc += gx; gy_acc += gy; gz_acc += gz
+        try:
+            ax, ay, az, _t, gx, gy, gz = _burst_read_14(bus, addr)
+            ax_acc += ax; ay_acc += ay; az_acc += az
+            gx_acc += gx; gy_acc += gy; gz_acc += gz
+            valid_samples += 1
+        except Exception:
+            pass
         time.sleep(_CALIB_DELAY)
 
-    n = float(_CALIB_SAMPLES)
-    ax_mean = ax_acc / n / _ACCEL_SCALE
-    ay_mean = ay_acc / n / _ACCEL_SCALE
-    az_mean = az_acc / n / _ACCEL_SCALE
+    if valid_samples < (_CALIB_SAMPLES // 2):
+        print(f"[IMU] Calibration failed: insufficient valid samples ({valid_samples}/{_CALIB_SAMPLES})")
+        return False
 
-    # Determine gravity axis: whichever has the largest |mean|
+    n = float(valid_samples)
+    ax_mean = (ax_acc / n) / _ACCEL_SCALE
+    ay_mean = (ay_acc / n) / _ACCEL_SCALE
+    az_mean = (az_acc / n) / _ACCEL_SCALE
+
+    # Gravity axis: whichever has largest absolute mean
     magnitudes = [abs(ax_mean), abs(ay_mean), abs(az_mean)]
-    grav_axis  = magnitudes.index(max(magnitudes))   # 0=X, 1=Y, 2=Z
-    grav_sign  = 1.0 if [ax_mean, ay_mean, az_mean][grav_axis] > 0 else -1.0
+    grav_axis = magnitudes.index(max(magnitudes))  # 0=X, 1=Y, 2=Z
+    means = [ax_mean, ay_mean, az_mean]
+    grav_sign = 1.0 if means[grav_axis] > 0 else -1.0
 
-    # Build offsets: gravity axis → remove 1 g in measured direction; others → zero mean
-    ax_off_new = ax_mean - (grav_sign if grav_axis == 0 else 0.0)
-    ay_off_new = ay_mean - (grav_sign if grav_axis == 1 else 0.0)
-    az_off_new = az_mean - (grav_sign if grav_axis == 2 else 0.0)
-
-    _ax_off = ax_off_new
-    _ay_off = ay_off_new
-    _az_off = az_off_new
-    _gx_off = gx_acc / n / _GYRO_SCALE
-    _gy_off = gy_acc / n / _GYRO_SCALE
-    _gz_off = gz_acc / n / _GYRO_SCALE
+    _offsets["ax"] = ax_mean - (grav_sign if grav_axis == 0 else 0.0)
+    _offsets["ay"] = ay_mean - (grav_sign if grav_axis == 1 else 0.0)
+    _offsets["az"] = az_mean - (grav_sign if grav_axis == 2 else 0.0)
+    _offsets["gx"] = (gx_acc / n) / _GYRO_SCALE
+    _offsets["gy"] = (gy_acc / n) / _GYRO_SCALE
+    _offsets["gz"] = (gz_acc / n) / _GYRO_SCALE
 
     axis_names = ("X", "Y", "Z")
     print(
-        f"[IMU] Calibration complete.\n"
-        f"      Gravity axis : {axis_names[grav_axis]} ({grav_sign:+.0f} g, mean={[ax_mean,ay_mean,az_mean][grav_axis]:+.4f} g)\n"
-        f"      Accel offsets: ax={_ax_off:+.4f}  ay={_ay_off:+.4f}  az={_az_off:+.4f}  g\n"
-        f"      Gyro  offsets: gx={_gx_off:+.4f}  gy={_gy_off:+.4f}  gz={_gz_off:+.4f}  °/s"
+        f"[IMU] Calibration complete ({valid_samples} samples).\n"
+        f"      Gravity axis : {axis_names[grav_axis]} ({grav_sign:+.0f} g, mean={means[grav_axis]:+.4f} g)\n"
+        f"      Accel offsets: ax={_offsets['ax']:+.4f}  ay={_offsets['ay']:+.4f}  az={_offsets['az']:+.4f} g\n"
+        f"      Gyro  offsets: gx={_offsets['gx']:+.4f}  gy={_offsets['gy']:+.4f}  gz={_offsets['gz']:+.4f} °/s"
     )
+    return True
 
 
 # ---------------------------------------------------------------------------
-# Complementary filter — verbatim port from .ino updateOrientation()
+# Complementary Filter & Quaternion Math
 # ---------------------------------------------------------------------------
+
+def _normalise_angle(a: float) -> float:
+    """Keeps angle in (-180, +180]."""
+    while a > 180.0:
+        a -= 360.0
+    while a < -180.0:
+        a += 360.0
+    return a
+
+
 def _update_orientation(ax: float, ay: float, az: float,
-                         gx: float, gy: float, gz: float,
-                         dt: float) -> None:
-    """Port of Arduino updateOrientation().  Updates module globals."""
+                        gx: float, gy: float, gz: float,
+                        dt: float) -> None:
+    """Complementary filter: fuses accelerometer gravity vector with gyro integration."""
     global _roll_deg, _pitch_deg, _yaw_deg
 
-    # Guard: clamp dt to valid range (same as .ino `if (dt<=0 || dt>0.5) dt=0.05`)
     if dt <= 0.0 or dt > 0.5:
         dt = TELEMETRY_INTERVAL_SEC
 
@@ -239,15 +293,8 @@ def _update_orientation(ax: float, ay: float, az: float,
     _yaw_deg   = _normalise_angle(_yaw_deg + gz * dt)
 
 
-def _normalise_angle(a: float) -> float:
-    """Port of .ino normalizeAngle() — keeps angle in (-180, +180]."""
-    while a >  180.0: a -= 360.0
-    while a < -180.0: a += 360.0
-    return a
-
-
 def _euler_to_quaternion(roll_deg: float, pitch_deg: float, yaw_deg: float) -> dict:
-    """Port of .ino printQuaternion() — Tait-Bryan Z-Y-X → quaternion."""
+    """Tait-Bryan Z-Y-X Euler angles to unit quaternion."""
     r = math.radians(roll_deg)
     p = math.radians(pitch_deg)
     y = math.radians(yaw_deg)
@@ -255,73 +302,73 @@ def _euler_to_quaternion(roll_deg: float, pitch_deg: float, yaw_deg: float) -> d
     cp, sp = math.cos(p * 0.5), math.sin(p * 0.5)
     cr, sr = math.cos(r * 0.5), math.sin(r * 0.5)
     return {
-        "w": round(cr*cp*cy + sr*sp*sy, 6),
-        "x": round(sr*cp*cy - cr*sp*sy, 6),
-        "y": round(cr*sp*cy + sr*cp*sy, 6),
-        "z": round(cr*cp*sy - sr*sp*cy, 6),
+        "w": round(cr * cp * cy + sr * sp * sy, 6),
+        "x": round(sr * cp * cy - cr * sp * sy, 6),
+        "y": round(cr * sp * cy - sr * sp * sy, 6),
+        "z": round(cr * cp * sy - sr * sp * cy, 6),
     }
 
 
 # ---------------------------------------------------------------------------
-# Internal re-initialisation (used by read() recovery path)
+# Recovery & Dynamic Bus Re-initialisation
 # ---------------------------------------------------------------------------
+
 def _reinit_bus() -> bool:
     """
-    Attempt a lightweight non-blocking re-initialisation: verify WHO_AM_I and re-apply
-    wake + config registers. Called when repeated read failures occur.
-    Does NOT re-run full calibration — keeps existing offsets.
-    Uses micro-delays (0.01s) instead of 200 ms sleeps so the 20 Hz loop is never blocked.
-    Returns True if the bus is responsive again.
+    Recover from persistent I2C bus errors: closes the stale smbus handle,
+    opens a fresh connection, wakes chip with PLL clock, and restores communication.
+    Rate-limited to once every 5.0 seconds. Preserves calibrated offsets.
     """
-    global _bus, imu_ok, _last_ts, _last_reinit_ts
+    global _bus, _active_addr, imu_ok, _last_ts, _last_reinit_ts
     now = time.monotonic()
     if (now - _last_reinit_ts) < 5.0:
         return False
     _last_reinit_ts = now
 
     try:
-        bus = _bus
-        if bus is None:
+        import smbus2  # type: ignore
+        # Safely close old bus handle to release Linux I2C adapter state
+        if _bus is not None:
+            try:
+                _bus.close()
+            except Exception:
+                pass
+            _bus = None
+
+        new_bus = smbus2.SMBus(1)
+        res = _probe_and_configure_chip(new_bus)
+        if res is None:
+            try:
+                new_bus.close()
+            except Exception:
+                pass
+            imu_ok = False
             return False
 
-        with _i2c_lock:
-            who = bus.read_byte_data(_ADDR, _WHO_AM_I)
-            if who not in _VALID_WHO_AM_I:
-                return False
-
-            bus.write_byte_data(_ADDR, _PWR_MGMT_1, 0x00)
-            time.sleep(0.01)
-            bus.write_byte_data(_ADDR, _ACCEL_CFG, 0x00)
-            bus.write_byte_data(_ADDR, _GYRO_CFG,  0x00)
-            time.sleep(0.01)
-
-        # Verify a burst read succeeds
-        _burst_read_14(bus)
-
+        _active_addr, who = res
+        _bus = new_bus
         _last_ts = time.monotonic()
-        imu_ok   = True
-        print(f"[IMU] Re-initialisation successful (WHO_AM_I=0x{who:02X})")
+        imu_ok = True
+        print(f"[IMU] Re-initialisation successful: chip at 0x{_active_addr:02X} (WHO_AM_I=0x{who:02X})")
         return True
-
-    except Exception:
+    except Exception as exc:
         imu_ok = False
+        print(f"[IMU] Re-initialisation error: {exc}")
         return False
 
 
 # ---------------------------------------------------------------------------
 # Public API — init()
 # ---------------------------------------------------------------------------
+
 def init() -> bool:
     """
-    Open SMBus(1), run staged initialisation with per-stage retries, calibrate.
-
-    Staged sequence:
-      BUS_OPEN → WHO_AM_I → WAKE → CONFIG_ACCEL → CONFIG_GYRO →
-      FIRST_READ → CALIBRATION
-
-    Returns True on success, False on any unrecoverable failure.
+    Initialise the MPU-6500 / MPU-6050 IMU on Raspberry Pi hardware I2C bus 1.
+    Performs staged device reset, PLL clock wake-up, sensor configuration,
+    and automatic gravity-direction calibration.
+    Returns True on success, False otherwise.
     """
-    global imu_ok, _bus, _last_ts, _read_fail_count
+    global imu_ok, _bus, _active_addr, _last_ts, _read_fail_count
 
     try:
         import smbus2  # type: ignore
@@ -330,132 +377,58 @@ def init() -> bool:
         print(f"[IMU] smbus2 unavailable ({exc}) — operating in bench/offline mode")
         return False
 
-    bus = None
-
-    # ── Stage: BUS_OPEN ───────────────────────────────────────────────────
     try:
-        bus = _stage("BUS_OPEN", lambda: smbus2.SMBus(1))
+        bus = smbus2.SMBus(1)
     except Exception as exc:
         imu_ok = False
         print(f"[IMU] INIT FAILED — cannot open SMBus(1): {exc}")
         return False
 
-    # ── Stage: WHO_AM_I ───────────────────────────────────────────────────
-    try:
-        who = _stage("WHO_AM_I",
-                     lambda: bus.read_byte_data(_ADDR, _WHO_AM_I))
-        if who not in _VALID_WHO_AM_I:
-            print(f"[IMU]   Note: WHO_AM_I=0x{who:02X} not in known-good set "
-                  f"{[hex(v) for v in sorted(_VALID_WHO_AM_I)]} — continuing")
-        else:
-            print(f"[IMU]   WHO_AM_I = 0x{who:02X}  ✔")
-    except Exception as exc:
+    res = _probe_and_configure_chip(bus)
+    if res is None:
         imu_ok = False
-        print(f"[IMU] INIT FAILED — WHO_AM_I unreadable: {exc}")
-        try: bus.close()
-        except Exception: pass
+        print(f"[IMU] INIT FAILED — no responsive MPU sensor at candidate addresses (0x{_PRIMARY_ADDR:02X}, 0x{_BACKUP_ADDR:02X})")
+        try:
+            bus.close()
+        except Exception:
+            pass
         return False
 
-    # ── Stage: WAKE ──────────────────────────────────────────────────────
-    try:
-        _stage("WAKE",
-               lambda: bus.write_byte_data(_ADDR, _PWR_MGMT_1, 0x00))
-        time.sleep(0.15)   # give oscillator time to stabilise
-        print("[IMU]   Wake successful")
-    except Exception as exc:
+    _active_addr, who = res
+    print(f"[IMU] Detected sensor at 0x{_active_addr:02X} (WHO_AM_I=0x{who:02X}) — configured ±2g, ±250°/s, DLPF 42Hz")
+
+    # Run calibration
+    if not _calibrate(bus, _active_addr):
         imu_ok = False
-        print(f"[IMU] INIT FAILED — cannot wake MPU-6500: {exc}")
-        try: bus.close()
-        except Exception: pass
+        print(f"[IMU] INIT FAILED — sensor calibration uncompleted")
+        try:
+            bus.close()
+        except Exception:
+            pass
         return False
 
-    # ── Stage: CONFIG_ACCEL ───────────────────────────────────────────────
-    try:
-        _stage("CONFIG_ACCEL",
-               lambda: bus.write_byte_data(_ADDR, _ACCEL_CFG, 0x00))
-        print("[IMU]   Accelerometer ±2 g configured")
-    except Exception as exc:
-        imu_ok = False
-        print(f"[IMU] INIT FAILED — accelerometer config: {exc}")
-        try: bus.close()
-        except Exception: pass
-        return False
-
-    # ── Stage: CONFIG_GYRO ────────────────────────────────────────────────
-    try:
-        _stage("CONFIG_GYRO",
-               lambda: bus.write_byte_data(_ADDR, _GYRO_CFG, 0x00))
-        time.sleep(0.05)
-        print("[IMU]   Gyroscope ±250 °/s configured")
-    except Exception as exc:
-        imu_ok = False
-        print(f"[IMU] INIT FAILED — gyroscope config: {exc}")
-        try: bus.close()
-        except Exception: pass
-        return False
-
-    # ── Stage: WHO_AM_I verification (post-config) ────────────────────────
-    try:
-        who2 = _stage("WHO_AM_I_VERIFY",
-                      lambda: bus.read_byte_data(_ADDR, _WHO_AM_I))
-        print(f"[IMU]   Post-config WHO_AM_I = 0x{who2:02X}  ✔")
-    except Exception as exc:
-        # Non-fatal — log but don't abort; hardware responded fine up to here
-        print(f"[IMU]   Post-config WHO_AM_I verify warning: {exc} — continuing")
-
-    # ── Stage: FIRST_READ ─────────────────────────────────────────────────
-    try:
-        _stage("FIRST_READ",
-               lambda: _burst_read_14(bus))
-        print("[IMU]   First 14-byte burst read successful")
-    except Exception as exc:
-        imu_ok = False
-        print(f"[IMU] INIT FAILED — first sensor read failed: {exc}")
-        try: bus.close()
-        except Exception: pass
-        return False
-
-    # ── Stage: CALIBRATION ────────────────────────────────────────────────
-    try:
-        _stage("CALIBRATION",
-               lambda: _calibrate(bus),
-               retries=2, delay=0.1)
-    except Exception as exc:
-        imu_ok = False
-        print(f"[IMU] INIT FAILED — calibration: {exc}")
-        try: bus.close()
-        except Exception: pass
-        return False
-
-    # ── READY ─────────────────────────────────────────────────────────────
-    _bus            = bus
-    _last_ts        = time.monotonic()
+    _bus = bus
+    _last_ts = time.monotonic()
     _read_fail_count = 0
-    imu_ok          = True
-    print(f"[IMU] READY — MPU-6500 at 0x{_ADDR:02X} on SMBus(1)  (WHO_AM_I=0x{who:02X})")
+    imu_ok = True
+    print(f"[IMU] READY — MPU sensor at 0x{_active_addr:02X} on SMBus(1) initialised successfully.")
     return True
 
 
 # ---------------------------------------------------------------------------
 # Public API — read()
 # ---------------------------------------------------------------------------
+
 def read() -> dict:
     """
-    Read one sample from the MPU-6500 and return a dict structurally identical
-    to the 'imu' sub-object emitted by the .ino emitTelemetry().
+    Read one sample from the IMU via single 14-byte I2C burst.
+    Returns a dictionary formatted for vehicle telemetry, HUD, and stop detection.
 
-    Uses a single 14-byte I²C burst read (register 0x3B, 14 bytes):
-      bytes [0:5]  → accel  X/Y/Z  (signed 16-bit, big-endian)
-      bytes [6:7]  → temperature    (signed 16-bit, big-endian)
-      bytes [8:13] → gyro   X/Y/Z  (signed 16-bit, big-endian)
-
-    Recovery:
-      Transient I²C errors are retried up to _READ_RETRIES times silently.
-      If all retries fail on a single 50ms tick, the last valid reading is
-      held over (up to 1.0s) so the 20 Hz telemetry loop, HUD, and stop
-      detection never experience spurious drops.
-      Only after sustained silence (> 20 consecutive fails = 1.0s) is a
-      rate-limited re-init attempted.
+    Fault tolerance:
+      Transient I2C read errors are retried up to _READ_RETRIES times.
+      Holds over the last valid sample (up to 1.0s) across brief glitches to
+      prevent spurious drops in the 20 Hz telemetry loop and stop detector.
+      Attempts non-blocking dynamic re-init if failure persists for >= 20 ticks.
     """
     global _last_ts, _read_fail_count, _last_valid_imu, _last_valid_ts, _last_error_log_ts
 
@@ -465,32 +438,30 @@ def read() -> dict:
     last_exc = None
     for attempt in range(1, _READ_RETRIES + 1):
         try:
-            ax_r, ay_r, az_r, t_r, gx_r, gy_r, gz_r = _burst_read_14(_bus)
+            ax_r, ay_r, az_r, t_r, gx_r, gy_r, gz_r = _burst_read_14(_bus, _active_addr)
 
-            # Scale + apply calibration offsets
-            ax = ax_r / _ACCEL_SCALE - _ax_off
-            ay = ay_r / _ACCEL_SCALE - _ay_off
-            az = az_r / _ACCEL_SCALE - _az_off
-            gx = gx_r / _GYRO_SCALE  - _gx_off
-            gy = gy_r / _GYRO_SCALE  - _gy_off
-            gz = gz_r / _GYRO_SCALE  - _gz_off
-            temperature_c = t_r / 333.87 + 21.0
+            # Scale and apply calibration offsets
+            ax = (ax_r / _ACCEL_SCALE) - _offsets["ax"]
+            ay = (ay_r / _ACCEL_SCALE) - _offsets["ay"]
+            az = (az_r / _ACCEL_SCALE) - _offsets["az"]
+            gx = (gx_r / _GYRO_SCALE)  - _offsets["gx"]
+            gy = (gy_r / _GYRO_SCALE)  - _offsets["gy"]
+            gz = (gz_r / _GYRO_SCALE)  - _offsets["gz"]
+            temperature_c = (t_r / 333.87) + 21.0
 
-            # Complementary filter (under lock for thread safety)
+            # Complementary filter update (thread-safe)
             now_ts = time.monotonic()
             with _lock:
-                dt      = now_ts - _last_ts
+                dt = now_ts - _last_ts
                 _last_ts = now_ts
                 _update_orientation(ax, ay, az, gx, gy, gz, dt)
                 roll  = _roll_deg
                 pitch = _pitch_deg
                 yaw   = _yaw_deg
 
-            # Derived values
-            mag  = math.sqrt(ax*ax + ay*ay + az*az) * _G_MS2
+            mag  = math.sqrt(ax * ax + ay * ay + az * az) * _G_MS2
             quat = _euler_to_quaternion(roll, pitch, yaw)
 
-            # Successful read — reset failure counter
             _read_fail_count = 0
 
             result = {
@@ -521,21 +492,21 @@ def read() -> dict:
             if attempt < _READ_RETRIES:
                 time.sleep(_READ_RETRY_DELAY)
 
-    # All retries exhausted in this tick
+    # All retries exhausted on this tick
     _read_fail_count += 1
     now_mono = time.monotonic()
 
-    # Rate-limit failure logging to once every 5 seconds under sustained failure
+    # Rate-limit persistent failure logging to once every 5 seconds
     if _read_fail_count >= 20 and (now_mono - _last_error_log_ts) >= 5.0:
         _last_error_log_ts = now_mono
         print(f"[IMU] Warning: I2C read failed continuously ({_read_fail_count} samples): {last_exc}")
 
-    # Attempt automatic lightweight re-init after 20 consecutive fails (1.0s)
+    # Trigger automatic fresh bus re-init after 20 consecutive fails (1.0s)
     if _read_fail_count >= 20:
         if _reinit_bus():
             _read_fail_count = 0
 
-    # Hold over last valid sample for up to 1.0s to smooth over transient I2C bus glitches
+    # Hold over last valid sample for up to 1.0s to smooth transient bus glitches
     if _last_valid_imu is not None and (now_mono - _last_valid_ts) < 1.0:
         return _last_valid_imu
 

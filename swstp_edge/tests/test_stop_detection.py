@@ -357,6 +357,51 @@ class TestVehicleStopDetection(unittest.TestCase):
         self.assertEqual(self.detector.state, "MOVING")
         self.assertEqual(self.detector._current_stop_id, 0)
 
+    def test_max_two_captures_per_stop_quota(self):
+        """Verify that at most two motion frames may be captured per stop event."""
+        t0 = 7000.0
+        imu_rest = self._make_imu()
+
+        # Confirm vehicle stop
+        self.detector.update(0.0, imu_rest, now_mono=t0)
+        res = self.detector.update(0.0, imu_rest, now_mono=t0 + 0.6)
+        self.assertTrue(res["is_stopped"])
+        self.assertEqual(res["max_captures_per_stop"], 2)
+        self.assertTrue(self.detector.can_capture())
+
+        # First capture -> allowed
+        cap1 = self.detector.record_capture({
+            "image_file": "motion_stop1_frame1.jpg",
+            "saved_count": 1,
+        }, now_mono=t0 + 5.0)
+        self.assertIsNotNone(cap1)
+        self.assertEqual(len(self.detector.active_stop.captures), 1)
+        self.assertTrue(self.detector.can_capture())
+
+        # Second capture -> allowed
+        cap2 = self.detector.record_capture({
+            "image_file": "motion_stop1_frame2.jpg",
+            "saved_count": 2,
+        }, now_mono=t0 + 10.0)
+        self.assertIsNotNone(cap2)
+        self.assertEqual(len(self.detector.active_stop.captures), 2)
+
+        # Quota reached: can_capture() is now False
+        self.assertFalse(self.detector.can_capture())
+
+        # Third capture attempt -> rejected, returns None!
+        cap3 = self.detector.record_capture({
+            "image_file": "motion_stop1_frame3.jpg",
+            "saved_count": 3,
+        }, now_mono=t0 + 15.0)
+        self.assertIsNone(cap3)
+        self.assertEqual(len(self.detector.active_stop.captures), 2)
+
+        # Check update() dictionary reflects quota exhaustion
+        res2 = self.detector.update(0.0, imu_rest, now_mono=t0 + 16.0)
+        self.assertFalse(res2["can_capture"])
+        self.assertFalse(res2["motion_capture_enabled"])
+
     def test_main_module_integration(self):
         """Verify that main.py integrates VehicleStopDetector cleanly without symbol errors."""
         self.assertTrue(hasattr(edge_main, "VehicleStopDetector"))

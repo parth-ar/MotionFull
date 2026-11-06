@@ -50,6 +50,10 @@ try:
         from config import REST_CONFIRM_SEC
     except ImportError:
         REST_CONFIRM_SEC = REST_DEBOUNCE_SEC
+    try:
+        from config import MAX_CAPTURES_PER_STOP
+    except ImportError:
+        MAX_CAPTURES_PER_STOP = 2
 except ImportError:
     STOP_SPEED_GATE          = 3.5
     REST_SPEED_THRESHOLD_KMH = 3.5
@@ -59,6 +63,7 @@ except ImportError:
     REST_CONFIRM_SEC         = 1.5
     MOTION_DEBOUNCE_SEC      = 1.0
     POST_REST_MOTION_HOLD_SEC = 2.0
+    MAX_CAPTURES_PER_STOP     = 2
 
 
 # ---------------------------------------------------------------------------
@@ -214,6 +219,7 @@ class VehicleStopDetector:
         speed_smoothing_window: int = 1,
         require_gps_fix: bool = False,
         post_rest_hold_sec: float = POST_REST_MOTION_HOLD_SEC,
+        max_captures_per_stop: int = MAX_CAPTURES_PER_STOP,
     ):
         self.stop_speed_gate = float(stop_speed_gate)
         self.rest_speed_threshold = float(rest_speed_threshold)
@@ -225,6 +231,7 @@ class VehicleStopDetector:
         self.speed_smoothing_window = max(1, int(speed_smoothing_window))
         self.require_gps_fix = bool(require_gps_fix)
         self.post_rest_hold_sec = float(post_rest_hold_sec)
+        self.max_captures_per_stop = max(1, int(max_captures_per_stop))
 
         self.state: str = "MOVING"  # "MOVING" | "STOPPED"
         self._current_stop_id: int = 0
@@ -245,6 +252,12 @@ class VehicleStopDetector:
         self._speed_buffer: collections.deque[float] = collections.deque(
             maxlen=self.speed_smoothing_window
         )
+
+    def can_capture(self) -> bool:
+        """Return True if current active stop has not reached its capture limit (max 2 frames/stop)."""
+        if self.state != "STOPPED" or self.active_stop is None:
+            return False
+        return len(self.active_stop.captures) < self.max_captures_per_stop
 
     @property
     def is_stopped(self) -> bool:
@@ -585,7 +598,9 @@ class VehicleStopDetector:
             "is_stopped": self.is_stopped,
             "post_rest_hold_active": post_rest_hold_active,
             "post_rest_remaining_sec": round(post_rest_remaining_sec, 2),
-            "motion_capture_enabled": self.is_stopped and not post_rest_hold_active,
+            "motion_capture_enabled": self.is_stopped and not post_rest_hold_active and self.can_capture(),
+            "can_capture": self.can_capture(),
+            "max_captures_per_stop": self.max_captures_per_stop,
             "duration_sec": current_duration,
             "duration_formatted": self.active_stop.get_duration_formatted() if self.active_stop else format_duration(current_duration),
             "stop_event_id": current_stop_id,
@@ -606,8 +621,18 @@ class VehicleStopDetector:
     def record_capture(self, meta: Dict[str, Any], now_mono: Optional[float] = None) -> Optional[StopCaptureItem]:
         """
         Registers a motion frame captured during an active stop event.
+        Enforces max_captures_per_stop quota (default: 2 frames per stop).
+        Returns None and ignores capture if the stop quota has already been met.
         """
         if self.state != "STOPPED" or self.active_stop is None:
+            return None
+
+        if len(self.active_stop.captures) >= self.max_captures_per_stop:
+            print(
+                f"[STOP #{self.active_stop.stop_id}] ⚠️ Capture quota reached: "
+                f"{len(self.active_stop.captures)}/{self.max_captures_per_stop} frames already captured. "
+                f"Ignoring extra motion frame."
+            )
             return None
 
         if now_mono is None:

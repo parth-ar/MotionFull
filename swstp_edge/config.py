@@ -214,6 +214,7 @@ REST_DEBOUNCE_SEC          = 1.5    # seconds of sustained < 5 km/h to confirm s
 REST_CONFIRM_SEC           = 1.5    # Alias: rest confirmation threshold in seconds
 MOTION_DEBOUNCE_SEC        = 1.0    # seconds of sustained > 5 km/h to confirm motion
 POST_REST_MOTION_HOLD_SEC  = 2.0    # seconds to hold motion capture after confirmed rest (vehicle settling window)
+MAX_CAPTURES_PER_STOP      = 2      # Maximum motion frames captured per vehicle stop event (quota: 2 frames max)
 
 # ---------------------------------------------------------------------------
 # Litter Detection Parameters
