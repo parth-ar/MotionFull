@@ -93,6 +93,9 @@ DEFAULT_ULB_ID    = "ULB_MH_AMRAVATI"
 DEFAULT_VEHICLE_ID = "UNASSIGNED"
 DEFAULT_STREAM_FPS = 3.0           # Live camera feed streaming FPS (reduced from 30 to protect cellular bandwidth)
 STREAM_JPEG_QUALITY = 60          # JPEG compression quality for live video stream (lightweight ~25 KB/frame)
+STREAM_ON_DEMAND = True           # Only upload live frames while a portal viewer has pressed "Start live feed".
+                                  # Set False to restore the legacy always-on streaming behaviour.
+STREAM_STATUS_POLL_SEC = 2.0      # How often the device asks GET /api/camera/{id}/stream/status while the feed is off
 
 # ---------------------------------------------------------------------------
 # Camera Configuration (Raspberry Pi Camera Module 3 / IMX708 Wide NoIR)
@@ -129,7 +132,7 @@ TELEMETRY_RATE_HZ      = 20           # packets per second
 TELEMETRY_INTERVAL_SEC = 1.0 / TELEMETRY_RATE_HZ
 TELEMETRY_FLUSH_INTERVAL_SEC = 0.2    # seconds between /api/telemetry/ingest-batch HTTP flushes (5 Hz rate)
 GNSS_RATE_HZ                  = 5.0    # Hardware GNSS measurement rate (5 Hz = 200 ms)
-GNSS_STREAM_RATE_HZ           = 5.0    # Live raw GNSS stream rate to backend (5 Hz)
+GNSS_STREAM_RATE_HZ           = 1.0    # Live raw GNSS stream rate to backend (1 Hz = one POST per second)
 
 # ---------------------------------------------------------------------------
 # GNSS / timing thresholds

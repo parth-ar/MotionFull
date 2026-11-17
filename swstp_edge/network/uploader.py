@@ -254,6 +254,26 @@ def live_frame_streamer(backend_url: str, device_id: str, fps: float,
     _ERR_LOG_INTERVAL  = 10.0   # seconds between repeated error messages
     _backoff_until     = 0.0    # epoch: don't attempt to send until this time
 
+    # On-demand streaming: frames are only uploaded while a portal viewer holds a lease
+    # (backend: POST /api/camera/{id}/stream/start). Fail-safe default is OFF.
+    on_demand         = bool(getattr(_cfg, "STREAM_ON_DEMAND", True))
+    status_poll_sec   = max(0.5, float(getattr(_cfg, "STREAM_STATUS_POLL_SEC", 2.0)))
+    stream_requested  = not on_demand
+    _next_status_poll = 0.0
+    _last_status_err  = 0.0
+
+    def _set_requested(value: bool, reason: str) -> None:
+        nonlocal stream_requested
+        if value != stream_requested:
+            stream_requested = value
+            if value:
+                print(f"\n[CAMERA STREAM] Live feed requested from portal -> streaming ON ({reason})\n")
+            else:
+                print(f"\n[CAMERA STREAM] No active viewers -> streaming OFF ({reason})\n")
+
+    if on_demand:
+        print("[CAMERA STREAM] On-demand mode: idle until a portal viewer presses 'Start live feed'.")
+
     while not stop_event.is_set():
         if not dynamic_session_info.get("authenticated", False):
             # Block frame streaming if device is not authenticated
@@ -261,6 +281,30 @@ def live_frame_streamer(backend_url: str, device_id: str, fps: float,
             continue
 
         loop_start = time.time()
+
+        # ── On-demand gate: poll the backend for an active viewer lease ──────
+        if on_demand and loop_start >= _next_status_poll:
+            # Poll quickly while OFF (fast start), slowly while ON (frame POST replies
+            # also carry the streaming flag, so stop is still near-instant).
+            _next_status_poll = loop_start + (5.0 if stream_requested else status_poll_sec)
+            cur_dev = latest_sensor.get("deviceId") or dynamic_session_info.get("deviceId") or device_id
+            try:
+                st = session.get(
+                    f"{backend_url.rstrip('/')}/api/camera/{cur_dev}/stream/status",
+                    timeout=2.0,
+                )
+                if st.status_code == 200:
+                    _set_requested(bool(st.json().get("streaming", False)), "status poll")
+            except Exception as exc:
+                # Network trouble: keep the current state; the lease expiry on the
+                # backend + frame POST replies will correct it once reachable again.
+                if loop_start - _last_status_err > _ERR_LOG_INTERVAL:
+                    print(f"[CAMERA STREAM] Stream status poll failed: {exc}")
+                    _last_status_err = loop_start
+
+        if not stream_requested:
+            stop_event.wait(0.5)
+            continue
 
         # Honour back-off window (reconnect delay after repeated failures)
         if loop_start < _backoff_until:
@@ -304,6 +348,14 @@ def live_frame_streamer(backend_url: str, device_id: str, fps: float,
                     # Reset error counters on success
                     _err_count     = 0
                     _backoff_until = 0.0
+                    # Backend reports whether any viewer still holds a lease
+                    if on_demand:
+                        try:
+                            flag = resp.json().get("streaming")
+                            if flag is not None:
+                                _set_requested(bool(flag), "frame ack")
+                        except ValueError:
+                            pass
                 else:
                     # Non-200 but server responded: count as a soft error, no back-off
                     hardware_state["backend"]["connected"] = False
@@ -475,7 +527,7 @@ def telemetry_streamer(backend_url: str, session_id_arg: int, ulb_id: str,
 # ---------------------------------------------------------------------------
 def raw_gnss_streamer(backend_url: str, vehicle_id: str,
                       stop_event: threading.Event,
-                      rate_hz: float = 5.0) -> None:
+                      rate_hz: float = 1.0) -> None:
     """Streams live, un-snapped raw GNSS coordinates to POST /api/{vehicle_id}/live_location.
 
     backend_url — Base URL of the SWSTP Backend (e.g. http://192.168.1.100:5000)
