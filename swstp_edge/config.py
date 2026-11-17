@@ -89,11 +89,15 @@ def get_timezone_obj():
 DEFAULT_BACKEND_URL = os.environ.get(
     "SWSTP_BACKEND_URL", "https://solidwasteapi.scipl.info.in"
 )
+GNSS_STREAM_BACKEND_URL = "https://solidwastenewapi.scipl.info.in"
+# Dedicated backend URL for the raw GNSS live-location streamer only.
+# All other workers (camera frames, telemetry, evidence upload) continue
+# to use DEFAULT_BACKEND_URL.  Set to None or "" to fall back to DEFAULT_BACKEND_URL.
 DEFAULT_ULB_ID    = "ULB_MH_AMRAVATI"
 DEFAULT_VEHICLE_ID = "UNASSIGNED"
 DEFAULT_STREAM_FPS = 3.0           # Live camera feed streaming FPS (reduced from 30 to protect cellular bandwidth)
 STREAM_JPEG_QUALITY = 60          # JPEG compression quality for live video stream (lightweight ~25 KB/frame)
-STREAM_ON_DEMAND = True           # Only upload live frames while a portal viewer has pressed "Start live feed".
+STREAM_ON_DEMAND = False           # Only upload live frames while a portal viewer has pressed "Start live feed".
                                   # Set False to restore the legacy always-on streaming behaviour.
 STREAM_STATUS_POLL_SEC = 2.0      # How often the device asks GET /api/camera/{id}/stream/status while the feed is off
 
@@ -123,7 +127,7 @@ CAMERA_AWB_MODE          = "auto"      # Default White Balance: "auto" (standard
                                        # Options: "auto", "daylight", "cloudy", "indoor", "tungsten", "fluorescent"
 CAMERA_TUNING_FILE       = None        # Optional path to libcamera tuning JSON file (None = native auto-detection like rpicam-hello)
 CAMERA_DAYLIGHT_FILTER   = False       # Outdoor daylight filter: boosts vegetation greens & suppresses harsh sunlight glare
-CAMERA_GREEN_BOOST       = 1.35        # Green channel boost multiplier for outdoor vegetation (1.0 = normal, 1.35 = rich green)
+CAMERA_GREEN_BOOST       = 1.45        # Green channel boost multiplier for outdoor vegetation (1.0 = normal, 1.35 = rich green)
 
 # ---------------------------------------------------------------------------
 # Telemetry rate

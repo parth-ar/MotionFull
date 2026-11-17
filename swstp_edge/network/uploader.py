@@ -29,7 +29,7 @@ import uuid
 import requests
 import requests.adapters
 
-from config import DEFAULT_BACKEND_URL, DEFAULT_ULB_ID, DEFAULT_VEHICLE_ID
+from config import DEFAULT_BACKEND_URL, DEFAULT_ULB_ID, DEFAULT_VEHICLE_ID, LITTER_CAPTURES_DIR
 import config as _cfg
 import geofence
 
@@ -551,6 +551,13 @@ def raw_gnss_streamer(backend_url: str, vehicle_id: str,
 
     target_hz = max(0.1, min(10.0, rate_hz))
     interval = 1.0 / target_hz
+
+    # Allow a dedicated override URL for the GNSS stream (independent of main backend)
+    _gnss_url_override = getattr(_cfg, "GNSS_STREAM_BACKEND_URL", None)
+    if _gnss_url_override and str(_gnss_url_override).strip():
+        backend_url = str(_gnss_url_override).strip()
+        print(f"[RAW GNSS STREAM] Using dedicated GNSS backend: {backend_url}")
+
     stream_url = f"{backend_url.rstrip('/')}/api/{vehicle_id}/live_location"
 
     session = requests.Session()
@@ -762,7 +769,10 @@ def _upload_and_cleanup_evidence(session: requests.Session,
             )
             if resp.status_code in (200, 201):
                 break
-        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as req_err:
+        except (requests.exceptions.Timeout,
+                requests.exceptions.ConnectionError,
+                requests.exceptions.SSLError,
+                requests.exceptions.ChunkedEncodingError) as req_err:
             if attempt == 0:
                 time.sleep(1.0)
                 continue
@@ -786,19 +796,23 @@ def _upload_and_cleanup_evidence(session: requests.Session,
         if detection_type == "LITTER":
             house_tag = f"🟡 Road Litter Marker @ ({lat:.8f}, {lon:.8f})"
         else:
-            near_h, h_dist = geofence.get_nearest_house(lat, lon)
-            house_tag = (
-                f"{near_h['id']} - {near_h['name']} (@ {h_dist:.1f}m)"
-                if (near_h and h_dist <= 25.0)
-                else "Road Corridor (Auto-allocated)"
-            )
-            # ── Gate: mark house green ONLY on confirmed backend receipt ────────
-            if near_h and h_dist <= 25.0:
-                h_id = near_h["id"]
-                geofence.field_state["marked_houses"].add(h_id)
-                print(f"[FIELD LOG] 🏠 HOUSE MARKED AS COLLECTED (EVIDENCE CONFIRMED by backend)")
-                print(f"            House: {h_id} - {near_h['name']} (@ {h_dist:.1f}m)")
-                print(f"            Total collected: {len(geofence.field_state['marked_houses'])} / {len(geofence.dynamic_houses)}")
+            try:
+                near_h, h_dist = geofence.get_nearest_house(lat, lon)
+                house_tag = (
+                    f"{near_h['id']} - {near_h['name']} (@ {h_dist:.1f}m)"
+                    if (near_h and h_dist <= 25.0)
+                    else "Road Corridor (Auto-allocated)"
+                )
+                # ── Gate: mark house green ONLY on confirmed backend receipt ────────
+                if near_h and h_dist <= 25.0:
+                    h_id = near_h["id"]
+                    geofence.field_state["marked_houses"].add(h_id)
+                    print(f"[FIELD LOG] 🏠 HOUSE MARKED AS COLLECTED (EVIDENCE CONFIRMED by backend)")
+                    print(f"            House: {h_id} - {near_h['name']} (@ {h_dist:.1f}m)")
+                    print(f"            Total collected: {len(geofence.field_state['marked_houses'])} / {len(geofence.dynamic_houses)}")
+            except Exception as geo_err:
+                house_tag = "Road Corridor (Auto-allocated)"
+                print(f"[EVIDENCE UPLOAD] Geofence lookup note (non-fatal): {geo_err}")
 
         raw_lat_val = latest_sensor.get("raw_gps_lat") or lat
         raw_lon_val = latest_sensor.get("raw_gps_lon") or lon
@@ -1029,13 +1043,14 @@ def evidence_upload_worker(backend_url: str, device_id: str, ulb_id: str,
                     _in_flight_evidence_files.add(abs_path)
 
             try:
+                _cur_sid = dynamic_session_info.get("sessionId", 0) or active_sid
                 success = _upload_and_cleanup_evidence(
                     session=session,
                     url=url,
                     backend_url=backend_url,
                     device_id=device_id,
                     ulb_id=ulb_id,
-                    active_sid=active_sid,
+                    active_sid=_cur_sid,
                     item=item,
                 )
                 if success:
@@ -1069,32 +1084,33 @@ def evidence_upload_worker(backend_url: str, device_id: str, ulb_id: str,
         now_t = time.time()
         if (upload_queue.empty() and (now_t - _last_backlog_chk >= _BACKLOG_INTERVAL)) or (_last_backlog_chk == 0.0):
             _last_backlog_chk = now_t
-            try:
-                sync_offline_captures_backlog(
-                    backend_url=backend_url,
-                    device_id=device_id,
-                    ulb_id=ulb_id,
-                    active_sid=active_sid,
-                    session=session,
-                    save_dir=target_save_dir,
-                )
-            except Exception as b_err:
-                print(f"[BACKLOG SYNC ERROR] {b_err}")
-
-            # Also sync offline litter captures backlog
-            try:
-                from config import LITTER_CAPTURES_DIR
-                if os.path.exists(LITTER_CAPTURES_DIR):
+            _backlog_sid = dynamic_session_info.get("sessionId", 0) or active_sid
+            if _backlog_sid > 0:
+                try:
                     sync_offline_captures_backlog(
                         backend_url=backend_url,
                         device_id=device_id,
                         ulb_id=ulb_id,
-                        active_sid=active_sid,
+                        active_sid=_backlog_sid,
                         session=session,
-                        save_dir=LITTER_CAPTURES_DIR,
+                        save_dir=target_save_dir,
                     )
-            except Exception as lb_err:
-                print(f"[LITTER BACKLOG SYNC ERROR] {lb_err}")
+                except Exception as b_err:
+                    print(f"[BACKLOG SYNC ERROR] {b_err}")
+
+                # Also sync offline litter captures backlog
+                try:
+                    if os.path.exists(LITTER_CAPTURES_DIR):
+                        sync_offline_captures_backlog(
+                            backend_url=backend_url,
+                            device_id=device_id,
+                            ulb_id=ulb_id,
+                            active_sid=_backlog_sid,
+                            session=session,
+                            save_dir=LITTER_CAPTURES_DIR,
+                        )
+                except Exception as lb_err:
+                    print(f"[LITTER BACKLOG SYNC ERROR] {lb_err}")
 
     session.close()
 
