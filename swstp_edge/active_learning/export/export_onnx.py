@@ -98,9 +98,19 @@ def main():
     # 3. Replace production weights if configured
     if args.replace:
         os.makedirs(args.prod_dir, exist_ok=True)
+        prod_pt   = os.path.join(args.prod_dir, "best.pt")
         prod_onnx = os.path.join(args.prod_dir, "best.onnx")
         prod_int8 = os.path.join(args.prod_dir, "best_int8.onnx")
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        # Replace PyTorch best.pt if source is a .pt file located elsewhere
+        if os.path.isfile(args.weights) and os.path.abspath(args.weights) != os.path.abspath(prod_pt):
+            if os.path.isfile(prod_pt) and args.backup:
+                bak_pt = f"{prod_pt}.bak_{timestamp}"
+                shutil.copy2(prod_pt, bak_pt)
+                print(f"[BACKUP] Backed up old production PyTorch to: {bak_pt}")
+            shutil.copy2(args.weights, prod_pt)
+            print(f"[REPLACED] Successfully replaced production PyTorch model at: {prod_pt}")
 
         # Replace standard best.onnx
         if os.path.isfile(prod_onnx) and args.backup:
@@ -111,7 +121,7 @@ def main():
         shutil.copy2(onnx_file, prod_onnx)
         print(f"[REPLACED] Successfully replaced production ONNX model at: {prod_onnx}")
 
-        # Replace INT8 if exported
+        # Replace INT8 if exported, or archive stale INT8
         if int8_file and os.path.isfile(int8_file):
             if os.path.isfile(prod_int8) and args.backup:
                 bak_int8 = f"{prod_int8}.bak_{timestamp}"
@@ -119,6 +129,13 @@ def main():
                 print(f"[BACKUP] Backed up old INT8 ONNX to: {bak_int8}")
             shutil.copy2(int8_file, prod_int8)
             print(f"[REPLACED] Successfully replaced production INT8 ONNX model at: {prod_int8}")
+        elif os.path.isfile(prod_int8):
+            stale_int8_bak = f"{prod_int8}.archived_{timestamp}"
+            try:
+                shutil.move(prod_int8, stale_int8_bak)
+                print(f"[ARCHIVE NOTE] Stale INT8 model archived to: {stale_int8_bak}")
+            except Exception:
+                pass
     else:
         print(f"[NOTE] Production replacement was skipped (--no-replace). ONNX saved at: {onnx_file}")
 

@@ -185,15 +185,21 @@ def build_dataset(batch_dir, output_dir, class_names, val_split, seed):
     return data_yaml_path
 
 
-def export_and_replace_onnx(model, new_weights_path, data_yaml_path, imgsz, replace_production, backup_old, int8_export):
+def export_and_replace_production_weights(model, new_weights_path, data_yaml_path, imgsz, replace_production, backup_old, int8_export):
     """
-    Export the fine-tuned model to ONNX format and replace the production ONNX
-    files in swstp_edge/weights/ as specified by configuration.
+    Export the fine-tuned model to ONNX format and atomically replace ALL production
+    model weights (PyTorch .pt, FP32 ONNX .onnx, and optional INT8 ONNX) in swstp_edge/weights/.
+
+    This guarantees that:
+      1. Future fine-tuning runs automatically use the newly fine-tuned .pt checkpoint,
+         allowing incremental active-learning improvements to cumulatively stack up.
+      2. Edge inference immediately executes the newly exported ONNX model.
     """
     print("\n" + "=" * 65)
     print("EXPORTING FINE-TUNED MODEL TO ONNX FORMAT...")
     print("=" * 65)
 
+    exported_path = None
     try:
         exported_path = model.export(format="onnx", imgsz=imgsz, dynamic=False)
         print(f"[EXPORT] Successfully exported standard ONNX model: {exported_path}")
@@ -217,42 +223,65 @@ def export_and_replace_onnx(model, new_weights_path, data_yaml_path, imgsz, repl
             print(f"[EXPORT WARNING] INT8 quantization failed ({e}). Proceeding with standard ONNX.")
 
     if not replace_production:
-        print("\n[NOTE] --no-replace-production was set. Production ONNX files were NOT modified.")
-        print(f"Newly produced ONNX file is located at: {exported_path}")
+        print("\n[NOTE] --no-replace-production was set. Production weights were NOT modified.")
+        print(f"Newly trained PyTorch checkpoint: {new_weights_path}")
+        print(f"Newly produced ONNX file:        {exported_path}")
         return exported_path
 
     # Production weights target paths in swstp_edge/weights/
     prod_weights_dir = os.path.join(_SWSTP_EDGE_DIR, "weights")
     os.makedirs(prod_weights_dir, exist_ok=True)
+    target_prod_pt   = os.path.join(prod_weights_dir, "best.pt")
     target_prod_onnx = os.path.join(prod_weights_dir, "best.onnx")
     target_prod_int8 = os.path.join(prod_weights_dir, "best_int8.onnx")
 
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    # 1. Replace standard best.onnx
-    if os.path.isfile(target_prod_onnx) and backup_old:
-        backup_path = f"{target_prod_onnx}.bak_{timestamp}"
-        shutil.copy2(target_prod_onnx, backup_path)
-        print(f"[BACKUP] Existing production model backed up to: {backup_path}")
+    # 1. Replace PyTorch checkpoint best.pt (enables cumulative/stacked retraining)
+    if new_weights_path and os.path.isfile(new_weights_path):
+        if os.path.isfile(target_prod_pt) and backup_old:
+            backup_pt_path = f"{target_prod_pt}.bak_{timestamp}"
+            shutil.copy2(target_prod_pt, backup_pt_path)
+            print(f"[BACKUP] Existing PyTorch base weights backed up to: {backup_pt_path}")
+        shutil.copy2(new_weights_path, target_prod_pt)
+        print(f"\n[PRODUCTION REPLACEMENT SUCCESS]")
+        print(f" -> Replaced PyTorch checkpoint at: {target_prod_pt}")
+        print(f"    (Future fine-tuning runs will automatically stack on top of this model)")
 
-    shutil.copy2(exported_path, target_prod_onnx)
-    print(f"\n[PRODUCTION REPLACEMENT SUCCESS]")
-    print(f" -> Newly produced ONNX model replaced old production file at:")
-    print(f"    {target_prod_onnx}")
+    # 2. Replace standard best.onnx for edge inference
+    if exported_path and os.path.isfile(exported_path):
+        if os.path.isfile(target_prod_onnx) and backup_old:
+            backup_path = f"{target_prod_onnx}.bak_{timestamp}"
+            shutil.copy2(target_prod_onnx, backup_path)
+            print(f"[BACKUP] Existing production ONNX backed up to: {backup_path}")
+        shutil.copy2(exported_path, target_prod_onnx)
+        print(f" -> Replaced production ONNX model at: {target_prod_onnx}")
 
-    # 2. Replace INT8 if available
+    # 3. Replace INT8 if available, or archive stale INT8
     if int8_exported_path and os.path.isfile(int8_exported_path):
         if os.path.isfile(target_prod_int8) and backup_old:
             backup_int8_path = f"{target_prod_int8}.bak_{timestamp}"
             shutil.copy2(target_prod_int8, backup_int8_path)
             print(f"[BACKUP] Existing INT8 model backed up to: {backup_int8_path}")
         shutil.copy2(int8_exported_path, target_prod_int8)
-        print(f" -> Newly produced INT8 ONNX model replaced old file at:")
-        print(f"    {target_prod_int8}")
+        print(f" -> Replaced production INT8 ONNX model at: {target_prod_int8}")
+    elif os.path.isfile(target_prod_int8):
+        # Stale INT8 exists from an older base model: archive it so it doesn't shadow the new model
+        stale_int8_bak = f"{target_prod_int8}.archived_{timestamp}"
+        try:
+            shutil.move(target_prod_int8, stale_int8_bak)
+            print(f"[ARCHIVE NOTE] Stale INT8 model archived to: {stale_int8_bak}")
+            print(f"               (Inference will execute updated {target_prod_onnx})")
+        except Exception as e:
+            print(f"[ARCHIVE NOTE] Note moving stale INT8 model: {e}")
 
     return exported_path
 
 
+# Backwards compatibility alias
+export_and_replace_onnx = export_and_replace_production_weights
+
+     
 def main():
     args = parse_args()
     class_names = [c.strip() for c in args.classes.split(",") if c.strip()]
@@ -322,7 +351,8 @@ def main():
     print(f" - Train/Val split:   {data_yaml_path}")
     print(f" - PyTorch Weights:   {new_weights}")
     if args.replace_production:
-        print(f" - Production ONNX:   {os.path.join(_SWSTP_EDGE_DIR, 'weights', 'best.onnx')} (REPLACED)")
+        print(f" - Production PyTorch: {os.path.join(_SWSTP_EDGE_DIR, 'weights', 'best.pt')} (UPDATED FOR FUTURE RETRAINING)")
+        print(f" - Production ONNX:    {os.path.join(_SWSTP_EDGE_DIR, 'weights', 'best.onnx')} (UPDATED FOR INFERENCE)")
     print("=" * 65 + "\n")
 
 

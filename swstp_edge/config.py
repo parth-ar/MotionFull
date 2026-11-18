@@ -231,7 +231,7 @@ LITTER_GNSS_LOST_TIMEOUT_SEC = 5.0
 LITTER_TIME_FALLBACK_SEC     = None
 
 # YOLO inference confidence threshold
-LITTER_CONF_THRESHOLD        = 0.65
+LITTER_CONF_THRESHOLD        = 0.70
 
 # Fraction of detection bounding box that must overlap the AoD polygon to be ignored
 LITTER_OVERLAP_THRESHOLD     = 0.50
@@ -257,7 +257,29 @@ _WEIGHT_CANDIDATES = [
     PROD_INT8_ONNX_PATH,
     PROD_ONNX_PATH,
 ]
-LITTER_WEIGHTS = next((p for p in _WEIGHT_CANDIDATES if os.path.isfile(p)), _WEIGHT_CANDIDATES[-1])
+def _resolve_production_weights() -> str:
+    """
+    Select the active production YOLO weights.
+    Prefers INT8 if it is fresh (newer than or equal to best.onnx).
+    If INT8 is missing or older than best.onnx, uses best.onnx to ensure
+    newly fine-tuned models take immediate effect in inference.
+    """
+    has_int8 = os.path.isfile(PROD_INT8_ONNX_PATH)
+    has_fp32 = os.path.isfile(PROD_ONNX_PATH)
+    if has_int8 and has_fp32:
+        try:
+            if os.path.getmtime(PROD_INT8_ONNX_PATH) >= os.path.getmtime(PROD_ONNX_PATH):
+                return PROD_INT8_ONNX_PATH
+        except Exception:
+            pass
+        return PROD_ONNX_PATH
+    elif has_int8:
+        return PROD_INT8_ONNX_PATH
+    elif has_fp32:
+        return PROD_ONNX_PATH
+    return PROD_ONNX_PATH
+
+LITTER_WEIGHTS = _resolve_production_weights()
 
 # ---------------------------------------------------------------------------
 # Power Management & Backup Battery Settings

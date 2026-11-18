@@ -56,9 +56,11 @@ DEFAULT_CLASSES = "litter"
 # When fine-tuning finishes in retrain.py:
 #   1. A new best.pt checkpoint is produced.
 #   2. The model is exported to ONNX format (best.onnx).
-#   3. If REPLACE_PRODUCTION_ONNX is True, the newly produced ONNX file
-#      replaces the old production ONNX file (swstp_edge/weights/best.onnx).
-#   4. If BACKUP_OLD_ONNX is True, a timestamped backup of the previous
-#      ONNX model is preserved before replacement.
+#   3. If AUTO_REPLACE_PRODUCTION_ONNX is True:
+#      - The new PyTorch checkpoint replaces swstp_edge/weights/best.pt so
+#        future retraining runs cumulatively stack on top of this model.
+#      - The new ONNX model replaces swstp_edge/weights/best.onnx for inference.
+#   4. If BACKUP_OLD_ONNX is True, timestamped backups of previous weights
+#      are preserved before replacement.
 AUTO_REPLACE_PRODUCTION_ONNX = True
 BACKUP_OLD_ONNX = True
