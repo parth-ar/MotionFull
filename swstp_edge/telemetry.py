@@ -265,9 +265,9 @@ def build_telemetry_packet(device_id: str) -> dict:
             except Exception:
                 pass
     else:
-        # Check if the satellite fix is within the holdover window (GNSS_DATA_TIMEOUT_SEC = 10.0s).
-        # Telemetry loop runs at 20 Hz (50 ms), whereas MAX-M10S emits NMEA bursts at 1 Hz.
-        # Stabilising across the burst interval prevents false NO_FIX/Searching toggles.
+        # Check if the satellite fix is within the holdover window (GNSS_DATA_TIMEOUT_SEC, 3 s).
+        # Telemetry loop runs at 20 Hz (50 ms); the MAX-M10S outputs a fix every 200 ms (5 Hz).
+        # Holding across short gaps prevents false NO_FIX/Searching toggles.
         now_mono = time.monotonic()
         last_fix_time = latest_sensor.get("last_gnss_fix_time")
         is_held_fix = (
@@ -277,7 +277,7 @@ def build_telemetry_packet(device_id: str) -> dict:
         )
 
         if is_held_fix:
-            # SATELLITE FIX HOLDOVER: Hold valid position between 1 Hz bursts.
+            # SATELLITE FIX HOLDOVER: hold the last valid position across short gaps.
             # speed_kmh is now always present when data_received (even without position fix).
             with _lock:
                 latest_sensor["gps_valid"]       = True
@@ -337,9 +337,14 @@ def build_telemetry_packet(device_id: str) -> dict:
                 _log_hardware("RTC MODULE (DS3231)", "ONLINE & SYNCHRONIZED", f"System clock: {iso_time}")
 
     # --- 6. Update IMU state in latest_sensor ---
-    if imu_data.get("valid"):
-        with _lock:
-            latest_sensor["imu"] = imu_data
+    # Always store the latest result, valid or not. (Storing only valid samples left the last
+    # good reading in place forever once the IMU died: telemetry kept sending imu_ok=true with
+    # frozen values and the stop detector used stale accel/gyro.)
+    with _lock:
+        latest_sensor["imu"] = imu_data
+
+    # IMU re-calibration at GNSS-confirmed stops (cheap check; work runs in background)
+    imu_sensor.note_vehicle_state(gnss_data.get("speed_kmh"), bool(gnss_fix))
 
     # --- 7. Increment sequence & compute uptime ---
     with _lock:
@@ -380,17 +385,14 @@ def build_telemetry_packet(device_id: str) -> dict:
         "speed":           s["speed"],
         "heading":         s["heading"],
         "satellites":      s["satellites"],
+        "hdop":            gnss_data.get("hdop") if gnss_valid else None,
         "fix":             "3D_FIX" if gnss_valid else "NO_FIX",
         "valid":           gnss_valid,
         "source":          s.get("location_source"),
     }
 
     # --- 11. Build the IMU sub-object ---
-    imu_pkt = s.get("imu") or {
-        "accel": {"x": 0.0, "y": 0.0, "z": 1.0},
-        "gyro":  {"x": 0.0, "y": 0.0, "z": 0.0},
-        "valid": True,
-    }
+    imu_pkt = s.get("imu") or {"valid": False}   # no reading yet → report invalid, not fake data
 
     # --- 12. Assemble full packet ---
     # rawJson is the full hardware telemetry line; here we serialise the
@@ -422,7 +424,7 @@ def build_telemetry_packet(device_id: str) -> dict:
     pkt = {
         "sequence":   seq,
         "timestamp":  epoch_ms,
-        "uptime_ms":  epoch_ms,
+        "uptime_ms":  uptime_ms,
         "rawJson":    raw_line,
         "rtc": {
             "iso":    iso_time,
@@ -433,6 +435,42 @@ def build_telemetry_packet(device_id: str) -> dict:
         "imu":  imu_pkt,
     }
     return pkt
+
+
+def build_fallback_full_packet() -> dict:
+    """
+    Minimal full-shaped packet built only from the last known latest_sensor values
+    (no sensor reads). Used by the heartbeat when build_telemetry_packet() fails, and
+    always passed through build_slim_packet() so the backup heartbeat has exactly the
+    same fields, types and formats as a normal packet.
+    """
+    with _lock:
+        latest_sensor["sequence"] += 1
+        s = dict(latest_sensor)
+
+    now_ms = int(time.time() * 1000)
+    iso    = s.get("timestamp") or datetime.datetime.now(get_timezone_obj()).strftime("%Y-%m-%d %H:%M:%S")
+    valid  = bool(s.get("gps_valid")) and s.get("lat") is not None and s.get("lon") is not None
+
+    return {
+        "sequence":  s["sequence"],
+        "timestamp": now_ms,
+        "uptime_ms": int((time.time() - _boot_time) * 1000),
+        "rtc": {"iso": iso, "epoch": now_ms, "synced": False},
+        "gnss": {
+            "lat":              round(float(s["lat"]), 8) if valid else None,
+            "lon":              round(float(s["lon"]), 8) if valid else None,
+            "alt":              s.get("alt"),
+            "speed":            s.get("speed"),
+            "heading":          s.get("heading"),
+            "satellites":       s.get("satellites"),
+            "hdop":             None,   # last HDOP is not cached in latest_sensor
+            "fix":              "3D_FIX" if valid else "NO_FIX",
+            "isInsideSafeZone": s.get("is_inside_safe_zone", False),
+            "source":           s.get("location_source"),
+        },
+        "imu": s.get("imu") or {},
+    }
 
 
 # ---------------------------------------------------------------------------

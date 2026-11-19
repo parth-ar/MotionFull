@@ -214,15 +214,36 @@ def ensure_hardware_session(backend_url: str, device_code: str, retries: int = 3
 # ---------------------------------------------------------------------------
 # Live Frame Streamer (POST /api/camera/{deviceId}/frame)
 # ---------------------------------------------------------------------------
+def poll_stream_demand(session: requests.Session, backend_url: str, dev_id: str,
+                       path_template: str, timeout: float = 2.0) -> bool | None:
+    """Asks the backend whether a live camera stream is wanted for this device.
+
+    GET {backend_url}{path_template} -> {"active": true|false}
+    Returns True/False from the response, or None if the backend could not be asked
+    (network error, non-200, bad JSON). Callers treat None as "not wanted".
+    """
+    url = f"{backend_url.rstrip('/')}{path_template.format(device_id=dev_id)}"
+    try:
+        resp = session.get(url, timeout=timeout)
+        if resp.status_code != 200:
+            return None
+        return bool(resp.json().get("active", False))
+    except Exception:
+        return None
+
+
 def live_frame_streamer(backend_url: str, device_id: str, fps: float,
                          stop_event: threading.Event,
                          frame_lock: threading.Lock | None = None,
-                         get_frame=None) -> None:
+                         get_frame=None,
+                         on_demand: bool | None = None) -> None:
     """Pushes live JPEG frames to Backend asynchronously, encoding frames on-demand without loading the main loop.
 
     frame_lock  — threading.Lock protecting the shared frame buffer (passed from main.py)
     get_frame   — callable() → numpy array | None; returns the latest BGR frame
                   (injected by main.py to avoid a circular import)
+    on_demand   — None = use config.STREAM_ON_DEMAND; True = stream only while the backend's
+                  stream-status endpoint returns {"active": true}; False = stream continuously
 
     Resilience: throttled error logging + exponential back-off reconnect so a transient
     network drop doesn't spam the console or stall frame delivery.
@@ -254,11 +275,44 @@ def live_frame_streamer(backend_url: str, device_id: str, fps: float,
     _ERR_LOG_INTERVAL  = 10.0   # seconds between repeated error messages
     _backoff_until     = 0.0    # epoch: don't attempt to send until this time
 
+    # On-demand mode (config.STREAM_ON_DEMAND): only send while the backend says a viewer
+    # is watching. False = continuous streaming whenever authenticated.
+    if on_demand is None:
+        on_demand = bool(getattr(_cfg, "STREAM_ON_DEMAND", True))
+    demand_path    = getattr(_cfg, "STREAM_DEMAND_PATH", "/api/camera/{device_id}/stream-status")
+    demand_poll    = max(0.5, float(getattr(_cfg, "STREAM_DEMAND_POLL_SEC", 3.0)))
+    stream_wanted  = not on_demand
+    _last_demand_check = 0.0
+    _demand_unreachable_logged = False
+    print(f"[CAMERA STREAM] Mode: {'ON-DEMAND (backend controlled)' if on_demand else 'CONTINUOUS'}")
+
     while not stop_event.is_set():
         if not dynamic_session_info.get("authenticated", False):
             # Block frame streaming if device is not authenticated
             stop_event.wait(2.0)
             continue
+
+        if on_demand:
+            now_m = time.monotonic()
+            if now_m - _last_demand_check >= demand_poll:
+                _last_demand_check = now_m
+                cur_dev = latest_sensor.get("deviceId") or dynamic_session_info.get("deviceId") or device_id
+                answer  = poll_stream_demand(session, backend_url, cur_dev, demand_path)
+                if answer is None and not _demand_unreachable_logged:
+                    _demand_unreachable_logged = True
+                    print(f"[CAMERA STREAM] On-demand status endpoint not reachable "
+                          f"({demand_path}); stream stays off until it answers.")
+                elif answer is not None:
+                    _demand_unreachable_logged = False
+                wanted = bool(answer)
+                if wanted != stream_wanted:
+                    print(f"[CAMERA STREAM] {'Viewer connected -> streaming started' if wanted else 'No viewer -> streaming paused'}")
+                    if not wanted:
+                        logged_first_ok = False
+                stream_wanted = wanted
+            if not stream_wanted:
+                stop_event.wait(max(0.1, demand_poll - (time.monotonic() - _last_demand_check)))
+                continue
 
         loop_start = time.time()
 
@@ -371,7 +425,6 @@ def telemetry_streamer(backend_url: str, session_id_arg: int, ulb_id: str,
         pass
 
     url = f"{backend_url.rstrip('/')}/api/telemetry/ingest-batch"
-    active_session_query_url = f"{backend_url.rstrip('/')}/api/officer/sessions?ulbId={ulb_id}&status=ACTIVE"
 
     session = requests.Session()
     adapter = requests.adapters.HTTPAdapter(pool_connections=5, pool_maxsize=10, max_retries=0)
@@ -379,7 +432,6 @@ def telemetry_streamer(backend_url: str, session_id_arg: int, ulb_id: str,
     session.mount("https://", adapter)
 
     current_session_id = session_id_arg or dynamic_session_info.get("sessionId") or 0
-    last_session_check = 0.0
 
     while not stop_event.is_set():
         active_dyn_sid = dynamic_session_info.get("sessionId", 0)
@@ -406,48 +458,22 @@ def telemetry_streamer(backend_url: str, session_id_arg: int, ulb_id: str,
 
         if not packets and (latest_sensor["timestamp"] or latest_sensor["gps_valid"] or latest_sensor["imu"]):
             # Heartbeat slim packet — same shape as what the 20 Hz loop sends
-            from telemetry import build_slim_packet, build_telemetry_packet
-            latest_sensor["sequence"] += 1
+            from telemetry import build_slim_packet, build_telemetry_packet, build_fallback_full_packet
             try:
-                # Build a fresh full packet then slim it down (reuses all local state)
-                # We pass device_id from dynamic_session_info since we don't have it locally
+                # Build a fresh full packet then slim it down (reuses all local state).
+                # build_telemetry_packet() increments the sequence itself.
                 full_hb = build_telemetry_packet(
                     dynamic_session_info.get("deviceId") or "UNPROVISIONED"
                 )
                 packets.append(build_slim_packet(full_hb))
-            except Exception as hb_err:
-                # Absolute fallback: hand-craft a minimal slim packet from latest_sensor
-                import datetime as _dt
-                s = latest_sensor
-                now_ms = int(time.time() * 1000)
-                imu_s  = s.get("imu") or {}
-                orient = (imu_s.get("orientation") or {})
-                packets.append({
-                    "seq":       s.get("sequence"),
-                    "ts":        s.get("timestamp") or _dt.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S"),
-                    "epoch":     now_ms,
-                    "uptime":    now_ms,
-                    "lat":       round(float(s["lat"]), 8)  if (s.get("gps_valid") and s.get("lat")  is not None) else None,
-                    "lon":       round(float(s["lon"]), 8)  if (s.get("gps_valid") and s.get("lon")  is not None) else None,
-                    "alt":       s.get("alt")    or 0.0,
-                    "spd":       s.get("speed")  or 0.0,
-                    "hdg":       s.get("heading"),
-                    "sats":      s.get("satellites") or 0,
-                    "hdop":      None,
-                    "fix":       bool(s.get("gps_valid")),
-                    "snapped":   False,
-                    "safe_zone": bool(s.get("is_inside_safe_zone")),
-                    "loc_src":   s.get("location_source"),
-                    "accel_mag": round(float(imu_s.get("accel_magnitude_ms2") or 0.0), 3),
-                    "roll":      round(float(orient.get("roll")  or 0.0), 2),
-                    "pitch":     round(float(orient.get("pitch") or 0.0), 2),
-                    "yaw":       round(float(orient.get("yaw")   or 0.0), 2),
-                    "temp_c":       round(float(imu_s.get("temperature_c") or 0.0), 2),
-                    "imu_ok":       bool(imu_s.get("valid")),
-                    "clk_src":      "unknown",
-                    "dumping_side": s.get("dumping_side", "none"),
-                    "dumpingSide":  s.get("dumping_side", "none"),
-                })
+            except Exception:
+                # Fallback: the sensor read failed, so rebuild a full-shaped packet from the
+                # last known latest_sensor values and pass it through the SAME
+                # build_slim_packet(), so the backup packet has exactly the main packet's shape.
+                try:
+                    packets.append(build_slim_packet(build_fallback_full_packet()))
+                except Exception as hb_err:
+                    print(f"[TELEMETRY] Heartbeat skipped: {hb_err}")
 
 
         if packets:
@@ -481,7 +507,7 @@ def raw_gnss_streamer(backend_url: str, vehicle_id: str,
     backend_url — Base URL of the SWSTP Backend (e.g. http://192.168.1.100:5000)
     vehicle_id  — Unique vehicle identifier (e.g. MH-27-TR-102 or SWSTP-AMRMC-001)
     stop_event  — threading.Event to cleanly terminate the background worker
-    rate_hz     — Streaming frequency in Hertz (default: 1.0 Hz)
+    rate_hz     — Streaming frequency in Hertz (default: 5.0 Hz; main.py passes GNSS_STREAM_RATE_HZ)
 
     Thread priority is elevated above camera/motion threads: GNSS location streaming
     to the ingest endpoint must never be starved by OpenCV/YOLO CPU load.
@@ -650,8 +676,17 @@ def _upload_and_cleanup_evidence(session: requests.Session,
 
     lat = item.get("latitude")
     lon = item.get("longitude")
+    # Older litter sidecars only carry coordinates under "gnss".
+    if lat is None and lon is None and isinstance(item.get("gnss"), dict):
+        lat = item["gnss"].get("latitude")
+        lon = item["gnss"].get("longitude")
     if lat is None or lon is None or (abs(lat) < 0.001 and abs(lon) < 0.001):
-        if latest_sensor.get("gps_valid"):
+        # Backlog replays happen long after capture: the vehicle's current
+        # position would mis-tag the event, so send no location instead.
+        if item.get("_from_backlog"):
+            lat = None
+            lon = None
+        elif latest_sensor.get("gps_valid"):
             lat = latest_sensor.get("lat")
             lon = latest_sensor.get("lon")
         else:
@@ -672,7 +707,6 @@ def _upload_and_cleanup_evidence(session: requests.Session,
         "latitude":           round(float(lat), 8) if (lat is not None and abs(float(lat)) > 0.001) else None,
         "longitude":          round(float(lon), 8) if (lon is not None and abs(float(lon)) > 0.001) else None,
         "speedKph":           speed,
-        "motionConfidence":   item.get("motionConfidence", 0.95),
         "sessionId":          active_sid,
         "deviceId":           device_id,
         "ulbId":              ulb_id,
@@ -688,8 +722,11 @@ def _upload_and_cleanup_evidence(session: requests.Session,
 
     # ── Optional enrichment fields (litter / stop duration) ───────────────
     stop_duration_sec    = item.get("stop_duration_sec", item.get("stop_offset_sec"))
-    detection_type       = item.get("detection_type") or item.get("detectionType")
-    detection_confidence = item.get("detection_confidence") or item.get("detectionConfidence")
+    # Motion items (and motion sidecars written before the tag existed) default to MOTION.
+    detection_type       = item.get("detection_type") or item.get("detectionType") or "MOTION"
+    detection_confidence = item.get("detection_confidence")
+    if detection_confidence is None:
+        detection_confidence = item.get("detectionConfidence")
 
     if stop_duration_sec is not None:
         data["stopDurationSec"] = round(float(stop_duration_sec), 2)
@@ -731,7 +768,10 @@ def _upload_and_cleanup_evidence(session: requests.Session,
         img_id  = res_json.get("evidenceImageId") or res_json.get("id") or "N/A"
         img_url = res_json.get("imageUrl") or f"{backend_url.rstrip('/')}/api/evidence/images/{img_id}"
 
-        if detection_type == "LITTER":
+        has_loc = lat is not None and lon is not None
+        if not has_loc:
+            house_tag = "Unknown (no GNSS location)"
+        elif detection_type == "LITTER":
             house_tag = f"🟡 Road Litter Marker @ ({lat:.8f}, {lon:.8f})"
         else:
             near_h, h_dist = geofence.get_nearest_house(lat, lon)
@@ -755,7 +795,9 @@ def _upload_and_cleanup_evidence(session: requests.Session,
         print(f"[FIELD LOG] 📸 EVIDENCE UPLOADED & CONFIRMED BY BACKEND")
         print(f"            EvidenceImageId: #{img_id}")
         print(f"            Server Path:     {res_json.get('relativePath', 'N/A')}")
-        if geofence.is_in_safe_zone(raw_lat_val, raw_lon_val):
+        if not has_loc:
+            print(f"            GPS Coordinates: N/A (no fix at capture)")
+        elif geofence.is_in_safe_zone(raw_lat_val, raw_lon_val):
             print(f"            GPS Coordinates: ({lat:.8f}, {lon:.8f}) [🛡 SAFE ZONE - NO SNAP]")
         elif abs(raw_lat_val - lat) > 0.00000001 or abs(raw_lon_val - lon) > 0.00000001:
             drift_val = geofence.haversine_dist_meters(raw_lat_val, raw_lon_val, lat, lon)
@@ -860,9 +902,10 @@ def sync_offline_captures_backlog(backend_url: str,
                     "latitude":            0.0,
                     "longitude":           0.0,
                     "speed_kph":           0.0,
-                    "motion_confidence":   0.95,
+                    "detection_type":      "MOTION",
                 }
 
+            meta_dict["_from_backlog"] = True
             meta_dict["local_path"] = img_path
             meta_dict["meta_path"]  = meta_path if os.path.exists(meta_path) else None
 

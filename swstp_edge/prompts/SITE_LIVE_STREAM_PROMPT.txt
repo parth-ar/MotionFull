@@ -1,0 +1,45 @@
+SITE-SIDE PROMPT: On-Demand Live Camera Stream
+===============================================
+
+FEATURE OVERVIEW
+----------------
+The edge device should only upload live camera frames while someone is actually
+watching the feed on the dashboard. This saves cellular data: at 3 FPS and
+~25 KB/frame, continuous streaming costs roughly 270 MB per hour per vehicle.
+
+WHAT THE EDGE PROGRAM ALREADY DOES
+------------------------------------
+- config.STREAM_ON_DEMAND = True  -> on-demand mode (default)
+  config.STREAM_ON_DEMAND = False -> continuous streaming (old behaviour, no backend change needed)
+- In on-demand mode, every STREAM_DEMAND_POLL_SEC (default 3 s) the device calls:
+      GET /api/camera/{deviceId}/stream-status
+  and streams frames only while the answer is {"active": true}.
+- Frames are still sent the same way as before:
+      POST /api/camera/{deviceId}/frame   (Content-Type: image/jpeg, raw JPEG body)
+- If the status endpoint is missing, returns non-200, or returns bad JSON, the
+  device treats it as "not wanted" and does NOT stream.
+  => Until this endpoint exists, the live feed stays off in on-demand mode.
+
+BACKEND API REQUIREMENTS
+-------------------------
+1. ENDPOINT: GET /api/camera/{deviceId}/stream-status
+   Response 200:
+     { "active": true }    // at least one viewer is watching this device's feed
+     { "active": false }   // nobody watching
+   - Must be fast and cheap; it is called every ~3 s by every device.
+   - Use the same device authentication as POST /api/camera/{deviceId}/frame.
+
+2. VIEWER TRACKING (how "active" is decided)
+   - When a dashboard user opens a device's live feed, mark the device as watched.
+   - The dashboard should send a viewer heartbeat (e.g. every 10 s) while the feed
+     is open, e.g. POST /api/camera/{deviceId}/viewer-heartbeat.
+   - "active" = true while at least one viewer heartbeat is newer than ~20-30 s.
+     (A time-out is needed so a closed browser tab doesn't keep the stream on.)
+
+3. EXPECTED LATENCY
+   - Feed start: up to ~3 s (one poll interval) after the viewer opens it.
+   - Feed stop: up to ~3 s after "active" turns false.
+   - The dashboard should show "Connecting to camera..." until the first frame arrives.
+
+4. NO CHANGE NEEDED
+   - POST /api/camera/{deviceId}/frame is unchanged.

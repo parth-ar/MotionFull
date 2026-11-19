@@ -89,10 +89,26 @@ def get_timezone_obj():
 DEFAULT_BACKEND_URL = os.environ.get(
     "SWSTP_BACKEND_URL", "https://solidwasteapi.scipl.info.in"
 )
+# Raw GNSS live-location stream (POST {base}/api/{vehicle_id}/live_location) goes to its own
+# host. Everything else (login, telemetry, evidence, camera) stays on DEFAULT_BACKEND_URL.
+# Set to "" to send the GNSS stream to DEFAULT_BACKEND_URL / --backend-url instead.
+GNSS_STREAM_BASE_URL = os.environ.get(
+    "SWSTP_GNSS_STREAM_URL", "https://solidwasteapinew.scipl.info.in"
+)
 DEFAULT_ULB_ID    = "ULB_MH_AMRAVATI"
 DEFAULT_VEHICLE_ID = "UNASSIGNED"
 DEFAULT_STREAM_FPS = 3.0           # Live camera feed streaming FPS (reduced from 30 to protect cellular bandwidth)
 STREAM_JPEG_QUALITY = 60          # JPEG compression quality for live video stream (lightweight ~25 KB/frame)
+
+# Live camera stream mode
+#   True  = on-demand: frames are sent only while the backend says someone is watching
+#           (device polls GET STREAM_DEMAND_PATH and reads {"active": true|false}).
+#   False = continuous: frames are sent the whole time the device is authenticated.
+# NOTE: on-demand needs the backend endpoint (see prompts/SITE_LIVE_STREAM_PROMPT.txt).
+#       Until it exists, the stream stays off in on-demand mode.
+STREAM_ON_DEMAND        = True
+STREAM_DEMAND_PATH      = "/api/camera/{device_id}/stream-status"   # {device_id} is filled in
+STREAM_DEMAND_POLL_SEC  = 3.0     # How often to ask the backend whether the stream is wanted
 
 # ---------------------------------------------------------------------------
 # Camera Configuration (Raspberry Pi Camera Module 3 / IMX708 Wide NoIR)
@@ -128,19 +144,26 @@ CAMERA_GREEN_BOOST       = 1.35        # Green channel boost multiplier for outd
 TELEMETRY_RATE_HZ      = 20           # packets per second
 TELEMETRY_INTERVAL_SEC = 1.0 / TELEMETRY_RATE_HZ
 TELEMETRY_FLUSH_INTERVAL_SEC = 0.2    # seconds between /api/telemetry/ingest-batch HTTP flushes (5 Hz rate)
-GNSS_RATE_HZ                  = 5.0    # Hardware GNSS measurement rate (5 Hz = 200 ms)
+GNSS_RATE_HZ                  = 5.0    # Receiver measurement rate, set via UBX-CFG-VALSET at every connect (1–10 Hz)
+GNSS_NMEA_FILTER              = True   # True: receiver sends only GGA + RMC every epoch and GSV at GNSS_GSV_RATE_HZ
+                                       #       (VTG / GLL / GSA off — unused, ~85% less UART + parsing)
+                                       # False: leave the receiver's sentence output as it is
+GNSS_GSV_RATE_HZ              = 1.0    # GSV (satellites-in-view) output rate when GNSS_NMEA_FILTER is on
 GNSS_STREAM_RATE_HZ           = 5.0    # Live raw GNSS stream rate to backend (5 Hz)
 
 # ---------------------------------------------------------------------------
 # GNSS / timing thresholds
 # ---------------------------------------------------------------------------
-GNSS_DATA_TIMEOUT_SEC    = 3.0
-GNSS_DETAIL_INTERVAL_SEC = 1.0
-GNSS_SATELLITE_SNAP_SEC  = 5.0
+GNSS_DATA_TIMEOUT_SEC    = 3.0     # fix / data considered lost after this long without sentences
+GNSS_SATELLITE_SNAP_SEC  = 5.0     # satellites_detail kept this long after the last GSV
+GNSS_SATELLITE_DETAIL    = False   # True: build per-satellite records (PRN/elev/az/SNR/used) and keep
+                                   #       GSA on — diagnostics only (tests/test_all_sensors.py sets it).
+                                   # False: only the satellites-in-view count (all production code needs)
+GNSS_SERIAL_ERROR_RECONNECT_SEC = 2.0   # continuous serial errors this long → close + reconnect port
 
 # ---------------------------------------------------------------------------
 # u-blox MAX-M10S GNSS Hardware Configuration (UART Serial)
-# Pin connections (identical to NEO-6M):
+# Pin connections:
 #   TXD (GNSS) -> Raspberry Pi Physical 10 / BCM 15 (RXD0 / /dev/serial0)
 #   RXD (GNSS) -> Raspberry Pi Physical 8  / BCM 14 (TXD0)
 #   VCC        -> Raspberry Pi Physical 1  (3.3V) or Physical 2/4 (5V)
@@ -148,13 +171,45 @@ GNSS_SATELLITE_SNAP_SEC  = 5.0
 #   RST (Opt)  -> Raspberry Pi Physical 36 / BCM 16 (GNSS_RESET_PIN)
 # ---------------------------------------------------------------------------
 GNSS_SERIAL_PORT    = "/dev/serial0"   # Default hardware UART on Raspberry Pi
-GNSS_BAUD_RATE      = 115200             # Standard NMEA default baud rate for MAX-M10S / NEO-6M
-GNSS_AUTO_DETECT    = True             # Auto-scan candidate serial ports if default fails
+GNSS_BAUD_RATE      = 115200           # Operating baud; receiver is switched from 9600 automatically
 
 # ---------------------------------------------------------------------------
 # IMU complementary filter
 # ---------------------------------------------------------------------------
 COMPLEMENTARY_ALPHA = 0.98
+
+# ---------------------------------------------------------------------------
+# IMU calibration (offsets must only be learned while the vehicle is still)
+# ---------------------------------------------------------------------------
+# Last good offsets are saved here and loaded at boot, so a device that boots
+# while moving still has a valid baseline. Device-specific: not in git.
+IMU_CALIBRATION_FILE          = os.path.join(_HERE, "imu_calibration.json")
+IMU_CAL_SAMPLES               = 100     # samples per calibration attempt
+IMU_CAL_SAMPLE_DELAY_SEC      = 0.010   # 100 × 10 ms ≈ 1 s
+
+# Option 1 — stillness check: reject the attempt if readings vary more than this
+#            (turning / braking / bumps). Tune from the logged "spread" values.
+IMU_CAL_MAX_GYRO_STD_DPS      = 0.5     # per-axis gyro standard deviation, °/s
+IMU_CAL_MAX_ACCEL_STD_G       = 0.03    # per-axis accel standard deviation, g
+# A smooth steady turn has low spread but a constant rotation that looks like bias.
+# If a trusted calibration exists, reject a boot result that moved further than this from it.
+IMU_CAL_MAX_GYRO_SHIFT_DPS    = 1.5
+IMU_CAL_MAX_ACCEL_SHIFT_G     = 0.05
+
+# Option 4 — sanity limits: no healthy MPU-6500 produces offsets outside these
+IMU_CAL_MAX_GYRO_OFFSET_DPS   = 10.0
+IMU_CAL_GRAVITY_MIN_G         = 0.85    # |mean accel| must look like gravity
+IMU_CAL_GRAVITY_MAX_G         = 1.15
+
+# While the IMU has no usable offsets at all, retry calibration this often
+IMU_CAL_RETRY_SEC             = 30.0
+
+# Option 3 — re-calibrate at confirmed stops (GNSS fix + speed ≈ 0)
+IMU_STOP_RECAL_ENABLED        = True
+IMU_STOP_RECAL_MAX_SPEED_KMH  = 1.0     # "stopped" for calibration purposes
+IMU_STOP_RECAL_MIN_STOP_SEC   = 5.0     # must be stopped this long first
+IMU_STOP_RECAL_INTERVAL_SEC   = 600.0   # at most once per 10 min
+IMU_STOP_RECAL_BLEND          = 0.3     # new = old + 0.3 × (measured − old)
 
 # ---------------------------------------------------------------------------
 # LED BCM GPIO pin assignments (Pi 40-pin header)
@@ -174,7 +229,7 @@ LED_RED        = 23   # BCM 23 — Physical 16 — error indicator only (red, bl
 LED_YELLOW     = 24   # BCM 24 — Physical 18 — system ready / snap (yellow, solid ON, triple blink on capture)
 LED_LTE_GREEN  = 10   # BCM 10 — Physical 19 — LTE/modem status (green)
 
-GNSS_RESET_PIN = 16   # BCM 16 — Physical 36 — MAX-M10S RST (active-low, drive LOW to reset)
+GNSS_RESET_PIN = 16   # BCM 16 — Physical 36 — MAX-M10S RST (active-low). Wiring reference only: not driven by code.
 
 LED_FAULT_BLINK_INTERVAL  = 0.400    # seconds
 LED_YELLOW_BLINK_INTERVAL = 1.000    # seconds

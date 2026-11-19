@@ -14,13 +14,16 @@ Hardware Pin Connections:
   - GND        -> Raspberry Pi Physical 6  (GND)
   - RST (Opt)  -> Raspberry Pi Physical 36 / BCM 16 (GNSS_RESET_PIN, active-low)
 
+Receiver configuration (applied at every connect, RAM only — see configure_receiver()):
+  - Measurement rate GNSS_RATE_HZ (5 Hz) via UBX-CFG-VALSET, ACK-checked, real rate measured.
+  - With GNSS_NMEA_FILTER: GGA + RMC every epoch, GSV at GNSS_GSV_RATE_HZ, VTG/GLL/GSA off.
+
 NMEA Sentences Parsed:
-  - $GGA / $GNGGA / $GPGGA: Fix quality, latitude, longitude, altitude, satellite count, HDOP
-  - $RMC / $GNRMC / $GPRMC: Recommended minimum navigation (speed km/h, course, date/time)
-  - $VTG / $GNVTG / $GPVTG: Speed over ground and true course
-  - $GSA / $GNGSA / $GPGSA: DOP metrics (PDOP, HDOP, VDOP) and active satellite PRNs
-  - $GSV / $GNGSV / $GPGSV / $GLGSV / $GAGSV / $GBGSV: Multi-constellation satellites
-    in view (GPS, GLONASS, Galileo, BeiDou, QZSS) with SNR and elevation.
+  - $xxGGA: position, fix quality, altitude, satellites used, HDOP   (authoritative position/fix)
+  - $xxRMC: speed (knots → km/h) and course over ground
+  - $xxGSV: satellites in view (count only, unless GNSS_SATELLITE_DETAIL)
+  - $xxGSA: used-satellite PRNs — only when GNSS_SATELLITE_DETAIL (diagnostics)
+  Everything else (VTG duplicates RMC, GLL races GGA, TXT, ...) is skipped before checksumming.
 
 Output shape:
 {
@@ -35,10 +38,9 @@ Output shape:
     "satellites":         int,
     "satellites_in_view": int,
     "satellite_records":  int,
-    "satellites_detail":  [...] | None,
+    "satellites_detail":  [...] | None,     # only with GNSS_SATELLITE_DETAIL
     "hdop":               float | None,
     "location_source":    "gnss" | None,
-    "primary_module":     "u-blox MAX-M10S",
 }
 """
 
@@ -99,11 +101,12 @@ _state = {
     "last_data_time":        None,
     "last_fix_time":         None,
     "last_detail_snap_time": None,
-    "location_source":       "gnss",
-    "primary_module":        "u-blox MAX-M10S",
 }
 
-# Tracking satellites grouped by talker to avoid multi-constellation GSV collisions
+# Satellites in view per talker (GP/GL/GA/GB...), from GSV field 3 — the only GSV data
+# production code needs. Summed into satellites_in_view.
+_gsv_count_by_talker: dict[str, int] = {}
+# Full per-satellite records per talker — only built when GNSS_SATELLITE_DETAIL is on
 _gsv_satellites_by_talker: dict[str, list[dict]] = {}
 _used_prn_set: set[int] = set()
 # Per-system PRN sets keyed by GSA system-ID field (field[18]).
@@ -118,7 +121,10 @@ _init_done_event = threading.Event()
 _active_port: str | None = None
 _active_baud: int = GNSS_BAUD_RATE
 _target_port: str | None = None
-_target_baud: int | None = None
+
+
+def _detail_enabled() -> bool:
+    return bool(getattr(_cfg, "GNSS_SATELLITE_DETAIL", False))
 
 
 # ---------------------------------------------------------------------------
@@ -219,6 +225,8 @@ def _parse_gga(fields: list) -> None:
     """Parse $GGA / $GNGGA / $GPGGA — Time, position, fix quality, altitude."""
     if len(fields) < 10:
         return
+    global _gga_count
+    _gga_count += 1     # one GGA per navigation epoch → measured output rate
 
     quality = _safe_int(fields[6])   # 0=no fix, 1=SPS, 2=DGPS, 4=RTK, 5=Float RTK
     has_fix = (quality > 0)
@@ -243,47 +251,23 @@ def _parse_gga(fields: list) -> None:
 
 
 def _parse_rmc(fields: list) -> None:
-    """Parse $RMC / $GNRMC / $GPRMC — Speed, course over ground, coordinates, status."""
-    if len(fields) < 4:
-        return
+    """Parse $xxRMC — speed over ground and course only.
 
-    now = time.monotonic()
-    status = fields[2].strip().upper() if fields[2] else "V"
-    active = (status == "A")
-
-    lat = _parse_lat(fields[3], fields[4]) if len(fields) > 4 else None
-    lon = _parse_lon(fields[5], fields[6]) if len(fields) > 6 else None
-    speed_kn = _safe_float(fields[7]) if len(fields) > 7 else None
-    course   = _safe_float(fields[8]) if len(fields) > 8 else None
-
-    # Convert speed from knots to km/h (1 knot = 1.852 km/h)
-    speed_kmh = round(speed_kn * 1.852, 2) if speed_kn is not None else None
-
-    with _lock:
-        _state["data_received"]  = True
-        _state["last_data_time"] = now
-        if speed_kmh is not None:
-            _state["speed_kmh"] = speed_kmh
-        if course is not None:
-            _state["course_deg"] = round(course, 2)
-        _update_fix_state(now, active, lat, lon)
-
-
-def _parse_vtg(fields: list) -> None:
-    """Parse $VTG / $GNVTG / $GPVTG — Ground speed and heading.
-    fields: [id, cog_t, T, cog_m, M, sog_knots, N, sog_kmh, K, mode]
+    Position and fix come from GGA alone: RMC carries the same coordinates for the same
+    epoch, so parsing them twice per epoch was redundant work (and two writers of the
+    same fix state). VTG is no longer parsed either — it repeats RMC's speed/course.
     """
-    if len(fields) < 8:
+    if len(fields) < 9:
         return
-    now = time.monotonic()
-    speed_kmh = _safe_float(fields[7])
-    course    = _safe_float(fields[1]) if len(fields) > 1 else None
+    speed_kn = _safe_float(fields[7])
+    course   = _safe_float(fields[8])
 
+    now = time.monotonic()
     with _lock:
         _state["data_received"]  = True
         _state["last_data_time"] = now
-        if speed_kmh is not None:
-            _state["speed_kmh"]  = round(speed_kmh, 2)
+        if speed_kn is not None:
+            _state["speed_kmh"] = round(speed_kn * 1.852, 2)   # knots → km/h
         if course is not None:
             _state["course_deg"] = round(course, 2)
 
@@ -330,8 +314,23 @@ def _parse_gsv(fields: list, talker: str) -> None:
         return
 
     msg_num = _safe_int(fields[2])
-    constellation = _TALKER_CONSTELLATION.get(talker, "GNSS")
+    now = time.monotonic()
 
+    if not _detail_enabled():
+        # Production path: field 3 = total satellites in view for this talker. Every message
+        # of the sequence repeats it, so only the first message is read.
+        if msg_num > 1:
+            return
+        with _lock:
+            _gsv_count_by_talker[talker] = _safe_int(fields[3])
+            total = sum(_gsv_count_by_talker.values())
+            _state["satellites_in_view"] = total
+            _state["satellite_records"]  = total
+            _state["data_received"]      = True
+            _state["last_data_time"]     = now
+        return
+
+    constellation = _TALKER_CONSTELLATION.get(talker, "GNSS")
     sat_records = []
     i = 4
     while i + 3 < len(fields):
@@ -350,7 +349,6 @@ def _parse_gsv(fields: list, talker: str) -> None:
             })
         i += 4
 
-    now = time.monotonic()
     with _lock:
         if msg_num <= 1 or talker not in _gsv_satellites_by_talker:
             _gsv_satellites_by_talker[talker] = sat_records
@@ -376,39 +374,45 @@ def _dispatch(line: str) -> bool:
             return False
         clean_line = line[idx:].strip()
 
+        # Identify the sentence type from the header ("$GNGGA,..." → "GGA") BEFORE the
+        # checksum, so unused sentences cost a slice instead of a full XOR pass.
+        comma = clean_line.find(",")
+        if comma < 4:
+            return False
+        sentence_type = clean_line[comma - 3:comma].upper()
+        if sentence_type == "GSA":
+            if not _detail_enabled():
+                return False
+        elif sentence_type not in _HANDLED_TYPES:
+            # VTG (duplicate of RMC), GLL (races GGA with status V during a valid fix), TXT, ...
+            return False
+        elif sentence_type == "GSV" and not _detail_enabled():
+            # Count-only mode needs just message 1 of each GSV sequence (it carries the total).
+            # "$GPGSV,3,2,12,..." → message number is the 3rd field.
+            parts = clean_line.split(",", 3)
+            if len(parts) < 4 or parts[2] != "1":
+                return False
+
         if not _nmea_checksum_ok(clean_line):
             return False
 
-        body = clean_line[1:].split("*")[0]
-        fields = body.split(",")
-        if not fields or not fields[0]:
-            return False
+        fields = clean_line[1:].split("*", 1)[0].split(",")
+        talker = fields[0][:2].upper() if len(fields[0]) >= 2 else "GN"
 
-        sentence_id = fields[0].upper()
-        talker = sentence_id[:2] if len(sentence_id) >= 2 else "GN"
-
-        if sentence_id.endswith("GGA"):
+        if sentence_type == "GGA":
             _parse_gga(fields)
-            return True
-        elif sentence_id.endswith("RMC"):
+        elif sentence_type == "RMC":
             _parse_rmc(fields)
-            return True
-        # GLL omitted: u-blox MAX-M10S emits $GNGLL with status V even during an active
-        # 3D fix, racing against GGA/RMC and falsely clearing fix=True. Authoritative
-        # position comes from GGA + RMC only.
-        elif sentence_id.endswith("VTG"):
-            _parse_vtg(fields)
-            return True
-        elif sentence_id.endswith("GSA"):
-            _parse_gsa(fields)
-            return True
-        elif sentence_id.endswith("GSV"):
+        elif sentence_type == "GSV":
             _parse_gsv(fields, talker)
-            return True
-
-        return False
+        else:
+            _parse_gsa(fields)
+        return True
     except Exception:
         return False
+
+
+_HANDLED_TYPES = frozenset({"GGA", "RMC", "GSV"})
 
 
 # ---------------------------------------------------------------------------
@@ -425,6 +429,7 @@ def _reset_state_to_disconnected() -> None:
     _used_by_sys.clear()
     _used_prn_set = set()
     _gsv_satellites_by_talker.clear()
+    _gsv_count_by_talker.clear()
     with _lock:
         _state["data_received"]         = False
         _state["fix"]                   = False
@@ -668,17 +673,150 @@ def _connect_and_configure_baud(target_port: str, verbose: bool = True):
     return None
 
 
-def configure_ubx_5hz(ser) -> bool:
-    """Send UBX-CFG-RATE command to set u-blox measurement rate to 5 Hz (200 ms)."""
+# ── UBX configuration (u-blox M10: CFG-VALSET; legacy UBX-CFG-RATE was confirmed ignored
+#    on the deployed MAX-M10S — GGA stayed at 1.0/s after sending it) ─────────────────────
+_CFG_RATE_MEAS = 0x30210001   # U2, ms between measurements
+_CFG_RATE_NAV  = 0x30210002   # U2, measurements per navigation solution
+_CFG_MSGOUT_UART1 = {         # U1, output every N navigation epochs (0 = off)
+    "GGA": 0x209100BB,
+    "RMC": 0x209100AC,
+    "VTG": 0x209100B1,
+    "GLL": 0x209100CA,
+    "GSA": 0x209100C0,
+    "GSV": 0x209100C5,
+}
+_LAYER_RAM = 0x01             # runtime only — re-applied at every connect, never written to flash/BBR
+
+
+def _ubx_frame(cls: int, msg_id: int, payload: bytes = b"") -> bytes:
+    body = bytes([cls, msg_id, len(payload) & 0xFF, (len(payload) >> 8) & 0xFF]) + payload
+    ck_a, ck_b = _ubx_checksum(body)
+    return b"\xb5\x62" + body + bytes([ck_a, ck_b])
+
+
+def _ubx_valset(items: list[tuple[int, int, int]], layers: int = _LAYER_RAM) -> bytes:
+    """UBX-CFG-VALSET. items = [(key_id, size_bytes, value), ...]."""
+    payload = bytes([0x00, layers, 0x00, 0x00])
+    for key, size, value in items:
+        payload += key.to_bytes(4, "little") + int(value).to_bytes(size, "little")
+    return _ubx_frame(0x06, 0x8A, payload)
+
+
+def _read_ubx_frame(ser, cls: int, msg_id: int, timeout_sec: float = 0.6) -> bytes | None:
+    """Return the payload of the first valid UBX frame with this class/id, or None."""
+    deadline = time.monotonic() + timeout_sec
+    buf = bytearray()
+    while time.monotonic() < deadline:
+        try:
+            n = getattr(ser, "in_waiting", 0) or 1
+            chunk = ser.read(min(n, 256))
+        except Exception:
+            return None
+        if chunk:
+            buf.extend(chunk)
+        else:
+            time.sleep(0.01)
+        while True:
+            idx = buf.find(b"\xb5\x62")
+            if idx < 0:
+                del buf[:-1]
+                break
+            if idx:
+                del buf[:idx]
+            if len(buf) < 8:
+                break
+            plen  = buf[4] | (buf[5] << 8)
+            total = 6 + plen + 2
+            if len(buf) < total:
+                break
+            ck_a, ck_b = _ubx_checksum(buf[2:6 + plen])
+            ok = (ck_a == buf[6 + plen] and ck_b == buf[7 + plen])
+            if ok and buf[2] == cls and buf[3] == msg_id:
+                return bytes(buf[6:6 + plen])
+            del buf[:2 if not ok else total]
+    return None
+
+
+def _send_and_ack(ser, frame: bytes) -> bool | None:
+    """Send a UBX-CFG frame; True = ACK, False = NAK, None = no answer."""
     try:
-        cmd = bytes([0xB5, 0x62, 0x06, 0x08, 0x06, 0x00, 0xC8, 0x00, 0x01, 0x00, 0x01, 0x00, 0xDE, 0x6A])
-        ser.write(cmd)
-        ser.flush()
-        print("[GNSS] Configured u-blox receiver measurement rate: 5 Hz (200 ms)", flush=True)
-        return True
-    except Exception as exc:
-        print(f"[GNSS] Note: 5 Hz UBX config skipped ({exc})")
-        return False
+        ser.write(frame)
+        if hasattr(ser, "flush"):
+            ser.flush()
+    except Exception:
+        return None
+    return _read_ubx_ack(ser, expected_cls=frame[2], expected_msg=frame[3], timeout_sec=0.6)
+
+
+def _query_firmware(ser) -> str | None:
+    """UBX-MON-VER → e.g. 'SPG 5.10 / PROTVER=34.10 / MOD=MAX-M10S'."""
+    try:
+        ser.write(UBX_POLL_MON_VER)
+        if hasattr(ser, "flush"):
+            ser.flush()
+    except Exception:
+        return None
+    payload = _read_ubx_frame(ser, 0x0A, 0x04, timeout_sec=0.6)
+    if not payload or len(payload) < 40:
+        return None
+    text = lambda b: b.split(b"\x00", 1)[0].decode("ascii", errors="replace").strip()
+    parts = [text(payload[i:i + 30]) for i in range(40, len(payload), 30)]
+    wanted = [p for p in parts if p.startswith(("FWVER=", "PROTVER=", "MOD="))]
+    return " / ".join(p.replace("FWVER=", "") for p in wanted) or text(payload[0:30])
+
+
+def configure_receiver(ser) -> dict:
+    """
+    Apply measurement rate (config.GNSS_RATE_HZ) and, if config.GNSS_NMEA_FILTER, the NMEA
+    sentence set, verifying the receiver's ACK. Fallback order:
+      1. VALSET rate + sentence filter (one message)
+      2. VALSET rate only            (if the receiver rejects a sentence key)
+      3. legacy UBX-CFG-RATE         (older firmware)
+    Returns {"rate_hz", "rate_ok", "filter_ok", "method", "firmware"}.
+    """
+    rate_hz = max(1.0, min(10.0, float(getattr(_cfg, "GNSS_RATE_HZ", 5.0))))
+    meas_ms = int(round(1000.0 / rate_hz))
+    want_filter = bool(getattr(_cfg, "GNSS_NMEA_FILTER", True))
+    gsv_every = max(1, int(round(rate_hz / max(0.1, float(getattr(_cfg, "GNSS_GSV_RATE_HZ", 1.0))))))
+
+    result = {"rate_hz": rate_hz, "rate_ok": False, "filter_ok": False,
+              "method": None, "firmware": _query_firmware(ser)}
+    if result["firmware"]:
+        print(f"[GNSS] Receiver firmware: {result['firmware']}", flush=True)
+
+    rate_items = [(_CFG_RATE_MEAS, 2, meas_ms), (_CFG_RATE_NAV, 2, 1)]
+    filter_items = [
+        (_CFG_MSGOUT_UART1["GGA"], 1, 1),
+        (_CFG_MSGOUT_UART1["RMC"], 1, 1),
+        (_CFG_MSGOUT_UART1["GSV"], 1, gsv_every),
+        (_CFG_MSGOUT_UART1["VTG"], 1, 0),
+        (_CFG_MSGOUT_UART1["GLL"], 1, 0),
+        # GSA only feeds the per-satellite "used in fix" flag → on (at GSV rate) in detail mode only
+        (_CFG_MSGOUT_UART1["GSA"], 1, gsv_every if _detail_enabled() else 0),
+    ]
+
+    if want_filter and _send_and_ack(ser, _ubx_valset(rate_items + filter_items)) is True:
+        result.update(rate_ok=True, filter_ok=True, method="VALSET")
+    elif _send_and_ack(ser, _ubx_valset(rate_items)) is True:
+        result.update(rate_ok=True, method="VALSET")
+    else:
+        legacy = _ubx_frame(0x06, 0x08, meas_ms.to_bytes(2, "little") + (1).to_bytes(2, "little")
+                            + (1).to_bytes(2, "little"))
+        if _send_and_ack(ser, legacy) is True:
+            result.update(rate_ok=True, method="CFG-RATE")
+
+    if result["rate_ok"]:
+        extra = (f", sentences GGA+RMC @ {rate_hz:g} Hz, GSV every {gsv_every} epochs, VTG/GLL off, "
+                 f"GSA {'every ' + str(gsv_every) + ' epochs' if _detail_enabled() else 'off'}"
+                 if result["filter_ok"] else
+                 (" (sentence filter REJECTED — receiver output unchanged)" if want_filter else ""))
+        print(f"[GNSS] Measurement rate {rate_hz:g} Hz ({meas_ms} ms) ACK via {result['method']}{extra}",
+              flush=True)
+    else:
+        print(f"[GNSS] WARNING: receiver did not acknowledge {rate_hz:g} Hz rate "
+              f"(VALSET and CFG-RATE both unanswered/rejected) — staying at its default rate.",
+              flush=True)
+    return result
 
 
 def _set_thread_priority_high() -> None:
@@ -701,6 +839,39 @@ def _set_thread_priority_high() -> None:
             _libc.pthread_setschedparam(ctypes.c_ulong(threading.current_thread().ident or 0), 2, ctypes.byref(p))
     except Exception:
         pass
+
+
+# ── Measured output rate (verifies the configuration actually took effect) ──────────────
+_RATE_CHECK_SEC = 5.0
+_gga_count: int = 0
+_rate_check_start: float | None = None
+_rate_check_target: float = 1.0
+measured_rate_hz: float | None = None    # last measured GGA rate (diagnostics)
+
+
+def _start_rate_check(target_hz: float) -> None:
+    global _gga_count, _rate_check_start, _rate_check_target
+    _gga_count = 0
+    _rate_check_target = float(target_hz)
+    _rate_check_start = time.monotonic()
+
+
+def _maybe_report_rate() -> None:
+    """Once, ~5 s after connect: log the real GGA rate and warn if it misses the target."""
+    global _rate_check_start, measured_rate_hz
+    if _rate_check_start is None:
+        return
+    elapsed = time.monotonic() - _rate_check_start
+    if elapsed < _RATE_CHECK_SEC:
+        return
+    _rate_check_start = None
+    measured_rate_hz = round(_gga_count / elapsed, 2)
+    if measured_rate_hz >= 0.8 * _rate_check_target:
+        print(f"[GNSS] Measured output rate: {measured_rate_hz:.1f} Hz (target {_rate_check_target:g} Hz) ✔",
+              flush=True)
+    else:
+        print(f"[GNSS] WARNING: measured output rate {measured_rate_hz:.1f} Hz is below target "
+              f"{_rate_check_target:g} Hz — receiver configuration did not take effect.", flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -740,12 +911,17 @@ def _serial_thread() -> None:
 
         _active_port = target_port
         _active_baud = 115200
-        configure_ubx_5hz(ser)
+        cfg_result = configure_receiver(ser)
+        _start_rate_check(cfg_result.get("rate_hz", 1.0))
 
+        err_since: float | None = None      # start of the current run of serial errors
+        reconnect_after = float(getattr(_cfg, "GNSS_SERIAL_ERROR_RECONNECT_SEC", 2.0))
         try:
             while not _stop_event.is_set():
+                _maybe_report_rate()
                 try:
                     line_bytes = ser.readline()
+                    err_since = None
                     if not line_bytes:
                         continue
 
@@ -775,6 +951,15 @@ def _serial_thread() -> None:
                     if target_port.startswith("/dev") and not os.path.exists(target_port):
                         print(f"[GNSS] Hardware port {target_port} disconnected from OS: {port_err}")
                         break
+                    # Port still exists but keeps failing (e.g. another process holds it, driver
+                    # wedged): previously retried every 10 ms forever without a word.
+                    now_e = time.monotonic()
+                    if err_since is None:
+                        err_since = now_e
+                    elif now_e - err_since >= reconnect_after:
+                        print(f"[GNSS] Serial errors on {target_port} for {now_e - err_since:.1f}s "
+                              f"({port_err}) — reopening port")
+                        break
                     time.sleep(0.01)
                 except Exception:
                     time.sleep(0.005)
@@ -800,19 +985,17 @@ def init(port: str | None = None, baud: int | None = None) -> bool:
     """Start the background u-blox MAX-M10S serial reader thread.
     Args:
         port: Serial port override (e.g. /dev/serial0, /dev/ttyUSB0, COM3).
-        baud: Baud rate override (default: 115200).
+        baud: Ignored — kept for call compatibility. The baud rate is auto-detected
+              (115200, else 9600 → receiver switched to 115200).
     Returns True immediately.
     """
-    global _thread, _target_port, _target_baud
+    global _thread, _target_port
     if port and port != "Pi-native":
         _target_port = port
-    if baud and baud > 0:
-        _target_baud = baud
 
     if _thread and _thread.is_alive():
         target_p = _target_port or auto_detect_gnss_port() or GNSS_SERIAL_PORT
-        target_b = _target_baud or GNSS_BAUD_RATE
-        print(f"[GNSS] Primary u-blox MAX-M10S reader already running ({target_p} @ {target_b} baud)")
+        print(f"[GNSS] Primary u-blox MAX-M10S reader already running ({target_p} @ {_active_baud} baud)")
         return True
 
     _stop_event.clear()
@@ -907,5 +1090,4 @@ def read() -> dict:
         "satellites_detail":  detail if data_received else None,
         "hdop":               snap["hdop"] if has_fix else None,
         "location_source":    loc_source,
-        "primary_module":     "u-blox MAX-M10S",
     }

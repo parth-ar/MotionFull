@@ -31,6 +31,7 @@ import os
 import queue
 import threading
 import time
+import uuid
 
 import cv2
 import numpy as np
@@ -131,14 +132,13 @@ def _save_worker() -> None:
             # Real-time upload: enqueue into upload_queue immediately after disk write
             try:
                 from telemetry import upload_queue
-                litter_lat = sidecar_data.get("gnss", {}).get("latitude")
-                litter_lon = sidecar_data.get("gnss", {}).get("longitude")
                 upload_item = {
                     "local_path":           filename,
                     "meta_path":            sidecar_filename,
                     "captured_at":          sidecar_data.get("captured_at"),
-                    "latitude":             litter_lat,
-                    "longitude":            litter_lon,
+                    "idempotency_key":      sidecar_data.get("idempotency_key"),
+                    "latitude":             sidecar_data.get("latitude"),
+                    "longitude":            sidecar_data.get("longitude"),
                     "detection_type":       "LITTER",
                     "detection_confidence": sidecar_data.get("detection_confidence", 0.0),
                     "stop_duration_sec":    None,
@@ -517,7 +517,17 @@ class LitterEngine:
                                        f"litter_T{trigger_n:04d}_E{self._event_count:04d}_{clean_ts}.jpg")
             sidecar_fn  = os.path.splitext(filename)[0] + ".json"
 
+            _cap_lat = float(lat) if (has_fix and lat is not None) else None
+            _cap_lon = float(lon) if (has_fix and lon is not None) else None
+
             sidecar_data = {
+                # Generated once per event so live upload and any backlog retry
+                # share the same key (backend de-duplicates on it).
+                "idempotency_key": str(uuid.uuid4()),
+                # Top-level capture coordinates, read by the uploader on both
+                # live upload and backlog replay (same keys as motion sidecars).
+                "latitude":       _cap_lat,
+                "longitude":      _cap_lon,
                 "event_number":   self._event_count,
                 "trigger_number": trigger_n,
                 "image_file":     os.path.basename(filename),
@@ -528,8 +538,8 @@ class LitterEngine:
                 "inference_ms":   infer_ms,
                 "gnss": {
                     "fix":        has_fix,
-                    "latitude":   float(lat) if (has_fix and lat is not None) else None,
-                    "longitude":  float(lon) if (has_fix and lon is not None) else None,
+                    "latitude":   _cap_lat,
+                    "longitude":  _cap_lon,
                     "speed_kmh":  (gnss_data.get("speed_kmh") if isinstance(gnss_data, dict) and gnss_data.get("speed_kmh") is not None else (gnss_data.get("speed") if isinstance(gnss_data, dict) else None)),
                     "satellites": gnss_data.get("satellites") if isinstance(gnss_data, dict) else None,
                     "hdop":       gnss_data.get("hdop") if isinstance(gnss_data, dict) else None,

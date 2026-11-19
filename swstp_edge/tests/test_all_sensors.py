@@ -280,6 +280,10 @@ def test_gnss(wait_sec: int = 30, port: str | None = None, baud: int | None = No
     target_baud = baud or GNSS_BAUD_RATE
 
     print(f"\n  {DIM}Starting MAX-M10S GNSS serial reader → {target_port} @ {target_baud} baud{RESET}")
+    # Diagnostics want the per-satellite table (PRN / elevation / SNR / used-in-fix);
+    # production builds only the satellites-in-view count.
+    import config as _cfg
+    _cfg.GNSS_SATELLITE_DETAIL = True
     gnss_mod.init(port=port, baud=baud)
 
     # ── Wait for data ─────────────────────────────────────────────────────

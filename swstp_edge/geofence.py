@@ -78,10 +78,10 @@ def compute_heading_from_gps_history(raw_lat, raw_lon,
     """Calculates context-aware vehicle motion heading.
 
     Priority order:
-    1. Hardware Doppler course from $RMC/$VTG (hardware_course_deg) — available at
-       1 Hz even when the vehicle is slow or the position barely changes. This is
-       preferred over geometric displacement which fails at low speeds because the
-       GPS sliding window covers < 0.8 m at < 10 km/h at 1 Hz update rate.
+    1. Hardware Doppler course from $RMC (hardware_course_deg) — available every
+       GNSS epoch (5 Hz) even when the vehicle is slow or the position barely changes.
+       Preferred over geometric displacement, which fails at low speed because the
+       displacement over the sliding window stays below 0.8 m.
     2. Outside Safe Zone & Snapped to Road: align hardware course parallel to the
        winning road segment (forward vs. reverse).
     3. Inside Safe Zone or Off-Road: use raw GPS displacement vector (geometric).

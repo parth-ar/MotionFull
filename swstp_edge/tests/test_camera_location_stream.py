@@ -712,6 +712,7 @@ def run_self_test() -> int:
         t_frame = threading.Thread(
             target=live_frame_streamer,
             args=(server_url, "SELFTEST-DEV-01", 10.0, test_stop, shared_frame_lock, _get_test_frame),
+            kwargs={"on_demand": False},   # self-test mock server has no stream-status endpoint
             daemon=True,
         )
         t_frame.start()

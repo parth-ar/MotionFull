@@ -9,6 +9,7 @@ swstp_edge/captures/motion/*.json
 swstp_edge/captures/litter/*.json
 swstp_edge/captures/*.jpg
 swstp_edge/captures/*.json
+swstp_edge/imu_calibration.json
 .history/
 *.log
 venv/

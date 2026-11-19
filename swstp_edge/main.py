@@ -203,7 +203,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--vehicle-id", default=None,
                         help="Vehicle ID for live raw GNSS streaming (default: loaded from device_config.json or device_id)")
     parser.add_argument("--gnss-stream-rate", type=float, default=getattr(_cfg, "GNSS_STREAM_RATE_HZ", 5.0),
-                        help="Live raw GNSS streaming rate in Hz to /api/{vehicle_id}/live_location (default: 1.0 Hz)")
+                        help="Live raw GNSS streaming rate in Hz to /api/{vehicle_id}/live_location (default: GNSS_STREAM_RATE_HZ, 5 Hz)")
     parser.add_argument("--ulb-id", default=DEFAULT_ULB_ID,
                         help="ULB ID")
     parser.add_argument("--session-id", type=int, default=0,
@@ -342,7 +342,8 @@ def main() -> None:
     print(f" Backend:          {effective_backend_url}")
     print(f" Device ID:        {device_id}")
     print(f" Vehicle ID:       {vehicle_id}")
-    print(f" Raw GNSS Stream:  POST {effective_backend_url.rstrip('/')}/api/{vehicle_id}/live_location @ {args.gnss_stream_rate:.1f}Hz")
+    gnss_stream_base = (getattr(_cfg, "GNSS_STREAM_BASE_URL", "") or "").strip() or effective_backend_url
+    print(f" Raw GNSS Stream:  POST {gnss_stream_base.rstrip('/')}/api/{vehicle_id}/live_location @ {args.gnss_stream_rate:.1f}Hz")
     print(f" ULB ID:           {effective_ulb_id}")
     print(f" Session ID:       {effective_session_id if effective_session_id else 'DYNAMIC HARDWARE BIND'}")
     print(f" Timezone:         {tz_name} (IST, UTC+05:30)")
@@ -472,7 +473,7 @@ def main() -> None:
 
     t_raw_gnss = threading.Thread(
         target=raw_gnss_streamer,
-        args=(effective_backend_url, vehicle_id, stop_event, args.gnss_stream_rate),
+        args=(gnss_stream_base, vehicle_id, stop_event, args.gnss_stream_rate),
         daemon=True, name="raw-gnss-streamer",
     )
     t_raw_gnss.start()
@@ -1148,7 +1149,7 @@ def main() -> None:
                         "stop_duration_sec":   round(float(current_event_duration), 2),
                         "drift_from_origin_m": round(float(stop_status.get("drift_from_origin_m", 0.0)), 2),
                         "max_drift_m":          round(float(stop_status.get("max_drift_m", 0.0)), 2),
-                        "motion_confidence":   0.95,
+                        "detection_type":      "MOTION",
                         "saved_count":         saved_count,
                         "local_path":          local_path,
                         # ── Dumping side classification (outbound JSON) ──────────
