@@ -1,8 +1,8 @@
-# SWSTP Edge — Raspberry Pi 4B Firmware
+﻿# SWSTP Edge â€” Raspberry Pi 4B Firmware
 
 Single-device replacement for the original Arduino Uno + PC two-device stack.
 The DS3231 RTC, MPU-6500 IMU, and NEO-6M GNSS module are wired directly to
-the Pi's I²C bus and hardware UART.  All downstream behaviour (motion detection,
+the Pi's IÂ²C bus and hardware UART.  All downstream behaviour (motion detection,
 geofencing, backend API contract) is unchanged.
 
 ---
@@ -11,32 +11,32 @@ geofencing, backend API contract) is unchanged.
 
 ```
 swstp_edge/
-├── main.py                  ← Entry point  (python3 main.py)
-├── config.py                ← All constants, GPIO pin map, device ID loader
-├── device_config.json       ← Hardware identity (replaces Arduino EEPROM)
-├── roi_polygon.json         ← Persistent ROI polygon (same format as before)
-├── requirements.txt
-├── captures/                ← Motion evidence frames saved locally
-├── sensors/
-│   ├── rtc.py               ← DS3231 via kernel i2c-rtc overlay
-│   ├── rtc_sync.py          ← Standalone NTP/RTC initial sync & periodic backup
-│   ├── imu.py               ← MPU-6500 via smbus2 + ported complementary filter
-│   ├── gnss.py              ← NEO-6M via gpsd + gpsdclient
-│   ├── leds.py              ← Status LEDs via gpiozero
-│   └── power.py             ← Secondary battery supervisor, evidence flusher & safe shutdown
-├── telemetry.py             ← 20 Hz sensor → JSON packet builder (slim & full)
-├── motion.py                ← Motion detection (unchanged algorithm)
-├── geofence.py              ← Haversine, road-snap, safe-zone (unchanged)
-└── network/
-    ├── uploader.py          ← Backend HTTP workers (unchanged endpoints)
-    └── location_fallback.py ← IP-geolocation fallback (Linux-only)
+â”œâ”€â”€ main.py                  â† Entry point  (python3 main.py)
+â”œâ”€â”€ config.py                â† All constants, GPIO pin map, device ID loader
+â”œâ”€â”€ device_config.json       â† Hardware identity (replaces Arduino EEPROM)
+â”œâ”€â”€ roi_polygon.json         â† Persistent ROI polygon (same format as before)
+â”œâ”€â”€ requirements.txt
+â”œâ”€â”€ captures/                â† Motion evidence frames saved locally
+â”œâ”€â”€ sensors/
+â”‚   â”œâ”€â”€ rtc.py               â† DS3231 via kernel i2c-rtc overlay
+â”‚   â”œâ”€â”€ rtc_sync.py          â† Standalone NTP/RTC initial sync & periodic backup
+â”‚   â”œâ”€â”€ imu.py               â† MPU-6500 via smbus2 + ported complementary filter
+â”‚   â”œâ”€â”€ gnss.py              â† NEO-6M via gpsd + gpsdclient
+â”‚   â”œâ”€â”€ leds.py              â† Status LEDs via gpiozero
+â”‚   â””â”€â”€ power.py             â† Secondary battery supervisor, evidence flusher & safe shutdown
+â”œâ”€â”€ telemetry.py             â† 20 Hz sensor â†’ JSON packet builder (slim & full)
+â”œâ”€â”€ motion.py                â† Motion detection (unchanged algorithm)
+â”œâ”€â”€ geofence.py              â† Haversine, road-snap, safe-zone (unchanged)
+â””â”€â”€ network/
+    â”œâ”€â”€ uploader.py          â† Backend HTTP workers (unchanged endpoints)
+    â””â”€â”€ location_fallback.py â† IP-geolocation fallback (Linux-only)
 ```
 
 ---
 
 ## Hardware Wiring
 
-### DS3231 RTC — I²C (address 0x68)
+### DS3231 RTC â€” IÂ²C (address 0x68)
 
 | DS3231 pin | Pi 40-pin header |
 |-----------|-----------------|
@@ -45,17 +45,17 @@ swstp_edge/
 | SDA       | Pin 3 (GPIO 2)  |
 | SCL       | Pin 5 (GPIO 3)  |
 
-> ⚠️ **VOLTAGE CAUTION**: Pi I²C operates at **3.3 V only**.  Many cheap DS3231
+> âš ï¸ **VOLTAGE CAUTION**: Pi IÂ²C operates at **3.3 V only**.  Many cheap DS3231
 > breakout boards tie their pull-up resistors to VCC = 5 V, which will pull the
-> SDA/SCL lines to 5 V — **exceeding the Pi GPIO absolute maximum of 3.3 V**.
-> Use a bidirectional 3.3 V ↔ 5 V I²C level-shifter (e.g. TXB0102, BSS138-
+> SDA/SCL lines to 5 V â€” **exceeding the Pi GPIO absolute maximum of 3.3 V**.
+> Use a bidirectional 3.3 V â†” 5 V IÂ²C level-shifter (e.g. TXB0102, BSS138-
 > based module) if your breakout uses 5 V pull-ups.  Breakout boards whose
 > pull-ups are tied to 3.3 V (e.g. Adafruit #3013) are safe for direct
 > connection.
 
 ---
 
-### MPU-6500 IMU — I²C (address 0x69, AD0 pulled HIGH)
+### MPU-6500 IMU â€” IÂ²C (address 0x69, AD0 pulled HIGH)
 
 | MPU-6500 pin | Pi 40-pin header |
 |-------------|-----------------|
@@ -65,31 +65,31 @@ swstp_edge/
 | SCL         | Pin 5 (GPIO 3)  |
 | AD0         | 3.3 V (HIGH)    |
 
-> ⚠️ **VOLTAGE CAUTION**: Most GY-6500 / GY-521 breakout boards include an
-> on-board 3.3 V regulator and run I²C logic at 3.3 V — **safe for direct Pi
+> âš ï¸ **VOLTAGE CAUTION**: Most GY-6500 / GY-521 breakout boards include an
+> on-board 3.3 V regulator and run IÂ²C logic at 3.3 V â€” **safe for direct Pi
 > connection when VCC is wired to 3.3 V**.  If you power the module from 5 V,
-> the I²C logic levels will be 5 V — insert a level-shifter before connecting
+> the IÂ²C logic levels will be 5 V â€” insert a level-shifter before connecting
 > to the Pi.  Always verify your specific module's schematic.
 
 ---
 
-### NEO-6M GNSS — Hardware UART (/dev/serial0)
+### NEO-6M GNSS â€” Hardware UART (/dev/serial0)
 
 | NEO-6M pin | Pi 40-pin header |
 |-----------|-----------------|
-| VCC       | Pin 1 (3.3 V) or Pin 4 (5 V) — check module |
+| VCC       | Pin 1 (3.3 V) or Pin 4 (5 V) â€” check module |
 | GND       | Pin 6 (GND)     |
 | TX        | Pin 10 (GPIO 15 / UART0 RX) |
 | RX        | Pin 8  (GPIO 14 / UART0 TX) |
 
-> ⚠️ **VOLTAGE CAUTION**:
-> - **NEO-6M TX → Pi RX**: The NEO-6M output is typically 2.8 V logic — safe
+> âš ï¸ **VOLTAGE CAUTION**:
+> - **NEO-6M TX â†’ Pi RX**: The NEO-6M output is typically 2.8 V logic â€” safe
 >   for direct connection to the Pi 3.3 V GPIO.
-> - **Pi TX → NEO-6M RX**: The Pi TX output is 3.3 V.  Most NEO-6M modules
+> - **Pi TX â†’ NEO-6M RX**: The Pi TX output is 3.3 V.  Most NEO-6M modules
 >   accept 3.3 V on their RX input.  However, some inexpensive modules labelled
 >   "5 V" may have the RX pin connected to 5 V-level circuitry.  **Check your
->   module's schematic.**  If uncertain, use a 1 kΩ / 2 kΩ voltage divider on
->   the Pi TX line (Pi TX → 1 kΩ → NEO-6M RX; NEO-6M RX → 2 kΩ → GND), or a
+>   module's schematic.**  If uncertain, use a 1 kÎ© / 2 kÎ© voltage divider on
+>   the Pi TX line (Pi TX â†’ 1 kÎ© â†’ NEO-6M RX; NEO-6M RX â†’ 2 kÎ© â†’ GND), or a
 >   logic-level shifter.
 
 ---
@@ -104,7 +104,7 @@ swstp_edge/
 | YELLOW     | 23            | 1 Hz blink when all modules OK        |
 | RED        | 24            | Blinks when any module is faulting    |
 
-Wire each LED through a **220 Ω – 470 Ω current-limiting resistor** to GND.
+Wire each LED through a **220 Î© â€“ 470 Î© current-limiting resistor** to GND.
 Pi GPIO outputs are 3.3 V at up to ~16 mA per pin.
 
 ---
@@ -142,7 +142,7 @@ In field deployment, the Pi is powered by the vehicle's main power supply (12V/2
 #### 2. Auto-Boot When Vehicle Powers On Again
 When the vehicle is restarted, the Pi must boot up automatically without manual intervention. There are two standard hardware methods:
 
-- **Method A (Power Cycle — Recommended with Automotive UPS / Relay)**:
+- **Method A (Power Cycle â€” Recommended with Automotive UPS / Relay)**:
   Once the Pi halts (`shutdown -h now`), an automotive UPS module or timer relay completely cuts the 5V rail after a short delay (e.g., 30s). When the vehicle turns on again, 12V ignition power returns, 5V power is re-applied from 0V, and the Raspberry Pi **automatically boots by hardware design**.
 - **Method B (GPIO 3 / RUN Wake-up)**:
   If 5V remains energized to the halted Pi, momentarily pulling **GPIO 3 (Pin 5)** or the **GLOBAL_EN / RUN** header pin to GND triggers an immediate hardware boot. An optocoupler or small NPN transistor connected to the vehicle's ignition signal (ACC) can pulse GPIO 3 or RUN when the key turns.
@@ -152,7 +152,7 @@ When the vehicle is restarted, the Pi must boot up automatically without manual 
 
 ## One-time Pi OS Setup
 
-### 1. Enable I²C and hardware UART
+### 1. Enable IÂ²C and hardware UART
 
 Edit `/boot/config.txt` (or `/boot/firmware/config.txt` on newer Pi OS):
 
@@ -175,7 +175,7 @@ Reboot after editing.
 
 ```bash
 sudo apt install i2c-tools
-sudo hwclock --hctosys      # load RTC → system clock (done automatically at boot by Raspberry Pi OS)
+sudo hwclock --hctosys      # load RTC â†’ system clock (done automatically at boot by Raspberry Pi OS)
 date                        # verify system time is correct
 i2cdetect -y 1             # should show 0x68 (DS3231) and 0x69 (MPU-6500)
 ```
@@ -218,7 +218,7 @@ pip3 install -r requirements.txt
 | `test_max_m10s_gnss.py` | Standalone u-blox MAX-M10S hardware diagnostic dashboard | `python test_max_m10s_gnss.py` |
 | `test_gnss_stop_detection.py` | Standalone stop-detection algorithm validator (with simulation and Arduino Uno support) | `python test_gnss_stop_detection.py` |
 | `test_all_sensors.py` | Comprehensive hardware diagnostic (RTC, IMU, GNSS, Camera, LEDs) | `python test_all_sensors.py` |
-| `test_raw_gnss_streamer.py` | Automated validator for `/api/{vehicle_id}/live_location` streaming | `python test_raw_gnss_streamer.py` |
+| `test_raw_gnss_streamer.py` | Automated validator for `/api/{device_id}/live_location` streaming | `python test_raw_gnss_streamer.py` |
 
 ---
 
@@ -259,7 +259,7 @@ python3 main.py
 | `--gps-fallback-timeout S` | 20 | Seconds before fallback engages |
 | `--no-power-monitor` | off | Disable background battery monitor thread |
 | `--simulate-low-batt-sec N` | 0 | Simulate low-battery shutdown after N seconds (testing) |
-| `--port` / `--baud` | ignored | Legacy flags — no-op on Pi |
+| `--port` / `--baud` | ignored | Legacy flags â€” no-op on Pi |
 
 
 ### Interactive controls (GUI mode)
@@ -284,7 +284,7 @@ identical** to what the original `webcam_motion_detect.py` produced:
 |----------|--------|-------|
 | `/api/camera/{deviceId}/frame` | POST | JPEG, `Content-Type: image/jpeg` |
 | `/api/telemetry/ingest-batch`  | POST | JSON batch, same field names/units |
-| `/api/{vehicle_id}/live_location` | POST | Live raw un-snapped GNSS location coordinates stream |
+| `/api/{device_id}/live_location` | POST | Live raw un-snapped GNSS location coordinates stream |
 | `/api/evidence/upload`         | POST | multipart/form-data, same metadata fields |
 
 ---
@@ -294,10 +294,10 @@ identical** to what the original `webcam_motion_detect.py` produced:
 | Component | Old (Arduino + PC) | New (Raspberry Pi 4B) |
 |-----------|-------------------|-----------------------|
 | Device identity | Arduino EEPROM | `device_config.json` |
-| RTC | DS3231 → Arduino → USB serial | DS3231 → kernel `i2c-rtc` → `datetime.now()` |
-| IMU | MPU-6500 → Arduino → USB serial | MPU-6500 → `smbus2` registers + ported complementary filter |
-| GNSS | NEO-6M → Arduino SoftwareSerial → USB serial | NEO-6M → `/dev/serial0` → `gpsd` → `gpsdclient` |
-| Telemetry → PC | 115200 baud JSON lines | Native Python thread, 20 Hz |
+| RTC | DS3231 â†’ Arduino â†’ USB serial | DS3231 â†’ kernel `i2c-rtc` â†’ `datetime.now()` |
+| IMU | MPU-6500 â†’ Arduino â†’ USB serial | MPU-6500 â†’ `smbus2` registers + ported complementary filter |
+| GNSS | NEO-6M â†’ Arduino SoftwareSerial â†’ USB serial | NEO-6M â†’ `/dev/serial0` â†’ `gpsd` â†’ `gpsdclient` |
+| Telemetry â†’ PC | 115200 baud JSON lines | Native Python thread, 20 Hz |
 | Motion detection | `webcam_motion_detect.py` on PC | `motion.py` on Pi (unchanged algorithm) |
 | LED control | Arduino `digitalWrite` | `gpiozero` |
 | Location fallback | Windows GPS + IP-geolocation | IP-geolocation only (Linux) |

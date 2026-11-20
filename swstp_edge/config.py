@@ -48,17 +48,7 @@ def load_device_id() -> str:
         return _DEFAULT_DEVICE_ID
 
 
-def load_vehicle_id() -> str:
-    """Read vehicle ID from device_config.json. Falls back to device_id or UNPROVISIONED."""
-    try:
-        with open(DEVICE_CONFIG_FILE, "r", encoding="utf-8") as f:
-            cfg = json.load(f)
-        v_id = str(cfg.get("vehicle_id") or cfg.get("vehicleId") or "").strip()
-        if v_id:
-            return v_id
-    except Exception:
-        pass
-    return load_device_id()
+# (load_vehicle_id removed: backend APIs identify the device by device_id only.)
 
 
 def load_timezone() -> str:
@@ -89,6 +79,16 @@ def get_timezone_obj():
 DEFAULT_BACKEND_URL = os.environ.get(
     "SWSTP_BACKEND_URL", "https://solidwasteapi.scipl.info.in"
 )
+# Secondary (mirror) backend — receives a copy of telemetry, raw GNSS live location and
+# evidence uploads, in parallel with DEFAULT_BACKEND_URL. Set to "" to disable mirroring.
+#   - Own login / session on the secondary (retried every SECONDARY_LOGIN_RETRY_SEC)
+#   - Never blocks or delays the primary: copies go through background queues
+#   - Evidence: local files are deleted when the PRIMARY confirms; the secondary gets one attempt
+#   - Live camera frames and startup GIS/ULB downloads stay on the primary only
+SECONDARY_BACKEND_URL = os.environ.get(
+    "SWSTP_SECONDARY_BACKEND_URL", "https://solidwastenewapi.scipl.info.in"
+)
+SECONDARY_LOGIN_RETRY_SEC = 30.0
 DEFAULT_ULB_ID    = "ULB_MH_AMRAVATI"
 DEFAULT_VEHICLE_ID = "UNASSIGNED"
 DEFAULT_STREAM_FPS = 3.0           # Live camera feed streaming FPS (reduced from 30 to protect cellular bandwidth)

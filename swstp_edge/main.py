@@ -201,9 +201,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device-id", default=None,
                         help="Hardware Device Code (overrides device_config.json)")
     parser.add_argument("--vehicle-id", default=None,
-                        help="Vehicle ID for live raw GNSS streaming (default: loaded from device_config.json or device_id)")
+                        help="DEPRECATED, ignored — APIs identify the device by device_id only")
     parser.add_argument("--gnss-stream-rate", type=float, default=getattr(_cfg, "GNSS_STREAM_RATE_HZ", 5.0),
-                        help="Live raw GNSS streaming rate in Hz to /api/{vehicle_id}/live_location (default: 1.0 Hz)")
+                        help="Live raw GNSS streaming rate in Hz to /api/{device_id}/live_location (default: 5.0 Hz)")
     parser.add_argument("--ulb-id", default=DEFAULT_ULB_ID,
                         help="ULB ID")
     parser.add_argument("--session-id", type=int, default=0,
@@ -254,14 +254,13 @@ def main() -> None:
     parser = build_parser()
     args, _ = parser.parse_known_args()
 
-    # ── Resolve device & vehicle identity ────────────────────────────────
+    # ── Resolve device identity (the only ID the backend APIs use) ───────
     device_id = (args.device_id or _cfg.load_device_id()).strip()
     if not device_id or device_id in ("", "UNPROVISIONED", "UNASSIGNED"):
         print("[INIT] WARNING: Device ID not set. Edit device_config.json to provision.")
-
-    vehicle_id = (args.vehicle_id or getattr(_cfg, "load_vehicle_id", lambda: device_id)()).strip()
-    if not vehicle_id:
-        vehicle_id = device_id
+    if args.vehicle_id:
+        print("[INIT] Note: --vehicle-id is deprecated and ignored; APIs use device_id "
+              f"('{device_id}').")
 
     effective_ulb_id = args.ulb_id if (args.ulb_id and args.ulb_id != "AUTO") else DEFAULT_ULB_ID
     enable_fallback  = False  # IP location fallback removed; MAX-M10S hardware GNSS only
@@ -273,11 +272,9 @@ def main() -> None:
     effective_backend_url = args.backend_url or DEFAULT_BACKEND_URL
     effective_session_id = args.session_id
     dynamic_session_info["deviceId"]   = device_id
-    dynamic_session_info["vehicleId"]  = vehicle_id
     dynamic_session_info["backendUrl"] = effective_backend_url
     dynamic_session_info["ulbId"]      = effective_ulb_id
     latest_sensor["deviceId"]          = device_id
-    latest_sensor["vehicleId"]         = vehicle_id
 
     # ── Non-blocking asynchronous backend metadata sync & session bind ───
     # Runs in a background daemon thread so camera & sensors start instantly (<1s)
@@ -340,9 +337,10 @@ def main() -> None:
     print("\n========================================================")
     print(" SWSTP UNIFIED EDGE GATEWAY INITIALIZING (Raspberry Pi 4B)")
     print(f" Backend:          {effective_backend_url}")
+    _mirror = (getattr(_cfg, "SECONDARY_BACKEND_URL", "") or "").strip()
+    print(f" Mirror Backend:   {_mirror + '  (telemetry, raw GNSS, evidence; camera excluded)' if _mirror else 'disabled'}")
     print(f" Device ID:        {device_id}")
-    print(f" Vehicle ID:       {vehicle_id}")
-    print(f" Raw GNSS Stream:  POST {effective_backend_url.rstrip('/')}/api/{vehicle_id}/live_location @ {args.gnss_stream_rate:.1f}Hz")
+    print(f" Raw GNSS Stream:  POST {effective_backend_url.rstrip('/')}/api/{device_id}/live_location @ {args.gnss_stream_rate:.1f}Hz")
     print(f" ULB ID:           {effective_ulb_id}")
     print(f" Session ID:       {effective_session_id if effective_session_id else 'DYNAMIC HARDWARE BIND'}")
     print(f" Timezone:         {tz_name} (IST, UTC+05:30)")
@@ -472,7 +470,7 @@ def main() -> None:
 
     t_raw_gnss = threading.Thread(
         target=raw_gnss_streamer,
-        args=(effective_backend_url, vehicle_id, stop_event, args.gnss_stream_rate),
+        args=(effective_backend_url, device_id, stop_event, args.gnss_stream_rate),
         daemon=True, name="raw-gnss-streamer",
     )
     t_raw_gnss.start()

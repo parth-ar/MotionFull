@@ -3,7 +3,7 @@
 test_raw_gnss_streamer.py — Automated Unit Test for Live Raw GNSS Streaming API.
 
 Validates:
-  1. POST requests sent to: /api/{vehicle_id}/live_location
+  1. POST requests sent to: /api/{device_id}/live_location  (vehicle IDs are no longer used)
   2. JSON payload structure (raw un-snapped latitude, longitude, speed, heading, altitude, sats, fix)
   3. Continuous non-blocking streaming rate and session keep-alive
   4. Graceful handling of backend offline / reconnect behavior
@@ -17,10 +17,13 @@ import sys
 import threading
 import time
 
-# Ensure swstp_edge is on sys.path
-_HERE = os.path.dirname(os.path.abspath(__file__))
+# Ensure swstp_edge (parent of tests/) is on sys.path
+_HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
+
+import config as _cfg
+_cfg.SECONDARY_BACKEND_URL = ""   # never mirror test packets to the real secondary backend
 
 import sensors.gnss as gnss_sensor
 import telemetry
@@ -66,7 +69,7 @@ def make_nmea(body: str) -> str:
 
 def run_test():
     print("==================================================================")
-    print("  TESTING LIVE RAW GNSS STREAMING API (/api/{vehicle_id}/live_location)")
+    print("  TESTING LIVE RAW GNSS STREAMING API (/api/{device_id}/live_location)")
     print("==================================================================")
 
     # 1. Start Mock HTTP Server on ephemeral local port
@@ -77,8 +80,8 @@ def run_test():
     server_thread.start()
     print(f"[TEST SETUP] Mock HTTP Backend running on: {server_url}")
 
-    test_vehicle_id = "MH-27-WASTE-404"
-    expected_path = f"/api/{test_vehicle_id}/live_location"
+    test_device_id = "SWSTP-TEST-404"
+    expected_path = f"/api/{test_device_id}/live_location"
 
     # 2. Feed simulated raw GNSS fix into gnss_sensor
     # Raw coordinates (e.g. Pune, Maharashtra: 18.520430, 73.856740)
@@ -100,7 +103,7 @@ def run_test():
     stop_event = threading.Event()
     stream_thread = threading.Thread(
         target=raw_gnss_streamer,
-        args=(server_url, test_vehicle_id, stop_event, 5.0),
+        args=(server_url, test_device_id, stop_event, 5.0),
         daemon=True,
     )
     stream_thread.start()
@@ -123,9 +126,10 @@ def run_test():
     assert first_req["path"] == expected_path, f"Path mismatch: {first_req['path']} != {expected_path}"
 
     payload = first_req["payload"]
-    print(f"[TEST CHECK 2] Vehicle ID: {payload.get('vehicle_id')}")
-    assert payload.get("vehicle_id") == test_vehicle_id, f"vehicle_id mismatch: {payload.get('vehicle_id')}"
-    assert payload.get("vehicleId") == test_vehicle_id, "vehicleId alias mismatch"
+    print(f"[TEST CHECK 2] Device ID: {payload.get('device_id')}")
+    assert payload.get("device_id") == test_device_id, f"device_id mismatch: {payload.get('device_id')}"
+    assert payload.get("deviceId") == test_device_id, "deviceId alias mismatch"
+    assert "vehicle_id" not in payload and "vehicleId" not in payload, "vehicle IDs must not be sent"
 
     print(f"[TEST CHECK 3] Raw Latitude: {payload.get('latitude'):.6f} (Expected: ~{raw_lat_expected:.6f})")
     print(f"[TEST CHECK 4] Raw Longitude: {payload.get('longitude'):.6f} (Expected: ~{raw_lon_expected:.6f})")

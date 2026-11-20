@@ -58,8 +58,13 @@ class TestStorageArchitecture(unittest.TestCase):
         dynamic_session_info["sessionId"] = 999
         dynamic_session_info["authenticated"] = True
         dynamic_session_info["deviceId"] = "TEST_DEV_01"
+        # Never mirror test uploads to the real secondary backend
+        import config as _cfg
+        self._mirror_patch = patch.object(_cfg, "SECONDARY_BACKEND_URL", "")
+        self._mirror_patch.start()
 
     def tearDown(self):
+        self._mirror_patch.stop()
         if os.path.exists(self.test_dir):
             shutil.rmtree(self.test_dir, ignore_errors=True)
 

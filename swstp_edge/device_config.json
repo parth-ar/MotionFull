@@ -2,5 +2,5 @@
   "device_id": "SWSTP-AMRMC-001",
   "vehicle_id": "SWSTP-AMRMC-001",
   "timezone": "Asia/Kolkata",
-  "_comment": "Edit 'device_id' and 'vehicle_id' to match your provisioned device/vehicle codes in the SWSTP backend. 'timezone' sets the local timezone (Asia/Kolkata for Maharashtra, India)."
+  "_comment": "Edit 'device_id' to match the provisioned device code in the SWSTP backend; it is the only ID the APIs use (vehicle IDs are no longer used). 'timezone' sets the local timezone (Asia/Kolkata for Maharashtra, India)."
 }

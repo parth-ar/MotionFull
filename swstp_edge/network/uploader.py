@@ -4,7 +4,7 @@ network/uploader.py — Backend HTTP worker threads.
 Verbatim port of all HTTP upload workers:
   live_frame_streamer     → POST /api/camera/{deviceId}/frame
   telemetry_streamer      → POST /api/telemetry/ingest-batch
-  raw_gnss_streamer       → POST /api/{vehicle_id}/live_location
+  raw_gnss_streamer       → POST /api/{device_id}/live_location
   evidence_upload_worker  → POST /api/evidence/upload
 
 Also contains:
@@ -209,6 +209,210 @@ def ensure_hardware_session(backend_url: str, device_code: str, retries: int = 3
     dynamic_session_info["sessionId"]     = 0
     dynamic_session_info["authenticated"] = False
     return 0
+
+
+# ---------------------------------------------------------------------------
+# Secondary (mirror) backend — config.SECONDARY_BACKEND_URL
+# ---------------------------------------------------------------------------
+# Telemetry batches, raw GNSS live location and evidence are copied to a second backend in
+# parallel. Copies go through bounded background queues, so a slow or offline secondary can
+# never delay or block the primary pipeline. The secondary has its own login/session.
+
+secondary_session_info: dict = {
+    "sessionId":     0,
+    "authenticated": False,
+    "ulbId":         None,
+}
+_secondary_login_lock = threading.Lock()
+_secondary_last_login = 0.0
+
+
+def secondary_backend_url() -> str | None:
+    """Mirror backend base URL, or None when mirroring is disabled."""
+    url = (getattr(_cfg, "SECONDARY_BACKEND_URL", "") or "").strip().rstrip("/")
+    return url or None
+
+
+def ensure_secondary_session(force: bool = False) -> int:
+    """Log the device in on the secondary backend (rate-limited). Returns its sessionId or 0.
+    Does not touch the primary session, latest_sensor or the telemetry sequence."""
+    global _secondary_last_login
+    base = secondary_backend_url()
+    device_code = dynamic_session_info.get("deviceId")
+    if not base or not device_code or device_code in ("AUTO", "UNASSIGNED", "DISCONNECTED", "UNPROVISIONED"):
+        return 0
+    with _secondary_login_lock:
+        if secondary_session_info["authenticated"] and not force:
+            return secondary_session_info["sessionId"]
+        now = time.monotonic()
+        if not force and now - _secondary_last_login < float(getattr(_cfg, "SECONDARY_LOGIN_RETRY_SEC", 30.0)):
+            return 0
+        _secondary_last_login = now
+        try:
+            r = requests.post(f"{base}/api/sessions/start-hardware-session",
+                              json={"deviceCode": device_code, "mode": "REAL_HARDWARE"}, timeout=8.0)
+            if r.status_code == 200:
+                sess = r.json()
+                sid = sess.get("sessionId") or 0
+                if sid > 0:
+                    secondary_session_info["sessionId"]     = sid
+                    secondary_session_info["ulbId"]         = (sess.get("ulbId") or
+                                                               (sess.get("ulb") or {}).get("ulbId"))
+                    secondary_session_info["authenticated"] = True
+                    print(f"[MIRROR] Secondary backend {base}: session #{sid} AUTHENTICATED (Device: {device_code})")
+                    return sid
+            print(f"[MIRROR] Secondary login rejected by {base}: HTTP {r.status_code} — retrying in "
+                  f"{getattr(_cfg, 'SECONDARY_LOGIN_RETRY_SEC', 30.0):.0f}s")
+        except Exception as exc:
+            print(f"[MIRROR] Secondary login to {base} failed: {exc} — retrying later")
+        secondary_session_info["authenticated"] = False
+        secondary_session_info["sessionId"]     = 0
+        return 0
+
+
+class _MirrorWorker:
+    """One background thread + bounded queue sending jobs to the secondary backend.
+    submit() never blocks: when the queue is full the oldest job is dropped."""
+
+    _LOG_EVERY = 30.0
+
+    def __init__(self, name: str, maxsize: int):
+        self.name = name
+        self._q: queue.Queue = queue.Queue(maxsize=maxsize)
+        self._thread: threading.Thread | None = None
+        self._start_lock = threading.Lock()
+        self._session: requests.Session | None = None
+        self.sent = self.failed = self.dropped = 0
+        self._last_log = 0.0
+        self._logged_ok = False
+
+    def submit(self, job) -> None:
+        """job(session, sid) -> requests.Response; sid is the secondary sessionId (0 if not logged in)."""
+        if secondary_backend_url() is None:
+            return
+        self._ensure_thread()
+        try:
+            self._q.put_nowait(job)
+        except queue.Full:
+            try:
+                self._q.get_nowait()
+                self.dropped += 1
+            except queue.Empty:
+                pass
+            try:
+                self._q.put_nowait(job)
+            except queue.Full:
+                self.dropped += 1
+
+    def _ensure_thread(self) -> None:
+        if self._thread is not None and self._thread.is_alive():
+            return
+        with self._start_lock:
+            if self._thread is None or not self._thread.is_alive():
+                self._thread = threading.Thread(target=self._run, name=f"mirror-{self.name}", daemon=True)
+                self._thread.start()
+
+    def _new_session(self) -> requests.Session:
+        s = requests.Session()
+        a = requests.adapters.HTTPAdapter(pool_connections=2, pool_maxsize=4, max_retries=0)
+        s.mount("http://", a)
+        s.mount("https://", a)
+        return s
+
+    def _log(self, msg: str) -> None:
+        now = time.monotonic()
+        if now - self._last_log >= self._LOG_EVERY:
+            self._last_log = now
+            print(f"[MIRROR:{self.name}] {msg} (sent={self.sent} failed={self.failed} dropped={self.dropped})")
+
+    def _run(self) -> None:
+        self._session = self._new_session()
+        while True:
+            job = self._q.get()
+            try:
+                resp = job(self._session, secondary_session_info.get("sessionId", 0))
+                if resp is None:            # job skipped itself (e.g. secondary not logged in)
+                    continue
+                if resp.status_code in (200, 201, 204):
+                    self.sent += 1
+                    if not self._logged_ok:
+                        self._logged_ok = True
+                        print(f"[MIRROR:{self.name}] Secondary backend accepting data (HTTP {resp.status_code})")
+                else:
+                    self.failed += 1
+                    if resp.status_code in (401, 403):
+                        secondary_session_info["authenticated"] = False   # force re-login
+                    self._log(f"secondary returned HTTP {resp.status_code}")
+            except Exception as exc:
+                self.failed += 1
+                self._log(f"secondary unreachable: {exc}")
+                try:
+                    self._session.close()
+                except Exception:
+                    pass
+                self._session = self._new_session()
+
+
+# Small JSON streams (telemetry 5/s, GNSS 5/s) and multipart evidence use separate workers,
+# so a 15 s evidence upload never holds up the location stream.
+_mirror_stream   = _MirrorWorker("stream",   maxsize=200)
+_mirror_evidence = _MirrorWorker("evidence", maxsize=20)
+
+
+def mirror_telemetry_batch(packets: list) -> None:
+    """Copy a telemetry batch to the secondary (with the secondary's own sessionId)."""
+    base = secondary_backend_url()
+    if not base or not packets:
+        return
+    pkts = list(packets)
+
+    def job(session, sid):
+        if not secondary_session_info["authenticated"] and ensure_secondary_session() <= 0:
+            return None
+        sid = secondary_session_info["sessionId"]
+        return session.post(f"{base}/api/telemetry/ingest-batch",
+                            json={"sessionId": sid, "mode": "REAL_HARDWARE", "packets": pkts},
+                            timeout=4.0)
+    _mirror_stream.submit(job)
+
+
+def mirror_live_location(device_id: str, payload: dict) -> None:
+    """Copy one raw GNSS live-location packet to the secondary (no login needed, as on primary)."""
+    base = secondary_backend_url()
+    if not base:
+        return
+    body = dict(payload)
+
+    def job(session, sid):
+        return session.post(f"{base}/api/{device_id}/live_location", json=body,
+                            headers={"Content-Type": "application/json"}, timeout=3.0)
+    _mirror_stream.submit(job)
+
+
+def mirror_evidence(file_name: str, jpeg_bytes: bytes, form: dict) -> None:
+    """Copy one evidence image (already confirmed by the primary) to the secondary.
+    One attempt; same idempotencyKey so the secondary can de-duplicate."""
+    base = secondary_backend_url()
+    if not base or not jpeg_bytes:
+        return
+    data = dict(form)
+
+    def job(session, sid):
+        if not secondary_session_info["authenticated"] and ensure_secondary_session() <= 0:
+            print(f"[MIRROR:evidence] Skipped {file_name}: secondary backend not logged in")
+            return None
+        data["sessionId"] = secondary_session_info["sessionId"]
+        if secondary_session_info.get("ulbId"):
+            data["ulbId"] = secondary_session_info["ulbId"]
+        return session.post(f"{base}/api/evidence/upload",
+                            files={"file": (file_name, jpeg_bytes, "image/jpeg")},
+                            data=data, timeout=15.0)
+    _mirror_evidence.submit(job)
+
+
+def mirror_stats() -> dict:
+    return {w.name: {"sent": w.sent, "failed": w.failed, "dropped": w.dropped}
+            for w in (_mirror_stream, _mirror_evidence)}
 
 
 # ---------------------------------------------------------------------------
@@ -456,6 +660,7 @@ def telemetry_streamer(backend_url: str, session_id_arg: int, ulb_id: str,
                 "mode":      "REAL_HARDWARE",
                 "packets":   packets,
             }
+            mirror_telemetry_batch(packets)   # copy to secondary backend (non-blocking)
             try:
                 resp = session.post(url, json=batch, timeout=4.0)
                 if resp.status_code == 200:
@@ -471,17 +676,19 @@ def telemetry_streamer(backend_url: str, session_id_arg: int, ulb_id: str,
 
 
 # ---------------------------------------------------------------------------
-# Raw GNSS Live Location Streamer (POST /api/{vehicle_id}/live_location)
+# Raw GNSS Live Location Streamer (POST /api/{device_id}/live_location)
 # ---------------------------------------------------------------------------
-def raw_gnss_streamer(backend_url: str, vehicle_id: str,
+def raw_gnss_streamer(backend_url: str, device_id: str,
                       stop_event: threading.Event,
                       rate_hz: float = 5.0) -> None:
-    """Streams live, un-snapped raw GNSS coordinates to POST /api/{vehicle_id}/live_location.
+    """Streams live, un-snapped raw GNSS coordinates to POST /api/{device_id}/live_location
+    (and a copy to the secondary backend, if configured).
 
     backend_url — Base URL of the SWSTP Backend (e.g. http://192.168.1.100:5000)
-    vehicle_id  — Unique vehicle identifier (e.g. MH-27-TR-102 or SWSTP-AMRMC-001)
+    device_id   — Provisioned device code from device_config.json (e.g. SWSTP-AMRMC-001).
+                  Vehicle IDs are no longer used by the APIs.
     stop_event  — threading.Event to cleanly terminate the background worker
-    rate_hz     — Streaming frequency in Hertz (default: 1.0 Hz)
+    rate_hz     — Streaming frequency in Hertz (default: 5.0 Hz, GNSS_STREAM_RATE_HZ)
 
     Thread priority is elevated above camera/motion threads: GNSS location streaming
     to the ingest endpoint must never be starved by OpenCV/YOLO CPU load.
@@ -499,7 +706,7 @@ def raw_gnss_streamer(backend_url: str, vehicle_id: str,
 
     target_hz = max(0.1, min(10.0, rate_hz))
     interval = 1.0 / target_hz
-    stream_url = f"{backend_url.rstrip('/')}/api/{vehicle_id}/live_location"
+    stream_url = f"{backend_url.rstrip('/')}/api/{device_id}/live_location"
 
     session = requests.Session()
     adapter = requests.adapters.HTTPAdapter(pool_connections=5, pool_maxsize=10, max_retries=0)
@@ -536,13 +743,9 @@ def raw_gnss_streamer(backend_url: str, vehicle_id: str,
             utc_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
             rtc_data = rtc_sensor.read()
             rtc_ts = rtc_data.get("timestamp") or utc_iso
-            cur_dev = latest_sensor.get("deviceId") or dynamic_session_info.get("deviceId") or "UNPROVISIONED"
-
             payload = {
-                "vehicle_id":         vehicle_id,
-                "vehicleId":          vehicle_id,
-                "device_id":          cur_dev,
-                "deviceId":           cur_dev,
+                "device_id":          device_id,
+                "deviceId":           device_id,
                 "latitude":           raw_lat,
                 "lat":                raw_lat,
                 "longitude":          raw_lon,
@@ -566,6 +769,7 @@ def raw_gnss_streamer(backend_url: str, vehicle_id: str,
                 "is_snapped":         False,
             }
 
+            mirror_live_location(device_id, payload)    # copy to secondary backend (non-blocking)
             resp = session.post(
                 stream_url,
                 json=payload,
@@ -728,6 +932,9 @@ def _upload_and_cleanup_evidence(session: requests.Session,
             res_json = {}
 
         hardware_state["backend"]["upload_count"] += 1
+        # Primary confirmed → copy to the secondary backend (one attempt, background; the
+        # bytes are held in memory, so deleting the local file below doesn't affect it)
+        mirror_evidence(file_display_name, jpeg_bytes, data)
         img_id  = res_json.get("evidenceImageId") or res_json.get("id") or "N/A"
         img_url = res_json.get("imageUrl") or f"{backend_url.rstrip('/')}/api/evidence/images/{img_id}"
 
